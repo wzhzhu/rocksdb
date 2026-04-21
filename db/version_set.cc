@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/multi_level_cache.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_reader.h"
@@ -97,6 +98,25 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
+
+void MaybeRefreshLevelCacheMapping(Cache* cache,
+                                   const VersionStorageInfo& storage_info) {
+  if (cache == nullptr) {
+    return;
+  }
+  auto* multi_level_cache = cache->CheckedCast<MultiLevelCache>();
+  if (multi_level_cache == nullptr) {
+    return;
+  }
+  for (int level = 0; level < storage_info.num_levels(); ++level) {
+    for (FileMetaData* file_meta : storage_info.LevelFiles(level)) {
+      if (file_meta != nullptr) {
+        multi_level_cache->UpdateFileLevelMapping(file_meta->fd.GetNumber(),
+                                                  level);
+      }
+    }
+  }
+}
 
 // Find File in LevelFilesBrief data structure
 // Within an index range defined by left and right
@@ -5868,6 +5888,7 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
 
   // Mark v finalized
   v->storage_info_.SetFinalized();
+  MaybeRefreshLevelCacheMapping(table_cache_, *v->storage_info());
 
   // Make "v" current
   assert(v->refs_ == 0);
