@@ -1,0 +1,338 @@
+//  Copyright (c) 2011-present, Facebook, Inc.  All rights reserved.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
+//
+// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file. See the AUTHORS file for names of contributors.
+
+#include "cache/multi_level_cache_allocator.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <limits>
+#include <numeric>
+#include <utility>
+
+namespace ROCKSDB_NAMESPACE {
+namespace {
+
+struct FractionalPart {
+  size_t index;
+  double fraction;
+};
+
+double ClampRatio(double ratio) {
+  if (ratio < 0.0) {
+    return 0.0;
+  }
+  if (ratio > 1.0) {
+    return 1.0;
+  }
+  return ratio;
+}
+
+}  // namespace
+
+MultiLevelCacheAllocator::MultiLevelCacheAllocator(
+    std::shared_ptr<MultiLevelCache> cache, MetricsProvider provider,
+    MultiLevelAllocationOptions options)
+    : cache_(std::move(cache)),
+      provider_(std::move(provider)),
+      options_(std::move(options)) {
+  if (options_.interval_ms == 0) {
+    options_.interval_ms = 1000;
+  }
+  if (options_.solver_max_iterations <= 0) {
+    options_.solver_max_iterations = 80;
+  }
+  if (options_.solver_epsilon <= 0) {
+    options_.solver_epsilon = 1e-9;
+  }
+  options_.smoothing_ratio = ClampRatio(options_.smoothing_ratio);
+}
+
+MultiLevelCacheAllocator::~MultiLevelCacheAllocator() { Stop(); }
+
+void MultiLevelCacheAllocator::Start() {
+  bool expected = false;
+  if (!running_.compare_exchange_strong(expected, true,
+                                        std::memory_order_acq_rel)) {
+    return;
+  }
+  worker_ = std::thread(&MultiLevelCacheAllocator::BackgroundLoop, this);
+}
+
+void MultiLevelCacheAllocator::Stop() {
+  bool expected = true;
+  if (!running_.compare_exchange_strong(expected, false,
+                                        std::memory_order_acq_rel)) {
+    return;
+  }
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+}
+
+Status MultiLevelCacheAllocator::RunOnce() {
+  std::lock_guard<std::mutex> lock(mu_);
+  return RunOnceLocked();
+}
+
+Status MultiLevelCacheAllocator::SolveCapacities(
+    const std::vector<double>& lambda, const std::vector<double>& data,
+    const std::vector<double>& alpha, size_t total_capacity,
+    std::vector<size_t>* capacities, double epsilon, int max_iterations) {
+  if (capacities == nullptr) {
+    return Status::InvalidArgument("capacities output cannot be null");
+  }
+  const size_t levels = lambda.size();
+  if (levels == 0 || data.size() != levels || alpha.size() != levels) {
+    return Status::InvalidArgument(
+        "lambda/data/alpha sizes must match and be non-zero");
+  }
+  if (max_iterations <= 0 || epsilon <= 0.0) {
+    return Status::InvalidArgument("invalid solver configuration");
+  }
+  if (total_capacity == 0) {
+    capacities->assign(levels, 0);
+    return Status::OK();
+  }
+
+  std::vector<double> a(levels, 0.0);
+  double a_max = 0.0;
+  bool has_positive_term = false;
+  for (size_t i = 0; i < levels; ++i) {
+    if (lambda[i] > 0.0 && alpha[i] > 0.0 && data[i] > 0.0) {
+      a[i] = lambda[i] * alpha[i] / data[i];
+      a_max = std::max(a_max, a[i]);
+      has_positive_term = true;
+    }
+  }
+
+  if (!has_positive_term || a_max <= 0.0) {
+    EqualSplit(total_capacity, levels, capacities);
+    return Status::OK();
+  }
+
+  auto sum_capacities_for_mu = [&](double mu,
+                                   std::vector<double>* out) -> double {
+    double sum = 0.0;
+    for (size_t i = 0; i < levels; ++i) {
+      double capacity = 0.0;
+      if (a[i] > 0.0 && mu > 0.0 && mu < a[i]) {
+        capacity = (data[i] / alpha[i]) * std::log(a[i] / mu);
+        if (capacity < 0.0) {
+          capacity = 0.0;
+        }
+      }
+      if (out != nullptr) {
+        (*out)[i] = capacity;
+      }
+      sum += capacity;
+    }
+    return sum;
+  };
+
+  double low = 0.0;
+  double high = a_max;
+  for (int iter = 0; iter < max_iterations; ++iter) {
+    const double mid = 0.5 * (low + high);
+    if (mid <= 0.0) {
+      low = std::numeric_limits<double>::min();
+      continue;
+    }
+    const double total = sum_capacities_for_mu(mid, nullptr);
+    if (total > static_cast<double>(total_capacity)) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+    if ((high - low) <= epsilon * std::max(1.0, high)) {
+      break;
+    }
+  }
+
+  std::vector<double> continuous(levels, 0.0);
+  sum_capacities_for_mu(high, &continuous);
+  *capacities = QuantizeToBudget(continuous, total_capacity);
+  return Status::OK();
+}
+
+void MultiLevelCacheAllocator::EqualSplit(size_t total_capacity, size_t levels,
+                                          std::vector<size_t>* capacities) {
+  capacities->assign(levels, 0);
+  if (levels == 0) {
+    return;
+  }
+  const size_t base = total_capacity / levels;
+  const size_t rem = total_capacity % levels;
+  for (size_t i = 0; i < levels; ++i) {
+    (*capacities)[i] = base + (i < rem ? 1 : 0);
+  }
+}
+
+std::vector<size_t> MultiLevelCacheAllocator::QuantizeToBudget(
+    const std::vector<double>& values, size_t budget) {
+  std::vector<size_t> result(values.size(), 0);
+  if (values.empty()) {
+    return result;
+  }
+
+  std::vector<FractionalPart> fractions;
+  fractions.reserve(values.size());
+  size_t used = 0;
+  for (size_t i = 0; i < values.size(); ++i) {
+    const double non_negative = std::max(0.0, values[i]);
+    const double floor_value = std::floor(non_negative);
+    const size_t base = static_cast<size_t>(
+        std::min<double>(floor_value, static_cast<double>(SIZE_MAX)));
+    result[i] = base;
+    used += base;
+    fractions.push_back({i, non_negative - floor_value});
+  }
+
+  if (used > budget) {
+    const double scale = static_cast<double>(budget) / static_cast<double>(used);
+    used = 0;
+    for (size_t i = 0; i < result.size(); ++i) {
+      result[i] = static_cast<size_t>(std::floor(result[i] * scale));
+      used += result[i];
+    }
+  }
+
+  size_t remaining = budget - used;
+  if (!result.empty() && remaining > 0) {
+    const size_t base_add = remaining / result.size();
+    if (base_add > 0) {
+      for (size_t i = 0; i < result.size(); ++i) {
+        result[i] += base_add;
+      }
+      remaining -= base_add * result.size();
+    }
+  }
+  std::sort(fractions.begin(), fractions.end(),
+            [](const FractionalPart& lhs, const FractionalPart& rhs) {
+              return lhs.fraction > rhs.fraction;
+            });
+  for (size_t i = 0; i < remaining && i < fractions.size(); ++i) {
+    ++result[fractions[i].index];
+  }
+  return result;
+}
+
+void MultiLevelCacheAllocator::SmoothCapacities(
+    const std::vector<size_t>& previous, const std::vector<size_t>& target,
+    double ratio, std::vector<size_t>* out) {
+  const double clamped_ratio = ClampRatio(ratio);
+  const size_t levels = target.size();
+  out->assign(levels, 0);
+  if (previous.size() != levels || clamped_ratio >= 1.0) {
+    *out = target;
+    return;
+  }
+  for (size_t i = 0; i < levels; ++i) {
+    const double blended =
+        (1.0 - clamped_ratio) * static_cast<double>(previous[i]) +
+        clamped_ratio * static_cast<double>(target[i]);
+    (*out)[i] = static_cast<size_t>(std::max(0.0, std::floor(blended)));
+  }
+
+  const size_t previous_sum =
+      std::accumulate(previous.begin(), previous.end(), static_cast<size_t>(0));
+  const size_t target_sum =
+      std::accumulate(target.begin(), target.end(), static_cast<size_t>(0));
+  const size_t budget = target_sum > 0 ? target_sum : previous_sum;
+  size_t smoothed_sum =
+      std::accumulate(out->begin(), out->end(), static_cast<size_t>(0));
+  if (smoothed_sum < budget) {
+    size_t remain = budget - smoothed_sum;
+    if (levels > 0) {
+      const size_t base_add = remain / levels;
+      if (base_add > 0) {
+        for (size_t i = 0; i < levels; ++i) {
+          (*out)[i] += base_add;
+        }
+        remain -= base_add * levels;
+      }
+      for (size_t i = 0; i < levels && remain > 0; ++i, --remain) {
+        ++(*out)[i];
+      }
+    }
+  } else if (smoothed_sum > budget) {
+    size_t over = smoothed_sum - budget;
+    for (size_t i = 0; i < levels && over > 0; ++i) {
+      const size_t dec = std::min((*out)[i], over);
+      (*out)[i] -= dec;
+      over -= dec;
+    }
+  }
+}
+
+void MultiLevelCacheAllocator::BackgroundLoop() {
+  while (running_.load(std::memory_order_acquire)) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      Status s = RunOnceLocked();
+      s.PermitUncheckedError();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(options_.interval_ms));
+  }
+}
+
+Status MultiLevelCacheAllocator::RunOnceLocked() {
+  if (cache_ == nullptr) {
+    return Status::InvalidArgument("cache cannot be null");
+  }
+  if (!provider_) {
+    return Status::InvalidArgument("metrics provider cannot be empty");
+  }
+
+  std::vector<double> lambda;
+  std::vector<double> data;
+  std::vector<double> alpha;
+  if (!provider_(&lambda, &data, &alpha)) {
+    return Status::OK();
+  }
+
+  std::vector<size_t> target_capacities;
+  const size_t total_capacity = cache_->GetCapacity();
+  Status solve_status =
+      SolveCapacities(lambda, data, alpha, total_capacity, &target_capacities,
+                      options_.solver_epsilon, options_.solver_max_iterations);
+  if (!solve_status.ok()) {
+    return solve_status;
+  }
+
+  std::vector<size_t> capacities_to_apply = target_capacities;
+  if (!last_capacities_.empty() &&
+      last_capacities_.size() == capacities_to_apply.size()) {
+    SmoothCapacities(last_capacities_, target_capacities, options_.smoothing_ratio,
+                     &capacities_to_apply);
+  }
+
+  if (!last_capacities_.empty() &&
+      last_capacities_.size() == capacities_to_apply.size()) {
+    uint64_t total_change = 0;
+    for (size_t i = 0; i < capacities_to_apply.size(); ++i) {
+      const size_t lhs = capacities_to_apply[i];
+      const size_t rhs = last_capacities_[i];
+      total_change += static_cast<uint64_t>(lhs > rhs ? lhs - rhs : rhs - lhs);
+    }
+    if (total_change < options_.min_total_change_bytes) {
+      return Status::OK();
+    }
+  }
+
+  Status adjust = cache_->AdjustCapacities(capacities_to_apply);
+  if (adjust.ok()) {
+    last_capacities_ = std::move(capacities_to_apply);
+  }
+  return adjust;
+}
+
+}  // namespace ROCKSDB_NAMESPACE
+

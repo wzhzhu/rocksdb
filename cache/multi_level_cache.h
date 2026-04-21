@@ -21,6 +21,13 @@ namespace ROCKSDB_NAMESPACE {
 // Routing is based on cache key prefix -> level mapping.
 class MultiLevelCache : public Cache {
  public:
+  struct LevelMetricsSnapshot {
+    std::vector<uint64_t> lookups;
+    std::vector<uint64_t> hits;
+    std::vector<size_t> capacities;
+    std::vector<uint64_t> data_sizes;
+  };
+
   static const char* kClassName() { return "MultiLevelCache"; }
 
   MultiLevelCache(size_t num_levels, size_t total_capacity);
@@ -84,9 +91,11 @@ class MultiLevelCache : public Cache {
   // Returns overall and per-level cache hit stats.
   std::string PrintStats() const;
   void ResetStats();
+  LevelMetricsSnapshot GetLevelMetricsSnapshot() const;
 
   // Thread-safe mapping update from SST file number to LSM-tree level.
   void UpdateFileLevelMapping(uint64_t file_number, int level);
+  void UpdateFileMetadata(uint64_t file_number, int level, uint64_t file_size);
   void RemoveFileLevelMapping(uint64_t file_number);
   // Thread-safe mapping update from cache key common prefix to LSM-tree level.
   void UpdateCacheKeyPrefixMapping(uint64_t cache_key_prefix, int level);
@@ -108,6 +117,10 @@ class MultiLevelCache : public Cache {
     mutable std::shared_mutex mutex;
     std::unordered_map<uint64_t, int> map;
   };
+  struct SizeShard {
+    mutable std::shared_mutex mutex;
+    std::unordered_map<uint64_t, uint64_t> map;
+  };
 
   static constexpr size_t kMappingShardCount = 64;
 
@@ -119,7 +132,6 @@ class MultiLevelCache : public Cache {
   size_t RouteLevelByKey(const Slice& key, RouteCaller caller) const;
   std::optional<uint64_t> GetCacheKeyPrefix(const Slice& key) const;
   std::optional<int> FindLevelByCacheKeyPrefix(uint64_t cache_key_prefix) const;
-  std::optional<int> FindLevelByFileNumber(uint64_t file_number) const;
 
   WrappedHandle* NewWrappedHandle(size_t level_index, Cache::Handle* inner);
   static WrappedHandle* ToWrappedHandle(Handle* handle);
@@ -134,6 +146,7 @@ class MultiLevelCache : public Cache {
   std::vector<std::shared_ptr<Cache>> sub_caches_;
   std::deque<std::atomic<uint64_t>> lookups_;
   std::deque<std::atomic<uint64_t>> hits_;
+  std::deque<std::atomic<uint64_t>> level_data_sizes_;
   mutable std::atomic<uint64_t> insert_route_queries_{0};
   mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
   mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};
@@ -145,6 +158,7 @@ class MultiLevelCache : public Cache {
   mutable std::atomic<uint64_t> route_normalize_fallbacks_{0};
   std::atomic<size_t> total_capacity_;
   std::array<MappingShard, kMappingShardCount> file_number_to_level_;
+  std::array<SizeShard, kMappingShardCount> file_number_to_size_;
   std::array<MappingShard, kMappingShardCount> cache_key_prefix_to_level_;
 };
 

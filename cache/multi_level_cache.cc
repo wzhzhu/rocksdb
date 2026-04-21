@@ -38,9 +38,11 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity)
 
   lookups_.resize(level_count);
   hits_.resize(level_count);
+  level_data_sizes_.resize(level_count);
   for (size_t level = 0; level < level_count; ++level) {
     lookups_[level].store(0, std::memory_order_relaxed);
     hits_[level].store(0, std::memory_order_relaxed);
+    level_data_sizes_[level].store(0, std::memory_order_relaxed);
   }
 }
 
@@ -308,13 +310,16 @@ std::string MultiLevelCache::PrintStats() const {
     const uint64_t level_lookups =
         lookups_[level].load(std::memory_order_relaxed);
     const uint64_t level_hits = hits_[level].load(std::memory_order_relaxed);
+    const uint64_t level_data_size =
+        level_data_sizes_[level].load(std::memory_order_relaxed);
     const double level_hit_rate =
         level_lookups == 0 ? 0.0
                            : static_cast<double>(level_hits) /
                                  static_cast<double>(level_lookups);
     oss << "L" << level << ": capacity=" << sub_caches_[level]->GetCapacity()
         << ", lookups=" << level_lookups << ", hits=" << level_hits
-        << ", hit_rate=" << level_hit_rate << "\n";
+        << ", hit_rate=" << level_hit_rate
+        << ", data_size=" << level_data_size << "\n";
   }
   return oss.str();
 }
@@ -335,6 +340,23 @@ void MultiLevelCache::ResetStats() {
   route_normalize_fallbacks_.store(0, std::memory_order_relaxed);
 }
 
+MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
+    const {
+  LevelMetricsSnapshot snapshot;
+  snapshot.lookups.resize(sub_caches_.size());
+  snapshot.hits.resize(sub_caches_.size());
+  snapshot.capacities.resize(sub_caches_.size());
+  snapshot.data_sizes.resize(sub_caches_.size());
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    snapshot.lookups[level] = lookups_[level].load(std::memory_order_relaxed);
+    snapshot.hits[level] = hits_[level].load(std::memory_order_relaxed);
+    snapshot.capacities[level] = sub_caches_[level]->GetCapacity();
+    snapshot.data_sizes[level] =
+        level_data_sizes_[level].load(std::memory_order_relaxed);
+  }
+  return snapshot;
+}
+
 void MultiLevelCache::UpdateFileLevelMapping(uint64_t file_number, int level) {
   const size_t shard_index = ShardIndex(file_number);
   MappingShard& shard = file_number_to_level_[shard_index];
@@ -342,11 +364,55 @@ void MultiLevelCache::UpdateFileLevelMapping(uint64_t file_number, int level) {
   shard.map[file_number] = level;
 }
 
+void MultiLevelCache::UpdateFileMetadata(uint64_t file_number, int level,
+                                         uint64_t file_size) {
+  const size_t normalized_level = NormalizeLevel(level);
+  const size_t shard_index = ShardIndex(file_number);
+  MappingShard& level_shard = file_number_to_level_[shard_index];
+  SizeShard& size_shard = file_number_to_size_[shard_index];
+  std::unique_lock<std::shared_mutex> level_lock(level_shard.mutex);
+  std::unique_lock<std::shared_mutex> size_lock(size_shard.mutex);
+
+  size_t old_level = normalized_level;
+  uint64_t old_size = 0;
+  auto level_it = level_shard.map.find(file_number);
+  if (level_it != level_shard.map.end()) {
+    old_level = NormalizeLevel(level_it->second);
+  }
+  auto size_it = size_shard.map.find(file_number);
+  if (size_it != size_shard.map.end()) {
+    old_size = size_it->second;
+  }
+
+  if (old_size > 0) {
+    level_data_sizes_[old_level].fetch_sub(old_size, std::memory_order_relaxed);
+  }
+  level_data_sizes_[normalized_level].fetch_add(file_size,
+                                                std::memory_order_relaxed);
+  level_shard.map[file_number] = level;
+  size_shard.map[file_number] = file_size;
+}
+
 void MultiLevelCache::RemoveFileLevelMapping(uint64_t file_number) {
   const size_t shard_index = ShardIndex(file_number);
-  MappingShard& shard = file_number_to_level_[shard_index];
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  shard.map.erase(file_number);
+  MappingShard& level_shard = file_number_to_level_[shard_index];
+  SizeShard& size_shard = file_number_to_size_[shard_index];
+  std::unique_lock<std::shared_mutex> level_lock(level_shard.mutex);
+  std::unique_lock<std::shared_mutex> size_lock(size_shard.mutex);
+
+  auto level_it = level_shard.map.find(file_number);
+  auto size_it = size_shard.map.find(file_number);
+  if (level_it != level_shard.map.end() && size_it != size_shard.map.end()) {
+    const size_t old_level = NormalizeLevel(level_it->second);
+    level_data_sizes_[old_level].fetch_sub(size_it->second,
+                                           std::memory_order_relaxed);
+  }
+  if (level_it != level_shard.map.end()) {
+    level_shard.map.erase(level_it);
+  }
+  if (size_it != size_shard.map.end()) {
+    size_shard.map.erase(size_it);
+  }
 }
 
 void MultiLevelCache::UpdateCacheKeyPrefixMapping(uint64_t cache_key_prefix,
@@ -429,18 +495,6 @@ std::optional<int> MultiLevelCache::FindLevelByCacheKeyPrefix(
   const MappingShard& shard = cache_key_prefix_to_level_[shard_index];
   std::shared_lock<std::shared_mutex> lock(shard.mutex);
   auto it = shard.map.find(cache_key_prefix);
-  if (it == shard.map.end()) {
-    return std::nullopt;
-  }
-  return it->second;
-}
-
-std::optional<int> MultiLevelCache::FindLevelByFileNumber(
-    uint64_t file_number) const {
-  const size_t shard_index = ShardIndex(file_number);
-  const MappingShard& shard = file_number_to_level_[shard_index];
-  std::shared_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.map.find(file_number);
   if (it == shard.map.end()) {
     return std::nullopt;
   }

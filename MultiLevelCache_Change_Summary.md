@@ -121,3 +121,77 @@
 - 修正 `tools/multilevel_cache_runner.cc` 注释与行为不一致问题：
   - 由“make lower levels larger”改为“make the deepest level larger”
   - 与当前容量分配逻辑（最后一层吃剩余容量）一致
+
+## 9. 新增凸优化求解器与后台分配模块
+
+新增 `cache/multi_level_cache_allocator.h/.cc`，提供基于数学模型的在线容量求解与周期下发能力。
+
+主要内容：
+
+- 新增 `MultiLevelAllocationOptions`：
+  - `interval_ms`
+  - `smoothing_ratio`
+  - `min_total_change_bytes`
+  - `solver_epsilon`
+  - `solver_max_iterations`
+- 新增 `MultiLevelCacheAllocator`：
+  - `Start()/Stop()/RunOnce()`
+  - `MetricsProvider` 回调接口（输入 `lambda_i/D_i/alpha_i`）
+  - 静态求解接口 `SolveCapacities(...)`
+- 求解算法：
+  - 基于 KKT 条件和 `mu` 的二分查找
+  - 先求连续解，再量化到 `size_t` 容量并保证预算守恒
+- 工程增强：
+  - 支持容量平滑与最小变更阈值（防抖）
+
+## 10. 量化预算分配缺陷修复
+
+修复了“预算很大时最多只补 N 字节剩余量”的问题。
+
+问题根因：
+
+- 旧逻辑在分配 `remaining = budget - used` 时，仅对前 `N` 个层做一次 `+1`，导致 `remaining >> N` 场景下大量预算未被分配。
+
+修复方式：
+
+- 先按 `remaining / N` 批量平均分配给所有层；
+- 再将 `remaining % N` 按小数部分排序补齐。
+- 同样修复了平滑路径中的同类剩余分配问题。
+
+## 11. 接入在线自适应 demo（runner）
+
+`tools/multilevel_cache_runner.cc` 从“固定向量调整”升级为“在线周期求解 + 自动下发”示例。
+
+主要内容：
+
+- 接入 `MultiLevelCacheAllocator`
+- 在第二轮读请求中开启后台线程周期求解
+- 运行结束打印 `Allocator capacities`
+
+## 12. D_i（层数据量）采集链路增强
+
+为让 `D_i` 更贴近真实值，新增了文件级元数据到层级数据量的聚合。
+
+主要内容：
+
+- `MultiLevelCache` 新增：
+  - `UpdateFileMetadata(file_number, level, file_size)`
+  - `GetLevelMetricsSnapshot()`（输出 `lookups/hits/capacities/data_sizes`）
+- 内部维护：
+  - `file_number -> level`
+  - `file_number -> file_size`
+  - 聚合得到 `level_data_sizes_`
+- 在 `BlockBasedTable::Open` 与 `VersionSet` 刷新路径中都调用 `UpdateFileMetadata(...)`，提升观测及时性和覆盖率。
+
+## 13. 代码审查后修复项
+
+根据新增代码审查结果，已完成以下修复：
+
+- 修复 `D_i` 双写冲突：
+  - 删除按层 `store` 覆盖路径（`UpdateLevelDataSize`）
+  - 统一使用文件级增量聚合路径（`UpdateFileMetadata`）
+- 删除未使用的 `FindLevelByFileNumber` 路径，减少冗余
+- 优化 runner 指标构造：
+  - 冷层 `lambda` 从强制 `+1` 改为 `epsilon`
+  - `D_i` 优先使用真实 `data_size`，缺失时使用已观测层均值兜底
+  - demo 中 `alpha` 统一为 `1.0`，减少人为偏置

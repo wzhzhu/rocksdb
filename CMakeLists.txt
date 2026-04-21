@@ -696,6 +696,7 @@ set(SOURCES
         cache/clock_cache.cc
         cache/compressed_secondary_cache.cc
         cache/lru_cache.cc
+        cache/multi_level_cache_allocator.cc
         cache/multi_level_cache.cc
         cache/secondary_cache.cc
         cache/secondary_cache_adapter.cc

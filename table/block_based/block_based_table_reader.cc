@@ -953,6 +953,7 @@ Status BlockBasedTable::Open(
   if (level >= 0 && rep->table_options.block_cache) {
     if (auto* multi_level_cache =
             rep->table_options.block_cache->CheckedCast<MultiLevelCache>()) {
+      multi_level_cache->UpdateFileMetadata(cur_file_num, level, file_size);
       const Slice common_prefix = rep->base_cache_key.CommonPrefixSlice();
       const uint64_t cache_key_prefix = DecodeFixed64(common_prefix.data());
       multi_level_cache->UpdateCacheKeyPrefixMapping(cache_key_prefix, level);

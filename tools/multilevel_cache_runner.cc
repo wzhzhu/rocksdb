@@ -2,11 +2,14 @@
 // This source code is licensed under both the GPLv2 and Apache 2.0 License.
 
 #include <cstdint>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "cache/multi_level_cache_allocator.h"
 #include "cache/multi_level_cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
@@ -119,22 +122,84 @@ int main(int argc, char** argv) {
   std::cout << "=== MultiLevelCache Stats (before adjust) ===\n";
   std::cout << ml_cache->PrintStats();
 
-  // Example of runtime capacity reconfiguration: make the deepest level larger.
-  std::vector<size_t> new_caps(static_cast<size_t>(num_levels), 0);
-  size_t consumed = 0;
-  for (size_t level = 0; level < new_caps.size(); ++level) {
-    size_t cap = total_cache_bytes / (new_caps.size() * 2);
-    if (level + 1 == new_caps.size()) {
-      cap = total_cache_bytes - consumed;
+  // Online demo: periodically solve capacities from real cache stats.
+  auto snapshot = ml_cache->GetLevelMetricsSnapshot();
+  std::vector<uint64_t> prev_lookups = snapshot.lookups;
+  ROCKSDB_NAMESPACE::MultiLevelCacheAllocator::MetricsProvider provider =
+      [ml_cache, prev_lookups](std::vector<double>* lambda,
+                               std::vector<double>* data,
+                               std::vector<double>* alpha) mutable {
+        if (lambda == nullptr || data == nullptr || alpha == nullptr) {
+          return false;
+        }
+        const auto stats = ml_cache->GetLevelMetricsSnapshot();
+        const size_t level_count = stats.lookups.size();
+        if (level_count == 0 || prev_lookups.size() != level_count) {
+          prev_lookups = stats.lookups;
+          return false;
+        }
+
+        lambda->assign(level_count, 1.0);
+        data->assign(level_count, 1.0);
+        alpha->assign(level_count, 1.0);
+        uint64_t total_observed_data = 0;
+        size_t observed_levels = 0;
+        for (size_t level = 0; level < level_count; ++level) {
+          if (stats.data_sizes[level] > 0) {
+            total_observed_data += stats.data_sizes[level];
+            ++observed_levels;
+          }
+        }
+        const double default_data = observed_levels > 0
+                                        ? static_cast<double>(total_observed_data) /
+                                              static_cast<double>(observed_levels)
+                                        : 1.0;
+        constexpr double kLambdaEpsilon = 1e-6;
+        for (size_t level = 0; level < level_count; ++level) {
+          const uint64_t curr = stats.lookups[level];
+          const uint64_t prev = prev_lookups[level];
+          const uint64_t delta = curr >= prev ? curr - prev : 0;
+          (*lambda)[level] =
+              delta > 0 ? static_cast<double>(delta) : kLambdaEpsilon;
+          (*data)[level] = stats.data_sizes[level] > 0
+                               ? static_cast<double>(stats.data_sizes[level])
+                               : default_data;
+          (*alpha)[level] = 1.0;
+        }
+        prev_lookups = stats.lookups;
+        return true;
+      };
+
+  ROCKSDB_NAMESPACE::MultiLevelAllocationOptions alloc_opts;
+  alloc_opts.interval_ms = 200;
+  alloc_opts.smoothing_ratio = 1.0;
+  alloc_opts.min_total_change_bytes = 0;
+  ROCKSDB_NAMESPACE::MultiLevelCacheAllocator allocator(ml_cache, provider,
+                                                        alloc_opts);
+  allocator.Start();
+
+  // Run another round of reads while allocator periodically updates capacities.
+  for (uint64_t i = 0; i < num_keys; ++i) {
+    s = db->Get(ROCKSDB_NAMESPACE::ReadOptions(), "k" + std::to_string(i),
+                &value);
+    if (!s.ok() && !s.IsNotFound()) {
+      std::cerr << "Get failed at " << i << " in adaptive pass: "
+                << s.ToString() << "\n";
+      allocator.Stop();
+      return 1;
     }
-    new_caps[level] = cap;
-    consumed += cap;
+    if ((i % 1024) == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
   }
-  s = ml_cache->AdjustCapacities(new_caps);
-  if (!s.ok()) {
-    std::cerr << "AdjustCapacities failed: " << s.ToString() << "\n";
-    return 1;
+  allocator.Stop();
+
+  auto after_alloc = ml_cache->GetLevelMetricsSnapshot();
+  std::cout << "Allocator capacities:";
+  for (size_t cap : after_alloc.capacities) {
+    std::cout << " " << cap;
   }
+  std::cout << "\n";
 
   std::cout << "=== MultiLevelCache Stats (after adjust) ===\n";
   std::cout << ml_cache->PrintStats();

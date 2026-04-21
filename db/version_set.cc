@@ -145,7 +145,8 @@ void MaybeRefreshLevelCacheMapping(Cache* cache,
     for (FileMetaData* file_meta : storage_info.LevelFiles(level)) {
       if (file_meta != nullptr) {
         const uint64_t file_number = file_meta->fd.GetNumber();
-        multi_level_cache->UpdateFileLevelMapping(file_number, level);
+        const uint64_t file_size = file_meta->fd.GetFileSize();
+        multi_level_cache->UpdateFileMetadata(file_number, level, file_size);
 
         // Keep route key format aligned with block cache key's 8-byte common
         // prefix generated from db/session/file identity.

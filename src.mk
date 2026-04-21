@@ -7,6 +7,7 @@ LIB_SOURCES =                                                   \
   cache/cache_reservation_manager.cc                            \
   cache/charged_cache.cc                                        \
   cache/clock_cache.cc                                          \
+  cache/multi_level_cache_allocator.cc                          \
   cache/lru_cache.cc                                            \
   cache/multi_level_cache.cc                                    \
   cache/compressed_secondary_cache.cc                           \
