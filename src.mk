@@ -8,6 +8,7 @@ LIB_SOURCES =                                                   \
   cache/charged_cache.cc                                        \
   cache/clock_cache.cc                                          \
   cache/lru_cache.cc                                            \
+  cache/multi_level_cache.cc                                    \
   cache/compressed_secondary_cache.cc                           \
   cache/secondary_cache.cc                                      \
   cache/secondary_cache_adapter.cc                              \
@@ -452,6 +453,7 @@ TOOLS_MAIN_SOURCES =                                                    \
   tools/io_tracer_parser.cc                                             \
   tools/sst_dump.cc                                                     \
   tools/write_stress.cc                                                 \
+  tools/multilevel_cache_runner.cc                                      \
   tools/dump/rocksdb_dump.cc                                            \
   tools/dump/rocksdb_undump.cc                                          \
   tools/trace_analyzer.cc                                               \

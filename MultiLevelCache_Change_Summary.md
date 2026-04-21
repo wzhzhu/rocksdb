@@ -18,32 +18,38 @@
 - 覆盖 `Cache` 核心接口，包括 `Insert`、`Lookup`、`Release`、`Erase`、`SetCapacity`、`GetUsage` 等
 - 引入 `WrappedHandle` 包装底层 handle，保证跨层路由后 `Ref/Release/Value/GetCharge/GetUsage` 等操作始终落到正确子缓存
 
-## 2. 实现按 SST 层级路由
+## 2. 实现按 SST 层级路由（并修复键空间冲突）
 
-在 `MultiLevelCache` 中实现了基于文件层级的路由逻辑。
+在 `MultiLevelCache` 中实现了基于缓存键前缀的路由逻辑，并修复了“`file_number` 与 `cache_key_prefix` 共用同一映射表”导致的键空间冲突。
 
 主要内容：
 
-- 新增并发映射：`file_to_level_`
-  - 结构为分片 `unordered_map + shared_mutex`
-  - 分片数量固定（64）
-- 新增接口：`UpdateFileLevelMapping(uint64_t file_number, int level)`
+- 新增并发映射（分片 `unordered_map + shared_mutex`，分片数固定 64）：
+  - `file_number_to_level_`
+  - `cache_key_prefix_to_level_`
+- 新增/更新接口：
+  - `UpdateFileLevelMapping(uint64_t file_number, int level)`
+  - `UpdateCacheKeyPrefixMapping(uint64_t cache_key_prefix, int level)`
 - 路由流程（`Insert`/`Lookup`）：
-  1. 从 `Cache key` 中提取 `file_number`（当前实现为首 8 字节 `DecodeFixed64`）
-  2. 查询 `file_number -> level` 映射
+  1. 从 `Cache key` 中提取 8-byte common prefix（`DecodeFixed64`）
+  2. 查询 `cache_key_prefix -> level` 映射
   3. 命中则路由到 `sub_caches_[level]`
   4. 未命中或解析失败回退到 `sub_caches_[0]`
 
-## 3. 接入 `VersionSet` 自动刷新映射
+## 3. 接入 `VersionSet` 自动刷新映射（含生命周期清理）
 
-在 `db/version_set.cc` 中加入了版本切换时对层级映射的同步逻辑。
+在 `db/version_set.cc` 中加入了版本切换时对层级映射的同步逻辑，并补上映射生命周期管理（避免“只增不删”）。
 
 主要内容：
 
-- 新增辅助函数：`MaybeRefreshLevelCacheMapping(Cache*, const VersionStorageInfo&)`
+- 新增/更新辅助函数：
+  - `MaybeRefreshLevelCacheMapping(Cache*, const VersionStorageInfo&, const VersionStorageInfo* old_storage_info, ...)`
 - 通过 `CheckedCast<MultiLevelCache>()` 进行类型门控，仅在使用 `MultiLevelCache` 时生效
 - 在 `VersionSet::AppendVersion()` 中调用同步函数
-- 使用当前 `VersionStorageInfo` 全量遍历各层 SST 文件，刷新 `file_number -> level`
+- 使用当前 `VersionStorageInfo` 全量刷新活跃文件映射
+- 对 `old_storage_info` 与新版本做差量比较，删除不再存活文件的映射：
+  - `RemoveFileLevelMapping(file_number)`
+  - `RemoveCacheKeyPrefixMapping(cache_key_prefix)`
 
 ## 4. 实现动态容量调整（Phase 3）
 
@@ -80,6 +86,17 @@
   - 可在每轮实验前清零统计计数
 - 统计相关原子读写统一使用 `std::memory_order_relaxed`
 
+后续增强（为实验可观测性）：
+
+- 路由统计按调用类型拆分：
+  - `route_insert: queries / parse_failures / prefix_hits / prefix_misses / prefix_hit_rate`
+  - `route_lookup: queries / parse_failures / prefix_hits / prefix_misses / prefix_hit_rate`
+- 新增 `route_normalize_fallbacks`：
+  - 当映射命中但 level 非法（负数或越界）时，回落 L0 并计数
+- 新增映射表规模观测：
+  - `mapping_entries: file_number=..., cache_key_prefix=...`
+  - 便于直接观察映射生命周期清理效果
+
 ## 6. 并发与性能设计说明
 
 - 容量调整路径未引入额外全局重锁，依赖底层 cache（`ShardedCache/LRUCache`）已有同步机制
@@ -92,6 +109,15 @@
 ## 7. 当前版本行为总结
 
 - 默认子缓存容量初始化为均分
-- 路由优先按层映射；映射未命中回退到 L0 子缓存
+- 路由优先按 `cache_key_prefix -> level`；映射未命中回退到 L0 子缓存
 - 支持外部算法周期性下发容量向量进行动态调整
-- 支持实验前清零统计与实验后按层命中率导出
+- 支持实验前清零统计与实验后导出：
+  - 按层命中率
+  - Insert/Lookup 路由命中质量
+  - 映射表实时条目数
+
+## 8. Runner 与文档一致性修正
+
+- 修正 `tools/multilevel_cache_runner.cc` 注释与行为不一致问题：
+  - 由“make lower levels larger”改为“make the deepest level larger”
+  - 与当前容量分配逻辑（最后一层吃剩余容量）一致

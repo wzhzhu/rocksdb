@@ -22,6 +22,7 @@
 #include "block_cache.h"
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
+#include "cache/multi_level_cache.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
 #include "db/pinned_iterators_manager.h"
@@ -946,6 +947,17 @@ Status BlockBasedTable::Open(
   // With properties loaded, we can set up portable/stable cache keys
   SetupBaseCacheKey(rep->table_properties.get(), cur_db_session_id,
                     cur_file_num, &rep->base_cache_key);
+
+  // Best-effort: keep MultiLevelCache key-prefix -> level mapping fresh at
+  // table-open time, where both base_cache_key and LSM level are available.
+  if (level >= 0 && rep->table_options.block_cache) {
+    if (auto* multi_level_cache =
+            rep->table_options.block_cache->CheckedCast<MultiLevelCache>()) {
+      const Slice common_prefix = rep->base_cache_key.CommonPrefixSlice();
+      const uint64_t cache_key_prefix = DecodeFixed64(common_prefix.data());
+      multi_level_cache->UpdateCacheKeyPrefixMapping(cache_key_prefix, level);
+    }
+  }
 
   rep->persistent_cache_options =
       PersistentCacheOptions(rep->table_options.persistent_cache,

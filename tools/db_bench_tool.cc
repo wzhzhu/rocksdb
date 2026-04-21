@@ -39,6 +39,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "cache/multi_level_cache.h"
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
@@ -601,6 +602,9 @@ DEFINE_double(cache_low_pri_pool_ratio, 0.0,
               "Ratio of block cache reserve for low pri blocks.");
 
 DEFINE_string(cache_type, "hyper_clock_cache", "Type of block cache.");
+DEFINE_bool(use_multi_level_cache, false,
+            "If true, use MultiLevelCache for block cache. "
+            "This mode currently uses per-level LRU sub-caches.");
 
 DEFINE_bool(use_compressed_secondary_cache, false,
             "Use the CompressedSecondaryCache as the secondary cache.");
@@ -3288,7 +3292,8 @@ class Benchmark {
     return static_cast<int32_t>(*seed_base) & 0x7fffffff;
   }
 
-  static std::shared_ptr<Cache> NewCache(int64_t capacity) {
+  static std::shared_ptr<Cache> NewCache(int64_t capacity,
+                                         bool use_multi_level_cache) {
     CompressedSecondaryCacheOptions secondary_cache_opts;
     TieredAdmissionPolicy adm_policy = TieredAdmissionPolicy::kAdmPolicyAuto;
     bool use_tiered_cache = false;
@@ -3331,6 +3336,25 @@ class Benchmark {
     }
 
     std::shared_ptr<Cache> block_cache;
+    if (use_multi_level_cache) {
+      if (!FLAGS_cache_uri.empty()) {
+        fprintf(stderr,
+                "--use_multi_level_cache is not compatible with --cache_uri\n");
+        db_bench_exit(1);
+      }
+      if (FLAGS_cache_type != "lru_cache") {
+        fprintf(
+            stderr,
+            "Warning: --use_multi_level_cache ignores --cache_type=%s and uses "
+            "level-partitioned LRU sub-caches.\n",
+            FLAGS_cache_type.c_str());
+      }
+      const size_t level_count =
+          FLAGS_num_levels > 0 ? static_cast<size_t>(FLAGS_num_levels) : 1U;
+      return std::make_shared<MultiLevelCache>(
+          level_count, static_cast<size_t>(capacity));
+    }
+
     if (!FLAGS_cache_uri.empty()) {
       Status s = Cache::CreateFromString(ConfigOptions(), FLAGS_cache_uri,
                                          &block_cache);
@@ -3419,8 +3443,8 @@ class Benchmark {
 
  public:
   Benchmark()
-      : cache_(NewCache(FLAGS_cache_size)),
-        compressed_cache_(NewCache(FLAGS_compressed_cache_size)),
+      : cache_(NewCache(FLAGS_cache_size, FLAGS_use_multi_level_cache)),
+        compressed_cache_(NewCache(FLAGS_compressed_cache_size, false)),
         prefix_extractor_(FLAGS_prefix_size != 0
                               ? NewFixedPrefixTransform(FLAGS_prefix_size)
                               : nullptr),
@@ -3507,6 +3531,18 @@ class Benchmark {
   }
 
   ~Benchmark() {
+    if (cache_.get() != nullptr && FLAGS_use_multi_level_cache) {
+      auto* multi_level_cache = cache_->CheckedCast<MultiLevelCache>();
+      if (multi_level_cache != nullptr) {
+        fprintf(stdout, "=== MultiLevelCache Stats (db_bench final) ===\n");
+        fprintf(stdout, "%s", multi_level_cache->PrintStats().c_str());
+      } else {
+        fprintf(stdout,
+                "=== MultiLevelCache Stats (db_bench final) ===\n"
+                "block cache is not a direct MultiLevelCache instance\n");
+      }
+    }
+
     DeleteDBs();
     if (cache_.get() != nullptr) {
       // Clear cache reference first

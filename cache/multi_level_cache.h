@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <memory>
 #include <optional>
@@ -17,7 +18,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 // A cache wrapper that maintains one sub-cache per LSM-tree level.
-// Routing is based on cache key -> file number -> level mapping.
+// Routing is based on cache key prefix -> level mapping.
 class MultiLevelCache : public Cache {
  public:
   static const char* kClassName() { return "MultiLevelCache"; }
@@ -86,8 +87,18 @@ class MultiLevelCache : public Cache {
 
   // Thread-safe mapping update from SST file number to LSM-tree level.
   void UpdateFileLevelMapping(uint64_t file_number, int level);
+  void RemoveFileLevelMapping(uint64_t file_number);
+  // Thread-safe mapping update from cache key common prefix to LSM-tree level.
+  void UpdateCacheKeyPrefixMapping(uint64_t cache_key_prefix, int level);
+  void RemoveCacheKeyPrefixMapping(uint64_t cache_key_prefix);
 
  private:
+  enum class RouteCaller {
+    kInsert,
+    kLookup,
+    kOther,
+  };
+
   struct WrappedHandle : public Handle {
     size_t level_index = 0;
     Cache::Handle* inner = nullptr;
@@ -105,8 +116,9 @@ class MultiLevelCache : public Cache {
   Cache* PrimarySubCache();
   const Cache* PrimarySubCache() const;
 
-  size_t RouteLevelByKey(const Slice& key) const;
-  std::optional<uint64_t> GetFileNumberFromCacheKey(const Slice& key) const;
+  size_t RouteLevelByKey(const Slice& key, RouteCaller caller) const;
+  std::optional<uint64_t> GetCacheKeyPrefix(const Slice& key) const;
+  std::optional<int> FindLevelByCacheKeyPrefix(uint64_t cache_key_prefix) const;
   std::optional<int> FindLevelByFileNumber(uint64_t file_number) const;
 
   WrappedHandle* NewWrappedHandle(size_t level_index, Cache::Handle* inner);
@@ -114,14 +126,26 @@ class MultiLevelCache : public Cache {
   static const WrappedHandle* ToWrappedHandle(const Handle* handle);
 
   size_t NormalizeLevel(int level) const;
+  uint64_t CountMappingEntries(
+      const std::array<MappingShard, kMappingShardCount>& shards) const;
   Status ValidateCapacities(const std::vector<size_t>& capacities) const;
   void ApplyCapacities(const std::vector<size_t>& capacities);
 
   std::vector<std::shared_ptr<Cache>> sub_caches_;
-  std::vector<std::atomic<uint64_t>> lookups_;
-  std::vector<std::atomic<uint64_t>> hits_;
+  std::deque<std::atomic<uint64_t>> lookups_;
+  std::deque<std::atomic<uint64_t>> hits_;
+  mutable std::atomic<uint64_t> insert_route_queries_{0};
+  mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
+  mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};
+  mutable std::atomic<uint64_t> insert_route_prefix_misses_{0};
+  mutable std::atomic<uint64_t> lookup_route_queries_{0};
+  mutable std::atomic<uint64_t> lookup_route_parse_failures_{0};
+  mutable std::atomic<uint64_t> lookup_route_prefix_hits_{0};
+  mutable std::atomic<uint64_t> lookup_route_prefix_misses_{0};
+  mutable std::atomic<uint64_t> route_normalize_fallbacks_{0};
   std::atomic<size_t> total_capacity_;
-  std::array<MappingShard, kMappingShardCount> file_to_level_;
+  std::array<MappingShard, kMappingShardCount> file_number_to_level_;
+  std::array<MappingShard, kMappingShardCount> cache_key_prefix_to_level_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -696,6 +696,7 @@ set(SOURCES
         cache/clock_cache.cc
         cache/compressed_secondary_cache.cc
         cache/lru_cache.cc
+        cache/multi_level_cache.cc
         cache/secondary_cache.cc
         cache/secondary_cache_adapter.cc
         cache/sharded_cache.cc
@@ -1661,6 +1662,11 @@ if(WITH_BENCHMARK_TOOLS)
     tools/tool_hooks.cc
     tools/db_bench_tool.cc)
   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+
+  add_executable(multilevel_cache_runner${ARTIFACT_SUFFIX}
+    tools/multilevel_cache_runner.cc)
+  target_link_libraries(multilevel_cache_runner${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
 
   add_executable(cache_bench${ARTIFACT_SUFFIX}
