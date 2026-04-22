@@ -11,6 +11,7 @@
 
 #include "cache/multi_level_cache_allocator.h"
 #include "cache/multi_level_cache.h"
+#include "cache/cache_key.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
@@ -59,6 +60,12 @@ int main(int argc, char** argv) {
   }
   if (num_levels == 0) {
     num_levels = 1;
+  }
+  if (num_levels > static_cast<uint64_t>(ROCKSDB_NAMESPACE::kMaxEncodedCacheKeyLevel + 1)) {
+    std::cerr << "num_levels=" << num_levels
+              << " exceeds encoded route limit "
+              << (ROCKSDB_NAMESPACE::kMaxEncodedCacheKeyLevel + 1) << "\n";
+    return 1;
   }
 
   const size_t total_cache_bytes = static_cast<size_t>(cache_mb) * 1024 * 1024;

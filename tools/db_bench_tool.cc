@@ -29,6 +29,7 @@
 #endif
 #include <atomic>
 #include <cinttypes>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <iostream>
@@ -39,7 +40,9 @@
 #include <thread>
 #include <unordered_map>
 
+#include "cache/multi_level_cache_allocator.h"
 #include "cache/multi_level_cache.h"
+#include "cache/cache_key.h"
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
@@ -605,6 +608,16 @@ DEFINE_string(cache_type, "hyper_clock_cache", "Type of block cache.");
 DEFINE_bool(use_multi_level_cache, false,
             "If true, use MultiLevelCache for block cache. "
             "This mode currently uses per-level LRU sub-caches.");
+DEFINE_bool(multi_level_cache_auto_adjust, true,
+            "If true and --use_multi_level_cache=true, automatically start "
+            "the MultiLevelCacheAllocator during db_bench run.");
+DEFINE_uint64(multi_level_cache_adjust_interval_ms, 1000,
+              "Allocator solve/apply interval in milliseconds.");
+DEFINE_double(multi_level_cache_adjust_smoothing_ratio, 0.5,
+              "Allocator smoothing ratio in [0,1]. 1 means no smoothing.");
+DEFINE_uint64(
+    multi_level_cache_adjust_min_change_bytes, 1 << 20,
+    "Allocator minimum total capacity change to trigger AdjustCapacities.");
 
 DEFINE_bool(use_compressed_secondary_cache, false,
             "Use the CompressedSecondaryCache as the secondary cache.");
@@ -2910,6 +2923,8 @@ static std::atomic<int> openandcompact_run_counter{0};
 class Benchmark {
  private:
   std::shared_ptr<Cache> cache_;
+  std::shared_ptr<MultiLevelCache> multi_level_cache_;
+  std::unique_ptr<MultiLevelCacheAllocator> multi_level_allocator_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const SliceTransform> prefix_extractor_;
   DBWithColumnFamilies db_;
@@ -2994,9 +3009,88 @@ class Benchmark {
 
   std::unique_ptr<TimestampEmulator> mock_app_clock_;
 
+  void MaybeStartMultiLevelAllocator() {
+    if (!FLAGS_use_multi_level_cache || !FLAGS_multi_level_cache_auto_adjust ||
+        multi_level_cache_ == nullptr) {
+      return;
+    }
+
+    auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
+    std::vector<uint64_t> prev_lookups = snapshot.lookups;
+    MultiLevelCacheAllocator::MetricsProvider provider =
+        [cache = multi_level_cache_,
+         prev_lookups](std::vector<double>* lambda, std::vector<double>* data,
+                       std::vector<double>* alpha) mutable {
+          if (lambda == nullptr || data == nullptr || alpha == nullptr) {
+            return false;
+          }
+          const auto stats = cache->GetLevelMetricsSnapshot();
+          const size_t level_count = stats.lookups.size();
+          if (level_count == 0 || prev_lookups.size() != level_count) {
+            prev_lookups = stats.lookups;
+            return false;
+          }
+
+          lambda->assign(level_count, 1.0);
+          data->assign(level_count, 1.0);
+          alpha->assign(level_count, 1.0);
+
+          uint64_t total_observed_data = 0;
+          size_t observed_levels = 0;
+          for (size_t level = 0; level < level_count; ++level) {
+            if (stats.data_sizes[level] > 0) {
+              total_observed_data += stats.data_sizes[level];
+              ++observed_levels;
+            }
+          }
+          const double default_data =
+              observed_levels > 0
+                  ? static_cast<double>(total_observed_data) /
+                        static_cast<double>(observed_levels)
+                  : 1.0;
+          constexpr double kLambdaEpsilon = 1e-6;
+          for (size_t level = 0; level < level_count; ++level) {
+            const uint64_t curr = stats.lookups[level];
+            const uint64_t prev = prev_lookups[level];
+            const uint64_t delta = curr >= prev ? curr - prev : 0;
+            (*lambda)[level] =
+                delta > 0 ? static_cast<double>(delta) : kLambdaEpsilon;
+            (*data)[level] = stats.data_sizes[level] > 0
+                                 ? static_cast<double>(stats.data_sizes[level])
+                                 : default_data;
+            (*alpha)[level] = 1.0;
+          }
+          prev_lookups = stats.lookups;
+          return true;
+        };
+
+    MultiLevelAllocationOptions options;
+    options.interval_ms = FLAGS_multi_level_cache_adjust_interval_ms;
+    options.smoothing_ratio = FLAGS_multi_level_cache_adjust_smoothing_ratio;
+    options.min_total_change_bytes =
+        static_cast<size_t>(FLAGS_multi_level_cache_adjust_min_change_bytes);
+    multi_level_allocator_ = std::make_unique<MultiLevelCacheAllocator>(
+        multi_level_cache_, std::move(provider), options);
+    multi_level_allocator_->Start();
+    fprintf(stdout,
+            "=== MultiLevelCache Allocator (db_bench) started: interval_ms=%" PRIu64
+            ", smoothing_ratio=%.3f, min_change_bytes=%" PRIu64 " ===\n",
+            FLAGS_multi_level_cache_adjust_interval_ms,
+            FLAGS_multi_level_cache_adjust_smoothing_ratio,
+            FLAGS_multi_level_cache_adjust_min_change_bytes);
+  }
+
   bool SanityCheck() {
     if (FLAGS_compression_ratio > 1) {
       fprintf(stderr, "compression_ratio should be between 0 and 1\n");
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        FLAGS_num_levels > (kMaxEncodedCacheKeyLevel + 1)) {
+      fprintf(stderr,
+              "--num_levels=%d exceeds encoded route limit (%d) when "
+              "--use_multi_level_cache=true\n",
+              FLAGS_num_levels, kMaxEncodedCacheKeyLevel + 1);
       return false;
     }
     return true;
@@ -3342,6 +3436,13 @@ class Benchmark {
                 "--use_multi_level_cache is not compatible with --cache_uri\n");
         db_bench_exit(1);
       }
+      if (FLAGS_num_levels > (kMaxEncodedCacheKeyLevel + 1)) {
+        fprintf(stderr,
+                "--num_levels=%d exceeds encoded route limit (%d) when "
+                "--use_multi_level_cache=true\n",
+                FLAGS_num_levels, kMaxEncodedCacheKeyLevel + 1);
+        db_bench_exit(1);
+      }
       if (FLAGS_cache_type != "lru_cache") {
         fprintf(
             stderr,
@@ -3466,6 +3567,21 @@ class Benchmark {
         report_file_operations_(FLAGS_report_file_operations),
         use_blob_db_(FLAGS_use_blob_db),  // Stacked BlobDB
         read_operands_(false) {
+    if (FLAGS_use_multi_level_cache) {
+      if (cache_ != nullptr) {
+        if (auto* raw = cache_->CheckedCast<MultiLevelCache>()) {
+          // Aliasing shared_ptr: share ownership with cache_ without RTTI.
+          multi_level_cache_ =
+              std::shared_ptr<MultiLevelCache>(cache_, raw);
+        }
+      }
+      if (multi_level_cache_ == nullptr) {
+        fprintf(stdout,
+                "=== MultiLevelCache Allocator (db_bench) skipped: "
+                "block cache is not MultiLevelCache ===\n");
+      }
+    }
+
     // use simcache instead of cache
     if (FLAGS_simcache_size >= 0) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -3521,6 +3637,7 @@ class Benchmark {
     if (user_timestamp_size_ > 0) {
       mock_app_clock_.reset(new TimestampEmulator());
     }
+    MaybeStartMultiLevelAllocator();
   }
 
   void DeleteDBs() {
@@ -3531,8 +3648,15 @@ class Benchmark {
   }
 
   ~Benchmark() {
+    if (multi_level_allocator_ != nullptr) {
+      multi_level_allocator_->Stop();
+      multi_level_allocator_.reset();
+    }
+
     if (cache_.get() != nullptr && FLAGS_use_multi_level_cache) {
-      auto* multi_level_cache = cache_->CheckedCast<MultiLevelCache>();
+      auto* multi_level_cache =
+          multi_level_cache_ != nullptr ? multi_level_cache_.get()
+                                        : cache_->CheckedCast<MultiLevelCache>();
       if (multi_level_cache != nullptr) {
         fprintf(stdout, "=== MultiLevelCache Stats (db_bench final) ===\n");
         fprintf(stdout, "%s", multi_level_cache->PrintStats().c_str());

@@ -22,7 +22,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "cache/cache_key.h"
 #include "cache/multi_level_cache.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_cache.h"
@@ -101,11 +100,8 @@ namespace {
 
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
 
-void MaybeRefreshLevelCacheMapping(Cache* cache,
-                                   const VersionStorageInfo& storage_info,
-                                   const VersionStorageInfo* old_storage_info,
-                                   const std::string& db_id,
-                                   const std::string& db_session_id) {
+void MaybeRefreshLevelCacheState(Cache* cache,
+                                 const VersionStorageInfo& storage_info) {
   if (cache == nullptr) {
     return;
   }
@@ -114,49 +110,18 @@ void MaybeRefreshLevelCacheMapping(Cache* cache,
     return;
   }
 
-  if (old_storage_info != nullptr) {
-    std::unordered_set<uint64_t> live_files;
-    for (int level = 0; level < storage_info.num_levels(); ++level) {
-      for (FileMetaData* file_meta : storage_info.LevelFiles(level)) {
-        if (file_meta != nullptr) {
-          live_files.insert(file_meta->fd.GetNumber());
-        }
-      }
-    }
-    for (int level = 0; level < old_storage_info->num_levels(); ++level) {
-      for (FileMetaData* file_meta : old_storage_info->LevelFiles(level)) {
-        if (file_meta == nullptr) {
-          continue;
-        }
-        const uint64_t file_number = file_meta->fd.GetNumber();
-        if (live_files.find(file_number) != live_files.end()) {
-          continue;
-        }
-        multi_level_cache->RemoveFileLevelMapping(file_number);
-        OffsetableCacheKey base_key(db_id, db_session_id, file_number);
-        const Slice common_prefix = base_key.CommonPrefixSlice();
-        const uint64_t cache_key_prefix = DecodeFixed64(common_prefix.data());
-        multi_level_cache->RemoveCacheKeyPrefixMapping(cache_key_prefix);
-      }
-    }
-  }
-
+  std::vector<uint64_t> level_data_sizes(
+      static_cast<size_t>(storage_info.num_levels()), 0);
   for (int level = 0; level < storage_info.num_levels(); ++level) {
+    uint64_t total_size = 0;
     for (FileMetaData* file_meta : storage_info.LevelFiles(level)) {
       if (file_meta != nullptr) {
-        const uint64_t file_number = file_meta->fd.GetNumber();
-        const uint64_t file_size = file_meta->fd.GetFileSize();
-        multi_level_cache->UpdateFileMetadata(file_number, level, file_size);
-
-        // Keep route key format aligned with block cache key's 8-byte common
-        // prefix generated from db/session/file identity.
-        OffsetableCacheKey base_key(db_id, db_session_id, file_number);
-        const Slice common_prefix = base_key.CommonPrefixSlice();
-        const uint64_t cache_key_prefix = DecodeFixed64(common_prefix.data());
-        multi_level_cache->UpdateCacheKeyPrefixMapping(cache_key_prefix, level);
+        total_size += file_meta->fd.GetFileSize();
       }
     }
+    level_data_sizes[static_cast<size_t>(level)] = total_size;
   }
+  multi_level_cache->UpdateLevelDataSizes(level_data_sizes);
 }
 
 // Find File in LevelFilesBrief data structure
@@ -5929,11 +5894,7 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
 
   // Mark v finalized
   v->storage_info_.SetFinalized();
-  const Version* current = column_family_data->current();
-  const VersionStorageInfo* old_storage_info =
-      current != nullptr ? current->storage_info() : nullptr;
-  MaybeRefreshLevelCacheMapping(table_cache_, *v->storage_info(),
-                                old_storage_info, db_id_, db_session_id_);
+  MaybeRefreshLevelCacheState(table_cache_, *v->storage_info());
 
   // Make "v" current
   assert(v->refs_ == 0);

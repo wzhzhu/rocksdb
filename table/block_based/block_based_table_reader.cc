@@ -22,7 +22,6 @@
 #include "block_cache.h"
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
-#include "cache/multi_level_cache.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
 #include "db/pinned_iterators_manager.h"
@@ -680,7 +679,7 @@ void BlockBasedTable::SetupBaseCacheKey(const TableProperties* properties,
                                         const std::string& cur_db_session_id,
                                         uint64_t cur_file_number,
                                         OffsetableCacheKey* out_base_cache_key,
-                                        bool* out_is_stable) {
+                                        bool* out_is_stable, int level) {
   // Use a stable cache key if sufficient data is in table properties
   std::string db_session_id;
   uint64_t file_num;
@@ -723,6 +722,9 @@ void BlockBasedTable::SetupBaseCacheKey(const TableProperties* properties,
   // Minimum block size is 5 bytes; therefore we can trim off two lower bits
   // from offsets. See GetCacheKey.
   *out_base_cache_key = OffsetableCacheKey(db_id, db_session_id, file_num);
+  if (IsCacheKeyLevelEncodable(level)) {
+    *out_base_cache_key = out_base_cache_key->WithLevel(level);
+  }
 }
 
 CacheKey BlockBasedTable::GetCacheKey(const OffsetableCacheKey& base_cache_key,
@@ -946,19 +948,7 @@ Status BlockBasedTable::Open(
 
   // With properties loaded, we can set up portable/stable cache keys
   SetupBaseCacheKey(rep->table_properties.get(), cur_db_session_id,
-                    cur_file_num, &rep->base_cache_key);
-
-  // Best-effort: keep MultiLevelCache key-prefix -> level mapping fresh at
-  // table-open time, where both base_cache_key and LSM level are available.
-  if (level >= 0 && rep->table_options.block_cache) {
-    if (auto* multi_level_cache =
-            rep->table_options.block_cache->CheckedCast<MultiLevelCache>()) {
-      multi_level_cache->UpdateFileMetadata(cur_file_num, level, file_size);
-      const Slice common_prefix = rep->base_cache_key.CommonPrefixSlice();
-      const uint64_t cache_key_prefix = DecodeFixed64(common_prefix.data());
-      multi_level_cache->UpdateCacheKeyPrefixMapping(cache_key_prefix, level);
-    }
-  }
+                    cur_file_num, &rep->base_cache_key, nullptr, level);
 
   rep->persistent_cache_options =
       PersistentCacheOptions(rep->table_options.persistent_cache,

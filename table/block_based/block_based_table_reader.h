@@ -264,7 +264,8 @@ class BlockBasedTable : public TableReader {
                                 const std::string& cur_db_session_id,
                                 uint64_t cur_file_number,
                                 OffsetableCacheKey* out_base_cache_key,
-                                bool* out_is_stable = nullptr);
+                                bool* out_is_stable = nullptr,
+                                int level = -1);
 
   static CacheKey GetCacheKey(const OffsetableCacheKey& base_cache_key,
                               const BlockHandle& handle);

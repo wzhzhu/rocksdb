@@ -1,15 +1,12 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <string>
 #include <memory>
 #include <optional>
-#include <shared_mutex>
-#include <unordered_map>
+#include <string>
 #include <vector>
 
 #include "rocksdb/advanced_cache.h"
@@ -18,7 +15,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 // A cache wrapper that maintains one sub-cache per LSM-tree level.
-// Routing is based on cache key prefix -> level mapping.
+// Routing decodes level directly from cache key prefix.
 class MultiLevelCache : public Cache {
  public:
   struct LevelMetricsSnapshot {
@@ -93,13 +90,8 @@ class MultiLevelCache : public Cache {
   void ResetStats();
   LevelMetricsSnapshot GetLevelMetricsSnapshot() const;
 
-  // Thread-safe mapping update from SST file number to LSM-tree level.
-  void UpdateFileLevelMapping(uint64_t file_number, int level);
-  void UpdateFileMetadata(uint64_t file_number, int level, uint64_t file_size);
-  void RemoveFileLevelMapping(uint64_t file_number);
-  // Thread-safe mapping update from cache key common prefix to LSM-tree level.
-  void UpdateCacheKeyPrefixMapping(uint64_t cache_key_prefix, int level);
-  void RemoveCacheKeyPrefixMapping(uint64_t cache_key_prefix);
+  // Replaces per-level data sizes used by allocator D_i metric.
+  void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
 
  private:
   enum class RouteCaller {
@@ -113,17 +105,6 @@ class MultiLevelCache : public Cache {
     Cache::Handle* inner = nullptr;
   };
 
-  struct MappingShard {
-    mutable std::shared_mutex mutex;
-    std::unordered_map<uint64_t, int> map;
-  };
-  struct SizeShard {
-    mutable std::shared_mutex mutex;
-    std::unordered_map<uint64_t, uint64_t> map;
-  };
-
-  static constexpr size_t kMappingShardCount = 64;
-
   Cache* SubCacheByLevel(size_t level_index);
   const Cache* SubCacheByLevel(size_t level_index) const;
   Cache* PrimarySubCache();
@@ -131,15 +112,15 @@ class MultiLevelCache : public Cache {
 
   size_t RouteLevelByKey(const Slice& key, RouteCaller caller) const;
   std::optional<uint64_t> GetCacheKeyPrefix(const Slice& key) const;
-  std::optional<int> FindLevelByCacheKeyPrefix(uint64_t cache_key_prefix) const;
+  void MaybeLogRouteMiss(RouteCaller caller, const Slice& key, bool has_prefix,
+                         uint64_t key_prefix, const char* reason) const;
+  static const char* RouteCallerToString(RouteCaller caller);
+  static int64_t ParseDebugMissLimit();
 
   WrappedHandle* NewWrappedHandle(size_t level_index, Cache::Handle* inner);
   static WrappedHandle* ToWrappedHandle(Handle* handle);
   static const WrappedHandle* ToWrappedHandle(const Handle* handle);
 
-  size_t NormalizeLevel(int level) const;
-  uint64_t CountMappingEntries(
-      const std::array<MappingShard, kMappingShardCount>& shards) const;
   Status ValidateCapacities(const std::vector<size_t>& capacities) const;
   void ApplyCapacities(const std::vector<size_t>& capacities);
 
@@ -156,10 +137,8 @@ class MultiLevelCache : public Cache {
   mutable std::atomic<uint64_t> lookup_route_prefix_hits_{0};
   mutable std::atomic<uint64_t> lookup_route_prefix_misses_{0};
   mutable std::atomic<uint64_t> route_normalize_fallbacks_{0};
+  mutable std::atomic<int64_t> debug_miss_budget_{0};
   std::atomic<size_t> total_capacity_;
-  std::array<MappingShard, kMappingShardCount> file_number_to_level_;
-  std::array<SizeShard, kMappingShardCount> file_number_to_size_;
-  std::array<MappingShard, kMappingShardCount> cache_key_prefix_to_level_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

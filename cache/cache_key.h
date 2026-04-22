@@ -138,6 +138,54 @@ class OffsetableCacheKey : private CacheKey {
 
     return Slice(reinterpret_cast<const char*>(this), kCommonPrefixSize);
   }
+
+  // Returns a copy whose common prefix explicitly encodes LSM level.
+  OffsetableCacheKey WithLevel(int level) const;
 };
+
+// Common-prefix level encoding for transitional routing without external
+// key-prefix->level map lookup.
+//
+// Layout of encoded prefix (MSB -> LSB):
+// [8-bit marker][3-bit level][53-bit payload-from-raw-prefix]
+//
+// Marker makes false positives from old-format prefixes very unlikely.
+constexpr uint64_t kCacheKeyLevelMarker = 0xB6;
+constexpr int kCacheKeyLevelBits = 3;
+constexpr int kMaxEncodedCacheKeyLevel = (1 << kCacheKeyLevelBits) - 1;
+constexpr int kCacheKeyLevelShift = 53;
+constexpr uint64_t kCacheKeyLevelPayloadMask =
+    (static_cast<uint64_t>(1) << kCacheKeyLevelShift) - 1;
+
+inline bool IsCacheKeyLevelEncodable(int level) {
+  return level >= 0 && level <= kMaxEncodedCacheKeyLevel;
+}
+
+inline uint64_t EncodeCacheKeyCommonPrefixWithLevel(uint64_t raw_prefix,
+                                                    int level) {
+  if (!IsCacheKeyLevelEncodable(level)) {
+    return raw_prefix;
+  }
+  const uint64_t level_bits =
+      static_cast<uint64_t>(level) & ((static_cast<uint64_t>(1)
+                                       << kCacheKeyLevelBits) -
+                                      1);
+  return (kCacheKeyLevelMarker << 56) |
+         (level_bits << kCacheKeyLevelShift) |
+         (raw_prefix & kCacheKeyLevelPayloadMask);
+}
+
+inline bool DecodeLevelFromEncodedCacheKeyCommonPrefix(uint64_t encoded_prefix,
+                                                       int* level) {
+  if (((encoded_prefix >> 56) & 0xFF) != kCacheKeyLevelMarker) {
+    return false;
+  }
+  if (level != nullptr) {
+    *level = static_cast<int>(
+        (encoded_prefix >> kCacheKeyLevelShift) &
+        ((static_cast<uint64_t>(1) << kCacheKeyLevelBits) - 1));
+  }
+  return true;
+}
 
 }  // namespace ROCKSDB_NAMESPACE

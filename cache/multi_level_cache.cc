@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdlib>
 #include <iomanip>
-#include <mutex>
 #include <sstream>
 #include <utility>
 
+#include "cache/cache_key.h"
 #include "util/coding.h"
 namespace ROCKSDB_NAMESPACE {
 
@@ -17,14 +19,10 @@ size_t SafeLevelCount(size_t num_levels) {
   return std::max<size_t>(num_levels, 1);
 }
 
-size_t ShardIndex(uint64_t file_number) {
-  return file_number % 64;
-}
-
 }  // namespace
 
 MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity)
-    : total_capacity_(total_capacity) {
+    : debug_miss_budget_(ParseDebugMissLimit()), total_capacity_(total_capacity) {
   const size_t level_count = SafeLevelCount(num_levels);
   sub_caches_.reserve(level_count);
 
@@ -287,10 +285,6 @@ std::string MultiLevelCache::PrintStats() const {
 
   const uint64_t route_normalize_fallbacks =
       route_normalize_fallbacks_.load(std::memory_order_relaxed);
-  const uint64_t file_mapping_entries =
-      CountMappingEntries(file_number_to_level_);
-  const uint64_t prefix_mapping_entries =
-      CountMappingEntries(cache_key_prefix_to_level_);
   oss << "route_insert: queries=" << insert_queries
       << ", parse_failures=" << insert_parse_failures
       << ", prefix_hits=" << insert_prefix_hits
@@ -302,8 +296,6 @@ std::string MultiLevelCache::PrintStats() const {
       << ", prefix_misses=" << lookup_prefix_misses
       << ", prefix_hit_rate=" << lookup_prefix_hit_rate << "\n";
   oss << "route_normalize_fallbacks=" << route_normalize_fallbacks << "\n";
-  oss << "mapping_entries: file_number=" << file_mapping_entries
-      << ", cache_key_prefix=" << prefix_mapping_entries << "\n";
   oss << "total_hit_rate=" << total_hit_rate << " (" << total_hits << "/"
       << total_lookups << ")\n";
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
@@ -357,77 +349,16 @@ MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
   return snapshot;
 }
 
-void MultiLevelCache::UpdateFileLevelMapping(uint64_t file_number, int level) {
-  const size_t shard_index = ShardIndex(file_number);
-  MappingShard& shard = file_number_to_level_[shard_index];
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  shard.map[file_number] = level;
-}
-
-void MultiLevelCache::UpdateFileMetadata(uint64_t file_number, int level,
-                                         uint64_t file_size) {
-  const size_t normalized_level = NormalizeLevel(level);
-  const size_t shard_index = ShardIndex(file_number);
-  MappingShard& level_shard = file_number_to_level_[shard_index];
-  SizeShard& size_shard = file_number_to_size_[shard_index];
-  std::unique_lock<std::shared_mutex> level_lock(level_shard.mutex);
-  std::unique_lock<std::shared_mutex> size_lock(size_shard.mutex);
-
-  size_t old_level = normalized_level;
-  uint64_t old_size = 0;
-  auto level_it = level_shard.map.find(file_number);
-  if (level_it != level_shard.map.end()) {
-    old_level = NormalizeLevel(level_it->second);
+void MultiLevelCache::UpdateLevelDataSizes(
+    const std::vector<uint64_t>& level_data_sizes) {
+  const size_t limit = std::min(level_data_sizes.size(), level_data_sizes_.size());
+  for (size_t level = 0; level < limit; ++level) {
+    level_data_sizes_[level].store(level_data_sizes[level],
+                                   std::memory_order_relaxed);
   }
-  auto size_it = size_shard.map.find(file_number);
-  if (size_it != size_shard.map.end()) {
-    old_size = size_it->second;
+  for (size_t level = limit; level < level_data_sizes_.size(); ++level) {
+    level_data_sizes_[level].store(0, std::memory_order_relaxed);
   }
-
-  if (old_size > 0) {
-    level_data_sizes_[old_level].fetch_sub(old_size, std::memory_order_relaxed);
-  }
-  level_data_sizes_[normalized_level].fetch_add(file_size,
-                                                std::memory_order_relaxed);
-  level_shard.map[file_number] = level;
-  size_shard.map[file_number] = file_size;
-}
-
-void MultiLevelCache::RemoveFileLevelMapping(uint64_t file_number) {
-  const size_t shard_index = ShardIndex(file_number);
-  MappingShard& level_shard = file_number_to_level_[shard_index];
-  SizeShard& size_shard = file_number_to_size_[shard_index];
-  std::unique_lock<std::shared_mutex> level_lock(level_shard.mutex);
-  std::unique_lock<std::shared_mutex> size_lock(size_shard.mutex);
-
-  auto level_it = level_shard.map.find(file_number);
-  auto size_it = size_shard.map.find(file_number);
-  if (level_it != level_shard.map.end() && size_it != size_shard.map.end()) {
-    const size_t old_level = NormalizeLevel(level_it->second);
-    level_data_sizes_[old_level].fetch_sub(size_it->second,
-                                           std::memory_order_relaxed);
-  }
-  if (level_it != level_shard.map.end()) {
-    level_shard.map.erase(level_it);
-  }
-  if (size_it != size_shard.map.end()) {
-    size_shard.map.erase(size_it);
-  }
-}
-
-void MultiLevelCache::UpdateCacheKeyPrefixMapping(uint64_t cache_key_prefix,
-                                                  int level) {
-  const size_t shard_index = ShardIndex(cache_key_prefix);
-  MappingShard& shard = cache_key_prefix_to_level_[shard_index];
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  shard.map[cache_key_prefix] = level;
-}
-
-void MultiLevelCache::RemoveCacheKeyPrefixMapping(uint64_t cache_key_prefix) {
-  const size_t shard_index = ShardIndex(cache_key_prefix);
-  MappingShard& shard = cache_key_prefix_to_level_[shard_index];
-  std::unique_lock<std::shared_mutex> lock(shard.mutex);
-  shard.map.erase(cache_key_prefix);
 }
 
 size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
@@ -460,23 +391,28 @@ size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
     if (route_parse_failures != nullptr) {
       route_parse_failures->fetch_add(1, std::memory_order_relaxed);
     }
+    MaybeLogRouteMiss(caller, key, /*has_prefix=*/false, 0,
+                      "prefix_parse_failure");
     return 0;
   }
-  const std::optional<int> level = FindLevelByCacheKeyPrefix(*key_prefix);
-  if (!level.has_value()) {
-    if (route_prefix_misses != nullptr) {
-      route_prefix_misses->fetch_add(1, std::memory_order_relaxed);
+  int encoded_level = 0;
+  if (DecodeLevelFromEncodedCacheKeyCommonPrefix(*key_prefix, &encoded_level)) {
+    if (route_prefix_hits != nullptr) {
+      route_prefix_hits->fetch_add(1, std::memory_order_relaxed);
     }
-    return 0;
+    if (encoded_level < 0 ||
+        static_cast<size_t>(encoded_level) >= sub_caches_.size()) {
+      route_normalize_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+      return 0;
+    }
+    return static_cast<size_t>(encoded_level);
   }
-  if (route_prefix_hits != nullptr) {
-    route_prefix_hits->fetch_add(1, std::memory_order_relaxed);
+  if (route_prefix_misses != nullptr) {
+    route_prefix_misses->fetch_add(1, std::memory_order_relaxed);
   }
-  if (*level < 0 || static_cast<size_t>(*level) >= sub_caches_.size()) {
-    route_normalize_fallbacks_.fetch_add(1, std::memory_order_relaxed);
-    return 0;
-  }
-  return static_cast<size_t>(*level);
+  MaybeLogRouteMiss(caller, key, /*has_prefix=*/true, *key_prefix,
+                    "prefix_marker_miss");
+  return 0;
 }
 
 std::optional<uint64_t> MultiLevelCache::GetCacheKeyPrefix(
@@ -487,18 +423,6 @@ std::optional<uint64_t> MultiLevelCache::GetCacheKeyPrefix(
     return std::nullopt;
   }
   return DecodeFixed64(key.data());
-}
-
-std::optional<int> MultiLevelCache::FindLevelByCacheKeyPrefix(
-    uint64_t cache_key_prefix) const {
-  const size_t shard_index = ShardIndex(cache_key_prefix);
-  const MappingShard& shard = cache_key_prefix_to_level_[shard_index];
-  std::shared_lock<std::shared_mutex> lock(shard.mutex);
-  auto it = shard.map.find(cache_key_prefix);
-  if (it == shard.map.end()) {
-    return std::nullopt;
-  }
-  return it->second;
 }
 
 MultiLevelCache::WrappedHandle* MultiLevelCache::NewWrappedHandle(
@@ -524,27 +448,6 @@ const MultiLevelCache::WrappedHandle* MultiLevelCache::ToWrappedHandle(
   const auto* wrapped = static_cast<const WrappedHandle*>(handle);
   assert(wrapped->inner != nullptr);
   return wrapped;
-}
-
-size_t MultiLevelCache::NormalizeLevel(int level) const {
-  if (level < 0) {
-    return 0;
-  }
-  const size_t level_index = static_cast<size_t>(level);
-  if (level_index >= sub_caches_.size()) {
-    return 0;
-  }
-  return level_index;
-}
-
-uint64_t MultiLevelCache::CountMappingEntries(
-    const std::array<MappingShard, kMappingShardCount>& shards) const {
-  uint64_t total = 0;
-  for (const MappingShard& shard : shards) {
-    std::shared_lock<std::shared_mutex> lock(shard.mutex);
-    total += shard.map.size();
-  }
-  return total;
 }
 
 Status MultiLevelCache::ValidateCapacities(
@@ -588,6 +491,56 @@ Cache* MultiLevelCache::PrimarySubCache() {
 
 const Cache* MultiLevelCache::PrimarySubCache() const {
   return SubCacheByLevel(0);
+}
+
+void MultiLevelCache::MaybeLogRouteMiss(RouteCaller caller, const Slice& key,
+                                        bool has_prefix, uint64_t key_prefix,
+                                        const char* reason) const {
+  int64_t remaining = debug_miss_budget_.load(std::memory_order_relaxed);
+  while (remaining > 0) {
+    if (debug_miss_budget_.compare_exchange_weak(
+            remaining, remaining - 1, std::memory_order_relaxed,
+            std::memory_order_relaxed)) {
+      if (has_prefix) {
+        std::fprintf(stderr,
+                     "[MultiLevelCache][route_miss] caller=%s reason=%s "
+                     "key_size=%zu prefix=0x%016" PRIx64 "\n",
+                     RouteCallerToString(caller), reason, key.size(),
+                     key_prefix);
+      } else {
+        std::fprintf(stderr,
+                     "[MultiLevelCache][route_miss] caller=%s reason=%s "
+                     "key_size=%zu\n",
+                     RouteCallerToString(caller), reason, key.size());
+      }
+      return;
+    }
+  }
+}
+
+const char* MultiLevelCache::RouteCallerToString(RouteCaller caller) {
+  switch (caller) {
+    case RouteCaller::kInsert:
+      return "insert";
+    case RouteCaller::kLookup:
+      return "lookup";
+    case RouteCaller::kOther:
+      return "other";
+  }
+  return "unknown";
+}
+
+int64_t MultiLevelCache::ParseDebugMissLimit() {
+  const char* env = std::getenv("MLC_ROUTE_DEBUG_MISS_LIMIT");
+  if (env == nullptr || env[0] == '\0') {
+    return 0;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(env, &end, 10);
+  if (end == env || (end != nullptr && *end != '\0') || parsed <= 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(parsed);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
