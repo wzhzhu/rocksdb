@@ -147,3 +147,26 @@
 1. **P0**：落地无损编码方案（解决 R1，兼顾 R2 扩展性）。
 2. **P1**：扩展层数支持（>8）并补充单测/压力回归。
 3. **P2**：按需清理非主路径调用点（兼容性完善），降低“隐式回落 L0”概率。
+
+## Release Notes（简版）
+
+- **架构变更**
+  - 完成 Step B：`MultiLevelCache` 路由改为纯 `key-level` 直解（从 cache key 前缀解码 level）。
+  - 移除 map-based 路由依赖与维护链路（不再依赖 file/prefix 映射表做路由）。
+  - `VersionSet` 仅保留按层 `D_i`（`level_data_sizes_`）同步，用于 allocator 指标，不参与路由判定。
+
+- **稳定性与防错**
+  - 增加 encoded-level 上限防护（当前编码支持 8 层）：
+    - `db_bench` / `multilevel_cache_runner` / 验证脚本都会拒绝 `num_levels > 8`，避免静默回绕。
+  - 增加可选 miss 调试能力：
+    - 通过 `MLC_ROUTE_DEBUG_MISS_LIMIT` 打印前 N 条 route miss（caller/reason/key_size/prefix）。
+
+- **验证与工具**
+  - 新增 `tools/verify_mlc_routing.sh`：一键做路由正确性检查（fill + read + 统计判定）。
+  - 新增 `tools/verify_mlc_ci.sh`：CI 风格一键检查（编译、路由、guard、allocator 冒烟）。
+  - 新增 `tools/compare_cache_hit_rate.sh`：MLC vs baseline 命中率对比。
+  - 新增论文一页摘要文档：`MultiLevelCache_Paper_OnePager.md`。
+
+- **当前已知风险（已记录）**
+  - 编码方案当前对原始前缀有损（空间压缩），理论上仍有碰撞风险（后续可做无损编码重构）。
+  - 非主路径少量 key 不带 level marker，可能出现极小量 `prefix_miss`（主要表现为统计噪声，对主路径影响很小）。
