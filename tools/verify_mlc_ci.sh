@@ -26,6 +26,10 @@ set -euo pipefail
 #   MIN_PREFIX_HIT_RATE=0.95
 #   MIN_LOOKUP_QUERIES=1000
 #   RESULT_ROOT=/tmp/mlc_ci_verify
+#   RUN_FLOOR_ABLATION=1
+#   ABL_NUM=200000
+#   ABL_READS=100000
+#   ABL_THREADS=4
 
 ROOT="${1:-/home/gpu/wzhzhu/rocksdb}"
 BUILD_JOBS="${BUILD_JOBS:-4}"
@@ -38,11 +42,17 @@ VALUE_SIZE="${VALUE_SIZE:-128}"
 MIN_PREFIX_HIT_RATE="${MIN_PREFIX_HIT_RATE:-0.95}"
 MIN_LOOKUP_QUERIES="${MIN_LOOKUP_QUERIES:-1000}"
 RESULT_ROOT="${RESULT_ROOT:-/tmp/mlc_ci_verify}"
+RUN_FLOOR_ABLATION="${RUN_FLOOR_ABLATION:-1}"
+ABL_NUM="${ABL_NUM:-200000}"
+ABL_READS="${ABL_READS:-100000}"
+ABL_THREADS="${ABL_THREADS:-4}"
 
 ROUTING_LOG_DIR="${RESULT_ROOT}/routing"
 ALLOC_LOG="${RESULT_ROOT}/allocator_smoke.log"
 DB_PATH_ROUTING="${RESULT_ROOT}/db_routing"
 DB_PATH_ALLOC="${RESULT_ROOT}/db_allocator"
+FLOOR_WITH_LOG="${RESULT_ROOT}/floor_with.log"
+FLOOR_NO_LOG="${RESULT_ROOT}/floor_without.log"
 
 pass=true
 
@@ -57,6 +67,22 @@ run_step() {
   echo
   echo "==> ${title}"
   "$@"
+}
+
+extract_data_hit_rate() {
+  local log_file="$1"
+  awk '
+    /rocksdb\.block\.cache\.data\.hit COUNT/ {h=$NF}
+    /rocksdb\.block\.cache\.data\.miss COUNT/ {m=$NF}
+    END {
+      t=h+m;
+      if (t == 0) {
+        print "0.0";
+      } else {
+        printf "%.6f\n", h/t;
+      }
+    }
+  ' "${log_file}"
 }
 
 if [[ ! -d "${ROOT}" ]]; then
@@ -150,10 +176,74 @@ else
   fi
 fi
 
+if [[ "${RUN_FLOOR_ABLATION}" == "1" ]]; then
+  echo
+  echo "==> Allocator floor ablation (aggressive mode)"
+  if ! "${ROOT}/build/db_bench" \
+    --benchmarks=fillrandom,readrandom \
+    --db="${RESULT_ROOT}/db_floor_with" \
+    --num="${ABL_NUM}" \
+    --reads="${ABL_READS}" \
+    --threads="${ABL_THREADS}" \
+    --value_size="${VALUE_SIZE}" \
+    --cache_size="${CACHE_SIZE}" \
+    --num_levels="${NUM_LEVELS}" \
+    --use_multi_level_cache=true \
+    --multi_level_cache_auto_adjust=true \
+    --multi_level_cache_allocator_mode=model \
+    --multi_level_cache_adjust_interval_ms=200 \
+    --multi_level_cache_adjust_smoothing_ratio=1.0 \
+    --multi_level_cache_adjust_min_change_bytes=0 \
+    --compression_type=none \
+    --statistics=1 \
+    --stats_interval_seconds=0 \
+    >"${FLOOR_WITH_LOG}" 2>&1; then
+    echo "FAIL: floor ablation (with floor) run failed" >&2
+    pass=false
+  elif ! "${ROOT}/build/db_bench" \
+    --benchmarks=fillrandom,readrandom \
+    --db="${RESULT_ROOT}/db_floor_without" \
+    --num="${ABL_NUM}" \
+    --reads="${ABL_READS}" \
+    --threads="${ABL_THREADS}" \
+    --value_size="${VALUE_SIZE}" \
+    --cache_size="${CACHE_SIZE}" \
+    --num_levels="${NUM_LEVELS}" \
+    --use_multi_level_cache=true \
+    --multi_level_cache_auto_adjust=true \
+    --multi_level_cache_allocator_mode=model \
+    --multi_level_cache_adjust_interval_ms=200 \
+    --multi_level_cache_adjust_smoothing_ratio=1.0 \
+    --multi_level_cache_adjust_min_change_bytes=0 \
+    --multi_level_cache_adjust_min_active_level_capacity_bytes=0 \
+    --compression_type=none \
+    --statistics=1 \
+    --stats_interval_seconds=0 \
+    >"${FLOOR_NO_LOG}" 2>&1; then
+    echo "FAIL: floor ablation (no floor) run failed" >&2
+    pass=false
+  else
+    with_rate="$(extract_data_hit_rate "${FLOOR_WITH_LOG}")"
+    no_rate="$(extract_data_hit_rate "${FLOOR_NO_LOG}")"
+    echo "floor_with_rate=${with_rate}"
+    echo "floor_without_rate=${no_rate}"
+    if awk -v a="${with_rate}" -v b="${no_rate}" 'BEGIN{exit !(a+1e-6 >= b)}'; then
+      echo "PASS: active-level floor improves or preserves hit rate"
+    else
+      echo "FAIL: active-level floor regressed hit rate in ablation run" >&2
+      pass=false
+    fi
+  fi
+fi
+
 echo
 echo "==> Summary"
 echo "routing logs: ${ROUTING_LOG_DIR}"
 echo "allocator log: ${ALLOC_LOG}"
+if [[ "${RUN_FLOOR_ABLATION}" == "1" ]]; then
+  echo "floor with log: ${FLOOR_WITH_LOG}"
+  echo "floor without log: ${FLOOR_NO_LOG}"
+fi
 
 if [[ "${pass}" == "true" ]]; then
   echo "PASS: verify_mlc_ci completed successfully."

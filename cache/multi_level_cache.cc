@@ -361,6 +361,10 @@ void MultiLevelCache::UpdateLevelDataSizes(
   }
 }
 
+void MultiLevelCache::SetForceRouteAllToL0(bool force_route_all_to_l0) {
+  force_route_all_to_l0_.store(force_route_all_to_l0, std::memory_order_relaxed);
+}
+
 size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
                                         RouteCaller caller) const {
   std::atomic<uint64_t>* route_queries = nullptr;
@@ -385,6 +389,9 @@ size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
   }
   if (route_queries != nullptr) {
     route_queries->fetch_add(1, std::memory_order_relaxed);
+  }
+  if (force_route_all_to_l0_.load(std::memory_order_relaxed)) {
+    return 0;
   }
   const std::optional<uint64_t> key_prefix = GetCacheKeyPrefix(key);
   if (!key_prefix.has_value()) {

@@ -92,6 +92,8 @@ class MultiLevelCache : public Cache {
 
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
+  // For A/B diagnostics: force all requests to route into L0.
+  void SetForceRouteAllToL0(bool force_route_all_to_l0);
 
  private:
   enum class RouteCaller {
@@ -138,6 +140,7 @@ class MultiLevelCache : public Cache {
   mutable std::atomic<uint64_t> lookup_route_prefix_misses_{0};
   mutable std::atomic<uint64_t> route_normalize_fallbacks_{0};
   mutable std::atomic<int64_t> debug_miss_budget_{0};
+  std::atomic<bool> force_route_all_to_l0_{false};
   std::atomic<size_t> total_capacity_;
 };
 

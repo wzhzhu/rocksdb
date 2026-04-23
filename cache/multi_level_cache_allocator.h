@@ -23,6 +23,11 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+enum class MultiLevelAllocatorMode {
+  kModel = 0,
+  kBaselineEmulation = 1,
+};
+
 struct MultiLevelAllocationOptions {
   // Background solve interval in milliseconds.
   uint64_t interval_ms = 1000;
@@ -33,6 +38,11 @@ struct MultiLevelAllocationOptions {
   // Binary search precision and iterations.
   double solver_epsilon = 1e-9;
   int solver_max_iterations = 80;
+  // Allocation mode.
+  MultiLevelAllocatorMode mode = MultiLevelAllocatorMode::kModel;
+  // Minimum capacity for each active level (data_size > 0), applied before
+  // AdjustCapacities.
+  size_t min_active_level_capacity_bytes = 0;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -80,6 +90,10 @@ class MultiLevelCacheAllocator {
   static void SmoothCapacities(const std::vector<size_t>& previous,
                                const std::vector<size_t>& target, double ratio,
                                std::vector<size_t>* out);
+  static void EnforceMinActiveLevelFloor(
+      const std::vector<size_t>& in_capacities,
+      const std::vector<uint64_t>& level_data_sizes, size_t total_budget,
+      size_t min_active_level_capacity_bytes, std::vector<size_t>* out);
 
   void BackgroundLoop();
   Status RunOnceLocked();

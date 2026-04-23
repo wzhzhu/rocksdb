@@ -611,6 +611,12 @@ DEFINE_bool(use_multi_level_cache, false,
 DEFINE_bool(multi_level_cache_auto_adjust, true,
             "If true and --use_multi_level_cache=true, automatically start "
             "the MultiLevelCacheAllocator during db_bench run.");
+DEFINE_bool(multi_level_cache_force_route_all_to_l0, false,
+            "If true, force all MultiLevelCache requests to L0 for "
+            "diagnostic A/B experiments.");
+DEFINE_string(
+    multi_level_cache_allocator_mode, "model",
+    "Allocator mode for MultiLevelCache: model | baseline_emulation");
 DEFINE_uint64(multi_level_cache_adjust_interval_ms, 1000,
               "Allocator solve/apply interval in milliseconds.");
 DEFINE_double(multi_level_cache_adjust_smoothing_ratio, 0.5,
@@ -618,6 +624,9 @@ DEFINE_double(multi_level_cache_adjust_smoothing_ratio, 0.5,
 DEFINE_uint64(
     multi_level_cache_adjust_min_change_bytes, 1 << 20,
     "Allocator minimum total capacity change to trigger AdjustCapacities.");
+DEFINE_uint64(
+    multi_level_cache_adjust_min_active_level_capacity_bytes, 4 << 20,
+    "Allocator minimum capacity floor for each active level (data_size > 0).");
 
 DEFINE_bool(use_compressed_secondary_cache, false,
             "Use the CompressedSecondaryCache as the secondary cache.");
@@ -3069,15 +3078,25 @@ class Benchmark {
     options.smoothing_ratio = FLAGS_multi_level_cache_adjust_smoothing_ratio;
     options.min_total_change_bytes =
         static_cast<size_t>(FLAGS_multi_level_cache_adjust_min_change_bytes);
+    options.min_active_level_capacity_bytes = static_cast<size_t>(
+        FLAGS_multi_level_cache_adjust_min_active_level_capacity_bytes);
+    if (FLAGS_multi_level_cache_allocator_mode == "baseline_emulation") {
+      options.mode = MultiLevelAllocatorMode::kBaselineEmulation;
+    } else {
+      options.mode = MultiLevelAllocatorMode::kModel;
+    }
     multi_level_allocator_ = std::make_unique<MultiLevelCacheAllocator>(
         multi_level_cache_, std::move(provider), options);
     multi_level_allocator_->Start();
     fprintf(stdout,
             "=== MultiLevelCache Allocator (db_bench) started: interval_ms=%" PRIu64
-            ", smoothing_ratio=%.3f, min_change_bytes=%" PRIu64 " ===\n",
+            ", smoothing_ratio=%.3f, min_change_bytes=%" PRIu64
+            ", min_active_level_cap=%" PRIu64 ", mode=%s ===\n",
             FLAGS_multi_level_cache_adjust_interval_ms,
             FLAGS_multi_level_cache_adjust_smoothing_ratio,
-            FLAGS_multi_level_cache_adjust_min_change_bytes);
+            FLAGS_multi_level_cache_adjust_min_change_bytes,
+            FLAGS_multi_level_cache_adjust_min_active_level_capacity_bytes,
+            FLAGS_multi_level_cache_allocator_mode.c_str());
   }
 
   bool SanityCheck() {
@@ -3091,6 +3110,15 @@ class Benchmark {
               "--num_levels=%d exceeds encoded route limit (%d) when "
               "--use_multi_level_cache=true\n",
               FLAGS_num_levels, kMaxEncodedCacheKeyLevel + 1);
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache && FLAGS_multi_level_cache_auto_adjust &&
+        FLAGS_multi_level_cache_allocator_mode != "model" &&
+        FLAGS_multi_level_cache_allocator_mode != "baseline_emulation") {
+      fprintf(stderr,
+              "invalid --multi_level_cache_allocator_mode=%s, expected "
+              "model|baseline_emulation\n",
+              FLAGS_multi_level_cache_allocator_mode.c_str());
       return false;
     }
     return true;
@@ -3573,12 +3601,18 @@ class Benchmark {
           // Aliasing shared_ptr: share ownership with cache_ without RTTI.
           multi_level_cache_ =
               std::shared_ptr<MultiLevelCache>(cache_, raw);
+          multi_level_cache_->SetForceRouteAllToL0(
+              FLAGS_multi_level_cache_force_route_all_to_l0);
         }
       }
       if (multi_level_cache_ == nullptr) {
         fprintf(stdout,
                 "=== MultiLevelCache Allocator (db_bench) skipped: "
                 "block cache is not MultiLevelCache ===\n");
+      } else if (FLAGS_multi_level_cache_force_route_all_to_l0) {
+        fprintf(stdout,
+                "=== MultiLevelCache route override enabled: all requests "
+                "forced to L0 ===\n");
       }
     }
 

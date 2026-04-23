@@ -100,12 +100,22 @@ namespace {
 
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
 
-void MaybeRefreshLevelCacheState(Cache* cache,
+void MaybeRefreshLevelCacheState(ColumnFamilyData* column_family_data,
                                  const VersionStorageInfo& storage_info) {
-  if (cache == nullptr) {
+  if (column_family_data == nullptr) {
     return;
   }
-  auto* multi_level_cache = cache->CheckedCast<MultiLevelCache>();
+  auto* table_factory =
+      column_family_data->GetLatestMutableCFOptions().table_factory.get();
+  if (table_factory == nullptr) {
+    return;
+  }
+  Cache* block_cache = table_factory->GetOptions<Cache>(
+      TableFactory::kBlockCacheOpts());
+  if (block_cache == nullptr) {
+    return;
+  }
+  auto* multi_level_cache = block_cache->CheckedCast<MultiLevelCache>();
   if (multi_level_cache == nullptr) {
     return;
   }
@@ -5894,7 +5904,7 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
 
   // Mark v finalized
   v->storage_info_.SetFinalized();
-  MaybeRefreshLevelCacheState(table_cache_, *v->storage_info());
+  MaybeRefreshLevelCacheState(column_family_data, *v->storage_info());
 
   // Make "v" current
   assert(v->refs_ == 0);

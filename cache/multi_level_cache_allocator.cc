@@ -272,6 +272,95 @@ void MultiLevelCacheAllocator::SmoothCapacities(
   }
 }
 
+void MultiLevelCacheAllocator::EnforceMinActiveLevelFloor(
+    const std::vector<size_t>& in_capacities,
+    const std::vector<uint64_t>& level_data_sizes, size_t total_budget,
+    size_t min_active_level_capacity_bytes, std::vector<size_t>* out) {
+  std::vector<size_t> adjusted = in_capacities;
+  const size_t levels = adjusted.size();
+  if (levels == 0 || min_active_level_capacity_bytes == 0 ||
+      level_data_sizes.size() != levels) {
+    *out = in_capacities;
+    return;
+  }
+
+  std::vector<size_t> active;
+  active.reserve(levels);
+  for (size_t i = 0; i < levels; ++i) {
+    if (level_data_sizes[i] > 0) {
+      active.push_back(i);
+    }
+  }
+  if (active.empty()) {
+    return;
+  }
+
+  std::vector<size_t> required_floor(levels, 0);
+  const uint64_t requested =
+      static_cast<uint64_t>(active.size()) *
+      static_cast<uint64_t>(min_active_level_capacity_bytes);
+  if (requested <= total_budget) {
+    for (size_t idx : active) {
+      required_floor[idx] = min_active_level_capacity_bytes;
+    }
+  } else {
+    const size_t base = total_budget / active.size();
+    size_t rem = total_budget % active.size();
+    for (size_t idx : active) {
+      required_floor[idx] = base + (rem > 0 ? 1 : 0);
+      if (rem > 0) {
+        --rem;
+      }
+    }
+  }
+
+  uint64_t deficit = 0;
+  for (size_t idx : active) {
+    if (adjusted[idx] < required_floor[idx]) {
+      deficit += static_cast<uint64_t>(required_floor[idx] - adjusted[idx]);
+    }
+  }
+  if (deficit == 0) {
+    *out = std::move(adjusted);
+    return;
+  }
+
+  // Drain removable bytes from donors while preserving active floors.
+  std::vector<size_t> donor_order(levels);
+  std::iota(donor_order.begin(), donor_order.end(), 0);
+  std::sort(donor_order.begin(), donor_order.end(),
+            [&](size_t a, size_t b) { return adjusted[a] > adjusted[b]; });
+
+  for (size_t idx : donor_order) {
+    const size_t floor = required_floor[idx];
+    if (adjusted[idx] <= floor) {
+      continue;
+    }
+    const size_t removable = adjusted[idx] - floor;
+    const size_t take =
+        static_cast<size_t>(std::min<uint64_t>(removable, deficit));
+    adjusted[idx] -= take;
+    deficit -= take;
+    if (deficit == 0) {
+      break;
+    }
+  }
+
+  if (deficit > 0) {
+    // Cannot satisfy all floors under current budget distribution.
+    *out = in_capacities;
+    return;
+  }
+
+  for (size_t idx : active) {
+    if (adjusted[idx] < required_floor[idx]) {
+      const size_t add = required_floor[idx] - adjusted[idx];
+      adjusted[idx] += add;
+    }
+  }
+  *out = std::move(adjusted);
+}
+
 void MultiLevelCacheAllocator::BackgroundLoop() {
   while (running_.load(std::memory_order_acquire)) {
     {
@@ -287,24 +376,34 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
   if (cache_ == nullptr) {
     return Status::InvalidArgument("cache cannot be null");
   }
-  if (!provider_) {
+  if (!provider_ && options_.mode == MultiLevelAllocatorMode::kModel) {
     return Status::InvalidArgument("metrics provider cannot be empty");
   }
+
+  const auto snapshot = cache_->GetLevelMetricsSnapshot();
+  const size_t level_count = snapshot.capacities.size();
+  if (level_count == 0) {
+    return Status::OK();
+  }
+  const size_t total_capacity = cache_->GetCapacity();
 
   std::vector<double> lambda;
   std::vector<double> data;
   std::vector<double> alpha;
-  if (!provider_(&lambda, &data, &alpha)) {
-    return Status::OK();
-  }
-
   std::vector<size_t> target_capacities;
-  const size_t total_capacity = cache_->GetCapacity();
-  Status solve_status =
-      SolveCapacities(lambda, data, alpha, total_capacity, &target_capacities,
-                      options_.solver_epsilon, options_.solver_max_iterations);
-  if (!solve_status.ok()) {
-    return solve_status;
+  if (options_.mode == MultiLevelAllocatorMode::kBaselineEmulation) {
+    target_capacities.assign(level_count, 0);
+    target_capacities[0] = total_capacity;
+  } else {
+    if (!provider_(&lambda, &data, &alpha)) {
+      return Status::OK();
+    }
+    Status solve_status =
+        SolveCapacities(lambda, data, alpha, total_capacity, &target_capacities,
+                        options_.solver_epsilon, options_.solver_max_iterations);
+    if (!solve_status.ok()) {
+      return solve_status;
+    }
   }
 
   std::vector<size_t> capacities_to_apply = target_capacities;
@@ -313,6 +412,10 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     SmoothCapacities(last_capacities_, target_capacities, options_.smoothing_ratio,
                      &capacities_to_apply);
   }
+  EnforceMinActiveLevelFloor(capacities_to_apply, snapshot.data_sizes,
+                             total_capacity,
+                             options_.min_active_level_capacity_bytes,
+                             &capacities_to_apply);
 
   if (!last_capacities_.empty() &&
       last_capacities_.size() == capacities_to_apply.size()) {
