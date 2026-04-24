@@ -363,6 +363,12 @@ void MultiLevelCache::UpdateLevelDataSizes(
 
 void MultiLevelCache::SetForceRouteAllToL0(bool force_route_all_to_l0) {
   force_route_all_to_l0_.store(force_route_all_to_l0, std::memory_order_relaxed);
+  if (!force_route_all_to_l0 || sub_caches_.empty()) {
+    return;
+  }
+  std::vector<size_t> l0_only_capacities(sub_caches_.size(), 0);
+  l0_only_capacities[0] = total_capacity_.load(std::memory_order_relaxed);
+  ApplyCapacities(l0_only_capacities);
 }
 
 size_t MultiLevelCache::RouteLevelByKey(const Slice& key,

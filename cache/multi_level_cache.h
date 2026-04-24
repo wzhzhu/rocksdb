@@ -93,6 +93,8 @@ class MultiLevelCache : public Cache {
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
   // For A/B diagnostics: force all requests to route into L0.
+  // When enabled, initial capacities are also switched to L0-only so the
+  // setup is closer to single-cache baseline behavior.
   void SetForceRouteAllToL0(bool force_route_all_to_l0);
 
  private:
