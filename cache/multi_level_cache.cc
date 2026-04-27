@@ -380,6 +380,12 @@ std::vector<std::vector<uint64_t>> MultiLevelCache::DrainLookupSamples() {
   return drained;
 }
 
+void MultiLevelCache::SetLookupSampleRateLog2(uint32_t sample_rate_log2) {
+  // Guard overly sparse sampling and shift overflow.
+  const uint32_t clamped = std::min<uint32_t>(sample_rate_log2, 20);
+  lookup_sample_rate_log2_.store(clamped, std::memory_order_relaxed);
+}
+
 void MultiLevelCache::UpdateLevelDataSizes(
     const std::vector<uint64_t>& level_data_sizes) {
   const size_t limit = std::min(level_data_sizes.size(), level_data_sizes_.size());
@@ -589,10 +595,13 @@ int64_t MultiLevelCache::ParseDebugMissLimit() {
 
 void MultiLevelCache::MaybeRecordLookupSample(size_t level_index,
                                               const Slice& key) {
-  static constexpr uint64_t kSampleMask = (1ULL << 10) - 1;  // 1/1024 sampling.
   static constexpr size_t kMaxSamplesPerLevel = 8192;
+  const uint32_t log2_rate =
+      lookup_sample_rate_log2_.load(std::memory_order_relaxed);
+  const uint64_t sample_mask =
+      log2_rate == 0 ? 0 : ((1ULL << log2_rate) - 1ULL);
   if ((lookup_sample_seq_.fetch_add(1, std::memory_order_relaxed) &
-       kSampleMask) != 0) {
+       sample_mask) != 0) {
     return;
   }
   if (level_index >= lookup_samples_.size()) {

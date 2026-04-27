@@ -94,6 +94,7 @@ class MultiLevelCache : public Cache {
   void ResetStats();
   LevelMetricsSnapshot GetLevelMetricsSnapshot() const;
   std::vector<std::vector<uint64_t>> DrainLookupSamples();
+  void SetLookupSampleRateLog2(uint32_t sample_rate_log2);
 
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
@@ -141,6 +142,7 @@ class MultiLevelCache : public Cache {
   std::deque<std::mutex> lookup_sample_mutexes_;
   std::vector<std::deque<uint64_t>> lookup_samples_;
   std::atomic<uint64_t> lookup_sample_seq_{0};
+  std::atomic<uint32_t> lookup_sample_rate_log2_{10};
   mutable std::atomic<uint64_t> insert_route_queries_{0};
   mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
   mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};

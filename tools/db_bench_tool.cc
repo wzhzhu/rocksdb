@@ -33,6 +33,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -644,6 +645,18 @@ DEFINE_uint64(
     multi_level_cache_alpha_debug_every_rounds, 10,
     "Print alpha debug once every N allocator rounds when "
     "--multi_level_cache_alpha_debug=true.");
+DEFINE_uint32(
+    multi_level_cache_alpha_shadow_sample_rate_log2, 8,
+    "Lookup sample rate for shadow alpha estimator as 1/(2^x). "
+    "0 means sample all lookups.");
+DEFINE_uint32(
+    multi_level_cache_alpha_shadow_window_rounds, 5,
+    "Sliding window length (allocator rounds) for shadow/observed hit-rate "
+    "aggregation when using shadow alpha estimator.");
+DEFINE_uint64(
+    multi_level_cache_alpha_shadow_min_capacity_bytes, 32 << 20,
+    "Minimum virtual capacity in bytes for shadow second fit point when "
+    "using shadow alpha estimator.");
 
 DEFINE_bool(use_compressed_secondary_cache, false,
             "Use the CompressedSecondaryCache as the secondary cache.");
@@ -3094,19 +3107,29 @@ class Benchmark {
     };
     std::vector<ShadowLruState> shadow_base(snapshot.lookups.size());
     std::vector<ShadowLruState> shadow_scaled(snapshot.lookups.size());
+    std::vector<std::deque<std::pair<uint64_t, uint64_t>>> observed_history(
+        snapshot.lookups.size());
+    std::vector<std::deque<std::pair<uint64_t, uint64_t>>> shadow_history(
+        snapshot.lookups.size());
     const bool use_shadow_alpha =
         FLAGS_multi_level_cache_alpha_estimator == "shadow_cache";
     const bool use_constant_one_alpha =
         FLAGS_multi_level_cache_alpha_estimator == "constant_one";
     const double shadow_scale =
         std::max(1.01, FLAGS_multi_level_cache_alpha_shadow_scale);
+    const size_t shadow_window_rounds =
+        std::max<uint32_t>(1, FLAGS_multi_level_cache_alpha_shadow_window_rounds);
+    const size_t shadow_min_capacity_bytes = static_cast<size_t>(
+        FLAGS_multi_level_cache_alpha_shadow_min_capacity_bytes);
     const size_t estimated_entry_bytes =
         static_cast<size_t>(std::max<int32_t>(1, FLAGS_block_size));
     uint64_t alpha_debug_round = 0;
     MultiLevelCacheAllocator::MetricsProvider provider =
         [cache = multi_level_cache_, prev_lookups, prev_hits,
-         prev_alpha, shadow_base, shadow_scaled, use_shadow_alpha, shadow_scale,
-         use_constant_one_alpha, estimated_entry_bytes,
+         prev_alpha, shadow_base, shadow_scaled, observed_history,
+         shadow_history, use_shadow_alpha, shadow_scale, shadow_window_rounds,
+         shadow_min_capacity_bytes, use_constant_one_alpha,
+         estimated_entry_bytes,
          alpha_debug_round](std::vector<double>* lambda,
                             std::vector<double>* data,
                             std::vector<double>* alpha) mutable {
@@ -3121,12 +3144,18 @@ class Benchmark {
               prev_alpha.size() != level_count ||
               shadow_base.size() != level_count ||
               shadow_scaled.size() != level_count ||
+              observed_history.size() != level_count ||
+              shadow_history.size() != level_count ||
               lookup_samples.size() != level_count) {
             prev_lookups = stats.lookups;
             prev_hits = stats.hits;
             prev_alpha.assign(level_count, 1.0);
             shadow_base.assign(level_count, ShadowLruState{});
             shadow_scaled.assign(level_count, ShadowLruState{});
+            observed_history.assign(level_count,
+                                    std::deque<std::pair<uint64_t, uint64_t>>{});
+            shadow_history.assign(level_count,
+                                  std::deque<std::pair<uint64_t, uint64_t>>{});
             return false;
           }
 
@@ -3192,10 +3221,20 @@ class Benchmark {
             double derived_alpha = prev_alpha[level];
             const size_t capacity_bytes = stats.capacities[level];
             if (delta_lookups > 0 && capacity_bytes > 0 && level_data > 0.0) {
+              observed_history[level].push_back({delta_hits, delta_lookups});
+              while (observed_history[level].size() > shadow_window_rounds) {
+                observed_history[level].pop_front();
+              }
+              uint64_t observed_hits_sum = 0;
+              uint64_t observed_lookups_sum = 0;
+              for (const auto& p : observed_history[level]) {
+                observed_hits_sum += p.first;
+                observed_lookups_sum += p.second;
+              }
               const double observed_hit_rate = std::min(
                   kMaxHitRate,
-                  std::max(0.0, static_cast<double>(delta_hits) /
-                                    static_cast<double>(delta_lookups)));
+                  std::max(0.0, static_cast<double>(observed_hits_sum) /
+                                    static_cast<double>(observed_lookups_sum)));
               debug_observed_hit[level] = observed_hit_rate;
               const double miss_rate =
                   std::max(kMinMissRate, 1.0 - observed_hit_rate);
@@ -3206,10 +3245,13 @@ class Benchmark {
               if (use_shadow_alpha) {
                 const size_t base_entries =
                     std::max<size_t>(capacity_bytes / estimated_entry_bytes, 1);
+                const size_t scaled_capacity_bytes =
+                    std::max<size_t>(static_cast<size_t>(std::llround(
+                                         static_cast<double>(capacity_bytes) *
+                                         shadow_scale)),
+                                     shadow_min_capacity_bytes);
                 const size_t scaled_entries = std::max<size_t>(
-                    static_cast<size_t>(
-                        std::llround(static_cast<double>(base_entries) *
-                                     shadow_scale)),
+                    scaled_capacity_bytes / estimated_entry_bytes,
                     base_entries + 1);
                 shadow_base[level].SetCapacityEntries(base_entries);
                 shadow_scaled[level].SetCapacityEntries(scaled_entries);
@@ -3217,19 +3259,31 @@ class Benchmark {
                   shadow_base[level].Observe(sample_hash);
                   shadow_scaled[level].Observe(sample_hash);
                 }
+                shadow_history[level].push_back(
+                    {shadow_scaled[level].window_hits,
+                     shadow_scaled[level].window_accesses});
+                while (shadow_history[level].size() > shadow_window_rounds) {
+                  shadow_history[level].pop_front();
+                }
+                uint64_t shadow_hits_sum = 0;
+                uint64_t shadow_accesses_sum = 0;
+                for (const auto& p : shadow_history[level]) {
+                  shadow_hits_sum += p.first;
+                  shadow_accesses_sum += p.second;
+                }
 
-                if (shadow_scaled[level].window_accesses > 0) {
+                if (shadow_accesses_sum > 0) {
                   const double shadow_hit_rate = std::min(
                       kMaxHitRate,
-                      std::max(0.0, shadow_scaled[level].WindowHitRate()));
+                      std::max(0.0, static_cast<double>(shadow_hits_sum) /
+                                        static_cast<double>(shadow_accesses_sum)));
                   debug_shadow_hit[level] = shadow_hit_rate;
                   const double y_obs = -std::log(std::max(
                       kMinMissRate, 1.0 - observed_hit_rate));
                   const double y_shadow =
                       -std::log(std::max(kMinMissRate, 1.0 - shadow_hit_rate));
                   const double c1 = static_cast<double>(capacity_bytes);
-                  const double c2 =
-                      static_cast<double>(scaled_entries * estimated_entry_bytes);
+                  const double c2 = static_cast<double>(scaled_capacity_bytes);
                   const double denom = c1 * c1 + c2 * c2;
                   if (denom > 0.0) {
                     const double slope = (c1 * y_obs + c2 * y_shadow) / denom;
@@ -3844,6 +3898,8 @@ class Benchmark {
               std::shared_ptr<MultiLevelCache>(cache_, raw);
           multi_level_cache_->SetForceRouteAllToL0(
               FLAGS_multi_level_cache_force_route_all_to_l0);
+          multi_level_cache_->SetLookupSampleRateLog2(
+              FLAGS_multi_level_cache_alpha_shadow_sample_rate_log2);
         }
       }
       if (multi_level_cache_ == nullptr) {

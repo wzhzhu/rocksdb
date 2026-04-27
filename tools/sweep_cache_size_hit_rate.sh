@@ -34,6 +34,9 @@ set -euo pipefail
 #   MLC_MODEL_ALPHA_ESTIMATOR=shadow_cache   # single estimator (compat mode)
 #   MLC_MODEL_ALPHA_ESTIMATOR_LIST=constant_one,robust_hit_rate,shadow_cache
 #   MLC_MODEL_ALPHA_SHADOW_SCALE=1.5
+#   MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2=8
+#   MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS=5
+#   MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES=33554432
 #   CACHE_SIZE_MB_LIST=32,64,128,256
 #   INCLUDE_FORCE_L0=1
 #   RESULT_DIR=/tmp/mlc_cache_sweep
@@ -60,6 +63,9 @@ MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES="${MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY
 MLC_MODEL_ALPHA_ESTIMATOR="${MLC_MODEL_ALPHA_ESTIMATOR:-shadow_cache}"
 MLC_MODEL_ALPHA_ESTIMATOR_LIST="${MLC_MODEL_ALPHA_ESTIMATOR_LIST:-${MLC_MODEL_ALPHA_ESTIMATOR}}"
 MLC_MODEL_ALPHA_SHADOW_SCALE="${MLC_MODEL_ALPHA_SHADOW_SCALE:-1.5}"
+MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2="${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2:-8}"
+MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS="${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS:-5}"
+MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES="${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES:-33554432}"
 CACHE_SIZE_MB_LIST="${CACHE_SIZE_MB_LIST:-32,64,128,256}"
 INCLUDE_FORCE_L0="${INCLUDE_FORCE_L0:-1}"
 RESULT_DIR="${RESULT_DIR:-/tmp/mlc_cache_sweep}"
@@ -182,6 +188,9 @@ run_read_case() {
         "--multi_level_cache_adjust_min_active_level_capacity_bytes=${MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES}"
         "--multi_level_cache_alpha_estimator=${alpha_estimator}"
         "--multi_level_cache_alpha_shadow_scale=${MLC_MODEL_ALPHA_SHADOW_SCALE}"
+        "--multi_level_cache_alpha_shadow_sample_rate_log2=${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2}"
+        "--multi_level_cache_alpha_shadow_window_rounds=${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS}"
+        "--multi_level_cache_alpha_shadow_min_capacity_bytes=${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES}"
       )
       ;;
     mlc_force_l0)
