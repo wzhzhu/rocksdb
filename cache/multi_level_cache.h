@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -28,6 +29,9 @@ class MultiLevelCache : public Cache {
   static const char* kClassName() { return "MultiLevelCache"; }
 
   MultiLevelCache(size_t num_levels, size_t total_capacity);
+  MultiLevelCache(size_t num_levels, size_t total_capacity,
+                  const LRUCacheOptions& lru_options,
+                  bool initial_force_route_all_to_l0 = false);
 
   const char* Name() const override;
 
@@ -89,6 +93,7 @@ class MultiLevelCache : public Cache {
   std::string PrintStats() const;
   void ResetStats();
   LevelMetricsSnapshot GetLevelMetricsSnapshot() const;
+  std::vector<std::vector<uint64_t>> DrainLookupSamples();
 
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
@@ -120,6 +125,7 @@ class MultiLevelCache : public Cache {
                          uint64_t key_prefix, const char* reason) const;
   static const char* RouteCallerToString(RouteCaller caller);
   static int64_t ParseDebugMissLimit();
+  void MaybeRecordLookupSample(size_t level_index, const Slice& key);
 
   WrappedHandle* NewWrappedHandle(size_t level_index, Cache::Handle* inner);
   static WrappedHandle* ToWrappedHandle(Handle* handle);
@@ -132,6 +138,9 @@ class MultiLevelCache : public Cache {
   std::deque<std::atomic<uint64_t>> lookups_;
   std::deque<std::atomic<uint64_t>> hits_;
   std::deque<std::atomic<uint64_t>> level_data_sizes_;
+  std::deque<std::mutex> lookup_sample_mutexes_;
+  std::vector<std::deque<uint64_t>> lookup_samples_;
+  std::atomic<uint64_t> lookup_sample_seq_{0};
   mutable std::atomic<uint64_t> insert_route_queries_{0};
   mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
   mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};

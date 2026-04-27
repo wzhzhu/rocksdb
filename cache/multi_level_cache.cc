@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 #include "cache/cache_key.h"
@@ -22,21 +23,39 @@ size_t SafeLevelCount(size_t num_levels) {
 }  // namespace
 
 MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity)
+    : MultiLevelCache(num_levels, total_capacity,
+                      LRUCacheOptions(total_capacity, -1,
+                                      false /*strict_capacity_limit*/,
+                                      0.0 /*high_pri_pool_ratio*/),
+                      false /*initial_force_route_all_to_l0*/) {}
+
+MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
+                                 const LRUCacheOptions& lru_options,
+                                 bool initial_force_route_all_to_l0)
     : debug_miss_budget_(ParseDebugMissLimit()), total_capacity_(total_capacity) {
   const size_t level_count = SafeLevelCount(num_levels);
   sub_caches_.reserve(level_count);
 
-  const size_t per_level_capacity = total_capacity / level_count;
-  const size_t remainder = total_capacity % level_count;
+  const size_t per_level_capacity =
+      initial_force_route_all_to_l0 ? 0 : (total_capacity / level_count);
+  const size_t remainder = initial_force_route_all_to_l0
+                               ? 0
+                               : (total_capacity % level_count);
   for (size_t level = 0; level < level_count; ++level) {
-    const size_t level_capacity =
-        per_level_capacity + (level < remainder ? 1 : 0);
-    sub_caches_.emplace_back(NewLRUCache(level_capacity));
+    size_t level_capacity = per_level_capacity + (level < remainder ? 1 : 0);
+    if (initial_force_route_all_to_l0 && level == 0) {
+      level_capacity = total_capacity;
+    }
+    LRUCacheOptions options = lru_options;
+    options.capacity = level_capacity;
+    sub_caches_.emplace_back(options.MakeSharedCache());
   }
 
   lookups_.resize(level_count);
   hits_.resize(level_count);
   level_data_sizes_.resize(level_count);
+  lookup_sample_mutexes_.resize(level_count);
+  lookup_samples_.resize(level_count);
   for (size_t level = 0; level < level_count; ++level) {
     lookups_[level].store(0, std::memory_order_relaxed);
     hits_[level].store(0, std::memory_order_relaxed);
@@ -82,6 +101,7 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
                                        CreateContext* create_context,
                                        Priority priority, Statistics* stats) {
   const size_t level_index = RouteLevelByKey(key, RouteCaller::kLookup);
+  MaybeRecordLookupSample(level_index, key);
   lookups_[level_index].fetch_add(1, std::memory_order_relaxed);
   Cache::Handle* inner = SubCacheByLevel(level_index)->Lookup(
       key, helper, create_context, priority, stats);
@@ -349,6 +369,17 @@ MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
   return snapshot;
 }
 
+std::vector<std::vector<uint64_t>> MultiLevelCache::DrainLookupSamples() {
+  std::vector<std::vector<uint64_t>> drained(sub_caches_.size());
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    std::lock_guard<std::mutex> lock(lookup_sample_mutexes_[level]);
+    auto& src = lookup_samples_[level];
+    drained[level].assign(src.begin(), src.end());
+    src.clear();
+  }
+  return drained;
+}
+
 void MultiLevelCache::UpdateLevelDataSizes(
     const std::vector<uint64_t>& level_data_sizes) {
   const size_t limit = std::min(level_data_sizes.size(), level_data_sizes_.size());
@@ -554,6 +585,27 @@ int64_t MultiLevelCache::ParseDebugMissLimit() {
     return 0;
   }
   return static_cast<int64_t>(parsed);
+}
+
+void MultiLevelCache::MaybeRecordLookupSample(size_t level_index,
+                                              const Slice& key) {
+  static constexpr uint64_t kSampleMask = (1ULL << 10) - 1;  // 1/1024 sampling.
+  static constexpr size_t kMaxSamplesPerLevel = 8192;
+  if ((lookup_sample_seq_.fetch_add(1, std::memory_order_relaxed) &
+       kSampleMask) != 0) {
+    return;
+  }
+  if (level_index >= lookup_samples_.size()) {
+    return;
+  }
+  const uint64_t hash = static_cast<uint64_t>(
+      std::hash<std::string_view>{}(std::string_view(key.data(), key.size())));
+  std::lock_guard<std::mutex> lock(lookup_sample_mutexes_[level_index]);
+  auto& samples = lookup_samples_[level_index];
+  if (samples.size() >= kMaxSamplesPerLevel) {
+    samples.pop_front();
+  }
+  samples.push_back(hash);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

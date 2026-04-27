@@ -30,12 +30,14 @@
 #include <atomic>
 #include <cinttypes>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <list>
 #include <queue>
 #include <thread>
 #include <unordered_map>
@@ -627,6 +629,21 @@ DEFINE_uint64(
 DEFINE_uint64(
     multi_level_cache_adjust_min_active_level_capacity_bytes, 4 << 20,
     "Allocator minimum capacity floor for each active level (data_size > 0).");
+DEFINE_string(
+    multi_level_cache_alpha_estimator, "robust_hit_rate",
+    "Alpha estimator for MultiLevelCache allocator: constant_one | "
+    "robust_hit_rate | shadow_cache");
+DEFINE_double(
+    multi_level_cache_alpha_shadow_scale, 1.5,
+    "Shadow-cache virtual capacity scale (>1.0) for alpha estimation when "
+    "--multi_level_cache_alpha_estimator=shadow_cache.");
+DEFINE_bool(
+    multi_level_cache_alpha_debug, false,
+    "If true, print periodic per-level alpha estimator debug lines.");
+DEFINE_uint64(
+    multi_level_cache_alpha_debug_every_rounds, 10,
+    "Print alpha debug once every N allocator rounds when "
+    "--multi_level_cache_alpha_debug=true.");
 
 DEFINE_bool(use_compressed_secondary_cache, false,
             "Use the CompressedSecondaryCache as the secondary cache.");
@@ -3026,17 +3043,90 @@ class Benchmark {
 
     auto snapshot = multi_level_cache_->GetLevelMetricsSnapshot();
     std::vector<uint64_t> prev_lookups = snapshot.lookups;
+    std::vector<uint64_t> prev_hits = snapshot.hits;
+    std::vector<double> prev_alpha(snapshot.lookups.size(), 1.0);
+    struct ShadowLruState {
+      size_t capacity_entries = 1;
+      std::list<uint64_t> lru;
+      std::unordered_map<uint64_t, std::list<uint64_t>::iterator> pos;
+      uint64_t window_hits = 0;
+      uint64_t window_accesses = 0;
+
+      void SetCapacityEntries(size_t entries) {
+        capacity_entries = std::max<size_t>(entries, 1);
+        while (pos.size() > capacity_entries) {
+          uint64_t victim = lru.back();
+          lru.pop_back();
+          pos.erase(victim);
+        }
+      }
+
+      void Observe(uint64_t key_hash) {
+        ++window_accesses;
+        auto it = pos.find(key_hash);
+        if (it != pos.end()) {
+          ++window_hits;
+          lru.splice(lru.begin(), lru, it->second);
+          it->second = lru.begin();
+          return;
+        }
+        lru.push_front(key_hash);
+        pos[key_hash] = lru.begin();
+        if (pos.size() > capacity_entries) {
+          uint64_t victim = lru.back();
+          lru.pop_back();
+          pos.erase(victim);
+        }
+      }
+
+      double WindowHitRate() const {
+        if (window_accesses == 0) {
+          return 0.0;
+        }
+        return static_cast<double>(window_hits) /
+               static_cast<double>(window_accesses);
+      }
+
+      void ResetWindowCounters() {
+        window_hits = 0;
+        window_accesses = 0;
+      }
+    };
+    std::vector<ShadowLruState> shadow_base(snapshot.lookups.size());
+    std::vector<ShadowLruState> shadow_scaled(snapshot.lookups.size());
+    const bool use_shadow_alpha =
+        FLAGS_multi_level_cache_alpha_estimator == "shadow_cache";
+    const bool use_constant_one_alpha =
+        FLAGS_multi_level_cache_alpha_estimator == "constant_one";
+    const double shadow_scale =
+        std::max(1.01, FLAGS_multi_level_cache_alpha_shadow_scale);
+    const size_t estimated_entry_bytes =
+        static_cast<size_t>(std::max<int32_t>(1, FLAGS_block_size));
+    uint64_t alpha_debug_round = 0;
     MultiLevelCacheAllocator::MetricsProvider provider =
-        [cache = multi_level_cache_,
-         prev_lookups](std::vector<double>* lambda, std::vector<double>* data,
-                       std::vector<double>* alpha) mutable {
+        [cache = multi_level_cache_, prev_lookups, prev_hits,
+         prev_alpha, shadow_base, shadow_scaled, use_shadow_alpha, shadow_scale,
+         use_constant_one_alpha, estimated_entry_bytes,
+         alpha_debug_round](std::vector<double>* lambda,
+                            std::vector<double>* data,
+                            std::vector<double>* alpha) mutable {
           if (lambda == nullptr || data == nullptr || alpha == nullptr) {
             return false;
           }
           const auto stats = cache->GetLevelMetricsSnapshot();
+          const auto lookup_samples = cache->DrainLookupSamples();
           const size_t level_count = stats.lookups.size();
-          if (level_count == 0 || prev_lookups.size() != level_count) {
+          if (level_count == 0 || prev_lookups.size() != level_count ||
+              prev_hits.size() != level_count ||
+              prev_alpha.size() != level_count ||
+              shadow_base.size() != level_count ||
+              shadow_scaled.size() != level_count ||
+              lookup_samples.size() != level_count) {
             prev_lookups = stats.lookups;
+            prev_hits = stats.hits;
+            prev_alpha.assign(level_count, 1.0);
+            shadow_base.assign(level_count, ShadowLruState{});
+            shadow_scaled.assign(level_count, ShadowLruState{});
             return false;
           }
 
@@ -3058,18 +3148,142 @@ class Benchmark {
                         static_cast<double>(observed_levels)
                   : 1.0;
           constexpr double kLambdaEpsilon = 1e-6;
+          constexpr double kAlphaPrior = 1.0;
+          constexpr uint64_t kAlphaConfidenceLookups = 5000;
+          constexpr double kAlphaEmaBeta = 0.2;
+          constexpr double kAlphaMin = 0.1;
+          constexpr double kAlphaMax = 20.0;
+          constexpr double kMinMissRate = 1e-6;
+          constexpr double kMaxHitRate = 1.0 - kMinMissRate;
+          std::vector<uint64_t> debug_delta_lookups(level_count, 0);
+          std::vector<uint64_t> debug_delta_hits(level_count, 0);
+          std::vector<double> debug_observed_hit(level_count, 0.0);
+          std::vector<double> debug_shadow_hit(level_count, -1.0);
           for (size_t level = 0; level < level_count; ++level) {
-            const uint64_t curr = stats.lookups[level];
-            const uint64_t prev = prev_lookups[level];
-            const uint64_t delta = curr >= prev ? curr - prev : 0;
-            (*lambda)[level] =
-                delta > 0 ? static_cast<double>(delta) : kLambdaEpsilon;
-            (*data)[level] = stats.data_sizes[level] > 0
-                                 ? static_cast<double>(stats.data_sizes[level])
-                                 : default_data;
-            (*alpha)[level] = 1.0;
+            const uint64_t curr_lookups = stats.lookups[level];
+            const uint64_t curr_hits = stats.hits[level];
+            const uint64_t delta_lookups =
+                curr_lookups >= prev_lookups[level]
+                    ? curr_lookups - prev_lookups[level]
+                    : 0;
+            const uint64_t delta_hits =
+                curr_hits >= prev_hits[level] ? curr_hits - prev_hits[level] : 0;
+            debug_delta_lookups[level] = delta_lookups;
+            debug_delta_hits[level] = delta_hits;
+
+            (*lambda)[level] = delta_lookups > 0
+                                   ? static_cast<double>(delta_lookups)
+                                   : kLambdaEpsilon;
+            const double level_data = stats.data_sizes[level] > 0
+                                          ? static_cast<double>(stats.data_sizes[level])
+                                          : default_data;
+            (*data)[level] = level_data;
+            if (use_constant_one_alpha) {
+              (*alpha)[level] = 1.0;
+              prev_alpha[level] = 1.0;
+              continue;
+            }
+
+            // Robust online alpha estimation:
+            //   1) derive raw alpha from observed window hit rate
+            //   2) optional shadow-cache dual-point fit
+            //   3) confidence-shrink to prior under small samples
+            //   4) EMA smooth across windows
+            double derived_alpha = prev_alpha[level];
+            const size_t capacity_bytes = stats.capacities[level];
+            if (delta_lookups > 0 && capacity_bytes > 0 && level_data > 0.0) {
+              const double observed_hit_rate = std::min(
+                  kMaxHitRate,
+                  std::max(0.0, static_cast<double>(delta_hits) /
+                                    static_cast<double>(delta_lookups)));
+              debug_observed_hit[level] = observed_hit_rate;
+              const double miss_rate =
+                  std::max(kMinMissRate, 1.0 - observed_hit_rate);
+              derived_alpha =
+                  -(level_data / static_cast<double>(stats.capacities[level])) *
+                  std::log(miss_rate);
+
+              if (use_shadow_alpha) {
+                const size_t base_entries =
+                    std::max<size_t>(capacity_bytes / estimated_entry_bytes, 1);
+                const size_t scaled_entries = std::max<size_t>(
+                    static_cast<size_t>(
+                        std::llround(static_cast<double>(base_entries) *
+                                     shadow_scale)),
+                    base_entries + 1);
+                shadow_base[level].SetCapacityEntries(base_entries);
+                shadow_scaled[level].SetCapacityEntries(scaled_entries);
+                for (uint64_t sample_hash : lookup_samples[level]) {
+                  shadow_base[level].Observe(sample_hash);
+                  shadow_scaled[level].Observe(sample_hash);
+                }
+
+                if (shadow_scaled[level].window_accesses > 0) {
+                  const double shadow_hit_rate = std::min(
+                      kMaxHitRate,
+                      std::max(0.0, shadow_scaled[level].WindowHitRate()));
+                  debug_shadow_hit[level] = shadow_hit_rate;
+                  const double y_obs = -std::log(std::max(
+                      kMinMissRate, 1.0 - observed_hit_rate));
+                  const double y_shadow =
+                      -std::log(std::max(kMinMissRate, 1.0 - shadow_hit_rate));
+                  const double c1 = static_cast<double>(capacity_bytes);
+                  const double c2 =
+                      static_cast<double>(scaled_entries * estimated_entry_bytes);
+                  const double denom = c1 * c1 + c2 * c2;
+                  if (denom > 0.0) {
+                    const double slope = (c1 * y_obs + c2 * y_shadow) / denom;
+                    derived_alpha = std::max(0.0, slope * level_data);
+                  }
+                }
+                shadow_base[level].ResetWindowCounters();
+                shadow_scaled[level].ResetWindowCounters();
+              }
+            }
+
+            const double confidence =
+                std::min(1.0, static_cast<double>(delta_lookups) /
+                                  static_cast<double>(kAlphaConfidenceLookups));
+            const double shrunk_alpha =
+                confidence * derived_alpha + (1.0 - confidence) * kAlphaPrior;
+            const double smoothed_alpha = (1.0 - kAlphaEmaBeta) * prev_alpha[level] +
+                                          kAlphaEmaBeta * shrunk_alpha;
+
+            double final_alpha = smoothed_alpha;
+            if (final_alpha < kAlphaMin) {
+              final_alpha = kAlphaMin;
+            } else if (final_alpha > kAlphaMax) {
+              final_alpha = kAlphaMax;
+            }
+            (*alpha)[level] = final_alpha;
+            prev_alpha[level] = final_alpha;
           }
           prev_lookups = stats.lookups;
+          prev_hits = stats.hits;
+          ++alpha_debug_round;
+          if (FLAGS_multi_level_cache_alpha_debug &&
+              FLAGS_multi_level_cache_alpha_debug_every_rounds > 0 &&
+              alpha_debug_round %
+                      FLAGS_multi_level_cache_alpha_debug_every_rounds ==
+                  0) {
+            std::fprintf(
+                stdout,
+                "[MLC][alpha_debug] round=%" PRIu64
+                " estimator=%s level_count=%zu\n",
+                alpha_debug_round,
+                FLAGS_multi_level_cache_alpha_estimator.c_str(), level_count);
+            for (size_t level = 0; level < level_count; ++level) {
+              std::fprintf(
+                  stdout,
+                  "[MLC][alpha_debug] L%zu delta_lookups=%" PRIu64
+                  " delta_hits=%" PRIu64 " obs_hit=%.4f shadow_hit=%.4f "
+                  "capacity=%zu data=%.0f lambda=%.3f alpha=%.4f\n",
+                  level, debug_delta_lookups[level], debug_delta_hits[level],
+                  debug_observed_hit[level], debug_shadow_hit[level],
+                  stats.capacities[level], (*data)[level], (*lambda)[level],
+                  (*alpha)[level]);
+            }
+          }
           return true;
         };
 
@@ -3091,12 +3305,13 @@ class Benchmark {
     fprintf(stdout,
             "=== MultiLevelCache Allocator (db_bench) started: interval_ms=%" PRIu64
             ", smoothing_ratio=%.3f, min_change_bytes=%" PRIu64
-            ", min_active_level_cap=%" PRIu64 ", mode=%s ===\n",
+            ", min_active_level_cap=%" PRIu64 ", mode=%s, alpha_estimator=%s ===\n",
             FLAGS_multi_level_cache_adjust_interval_ms,
             FLAGS_multi_level_cache_adjust_smoothing_ratio,
             FLAGS_multi_level_cache_adjust_min_change_bytes,
             FLAGS_multi_level_cache_adjust_min_active_level_capacity_bytes,
-            FLAGS_multi_level_cache_allocator_mode.c_str());
+            FLAGS_multi_level_cache_allocator_mode.c_str(),
+            FLAGS_multi_level_cache_alpha_estimator.c_str());
   }
 
   bool SanityCheck() {
@@ -3119,6 +3334,25 @@ class Benchmark {
               "invalid --multi_level_cache_allocator_mode=%s, expected "
               "model|baseline_emulation\n",
               FLAGS_multi_level_cache_allocator_mode.c_str());
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache && FLAGS_multi_level_cache_auto_adjust &&
+        FLAGS_multi_level_cache_alpha_estimator != "constant_one" &&
+        FLAGS_multi_level_cache_alpha_estimator != "robust_hit_rate" &&
+        FLAGS_multi_level_cache_alpha_estimator != "shadow_cache") {
+      fprintf(stderr,
+              "invalid --multi_level_cache_alpha_estimator=%s, expected "
+              "constant_one|robust_hit_rate|shadow_cache\n",
+              FLAGS_multi_level_cache_alpha_estimator.c_str());
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache && FLAGS_multi_level_cache_auto_adjust &&
+        FLAGS_multi_level_cache_alpha_estimator == "shadow_cache" &&
+        FLAGS_multi_level_cache_alpha_shadow_scale <= 1.0) {
+      fprintf(stderr,
+              "invalid --multi_level_cache_alpha_shadow_scale=%.3f, must be "
+              "> 1.0 when using shadow_cache estimator\n",
+              FLAGS_multi_level_cache_alpha_shadow_scale);
       return false;
     }
     return true;
@@ -3480,8 +3714,15 @@ class Benchmark {
       }
       const size_t level_count =
           FLAGS_num_levels > 0 ? static_cast<size_t>(FLAGS_num_levels) : 1U;
+      LRUCacheOptions mlc_lru_opts(
+          static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
+          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
+          GetCacheAllocator(), kDefaultToAdaptiveMutex,
+          kDefaultCacheMetadataChargePolicy, FLAGS_cache_low_pri_pool_ratio);
+      mlc_lru_opts.hash_seed = GetCacheHashSeed();
       return std::make_shared<MultiLevelCache>(
-          level_count, static_cast<size_t>(capacity));
+          level_count, static_cast<size_t>(capacity), mlc_lru_opts,
+          FLAGS_multi_level_cache_force_route_all_to_l0);
     }
 
     if (!FLAGS_cache_uri.empty()) {
