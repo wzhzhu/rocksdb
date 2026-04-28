@@ -15,7 +15,9 @@ set -euo pipefail
 #
 # Environment overrides:
 #   RUNS=3
-#   NUM=2000000
+#   NUM=2000000  # compatibility fallback
+#   KEY_SPACE_NUM=2000000
+#   FILL_WRITES_PER_THREAD=2000000
 #   READS=1000000
 #   THREADS=16
 #   WRITE_THREADS=16
@@ -45,6 +47,8 @@ set -euo pipefail
 DB_BENCH_BIN="${1:-./build/db_bench}"
 RUNS="${RUNS:-3}"
 NUM="${NUM:-2000000}"
+KEY_SPACE_NUM="${KEY_SPACE_NUM:-${NUM}}"
+FILL_WRITES_PER_THREAD="${FILL_WRITES_PER_THREAD:-${NUM}}"
 READS="${READS:-1000000}"
 THREADS="${THREADS:-16}"
 WRITE_THREADS="${WRITE_THREADS:-${THREADS}}"
@@ -103,7 +107,8 @@ prepare_db_once() {
     --benchmarks=fillrandom \
     --use_existing_db=false \
     --db="${db_path}" \
-    --num="${NUM}" \
+    --num="${KEY_SPACE_NUM}" \
+    --writes="${FILL_WRITES_PER_THREAD}" \
     --threads="${WRITE_THREADS}" \
     --value_size="${VALUE_SIZE}" \
     --num_levels="${NUM_LEVELS}" \
@@ -128,7 +133,7 @@ wait_for_compaction_after_fill() {
     --benchmarks=waitforcompaction \
     --use_existing_db=true \
     --db="${db_path}" \
-    --num="${NUM}" \
+    --num="${KEY_SPACE_NUM}" \
     --threads=1 \
     --num_levels="${NUM_LEVELS}" \
     --compression_type="${COMPRESSION_TYPE}" \
@@ -158,7 +163,7 @@ run_read_case() {
     "--benchmarks=readrandom"
     "--use_existing_db=true"
     "--db=${db_path}"
-    "--num=${NUM}"
+    "--num=${KEY_SPACE_NUM}"
     "--reads=${READS}"
     "--threads=${READ_THREADS}"
     "--value_size=${VALUE_SIZE}"
