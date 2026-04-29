@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <iomanip>
 #include <sstream>
 #include <string_view>
@@ -19,6 +20,10 @@ namespace {
 size_t SafeLevelCount(size_t num_levels) {
   return std::max<size_t>(num_levels, 1);
 }
+
+constexpr uint32_t kRatioScalePpm = 1000000U;
+constexpr uint32_t kMaxSharedPoolRatioPpm = 900000U;
+constexpr size_t kMaxAdmissionCandidatesPerShard = 4096;
 
 }  // namespace
 
@@ -50,6 +55,9 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
     options.capacity = level_capacity;
     sub_caches_.emplace_back(options.MakeSharedCache());
   }
+  LRUCacheOptions shared_options = lru_options;
+  shared_options.capacity = 0;
+  shared_cache_ = shared_options.MakeSharedCache();
 
   lookups_.resize(level_count);
   hits_.resize(level_count);
@@ -70,16 +78,28 @@ Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
                                Handle** handle, Priority priority,
                                const Slice& compressed, CompressionType type) {
   const size_t level_index = RouteLevelByKey(key, RouteCaller::kInsert);
+  Cache* target_cache = SubCacheByLevel(level_index);
+  const uint64_t key_hash = HashCacheKey(key);
+  bool route_to_shared = false;
+  if (!force_route_all_to_l0_.load(std::memory_order_relaxed) &&
+      shared_pool_ratio_ppm_.load(std::memory_order_relaxed) > 0 &&
+      IsSharedPoolAdmissionReady(key_hash)) {
+    target_cache = SharedCache();
+    route_to_shared = true;
+  }
   Cache::Handle* inner = nullptr;
   Cache::Handle** inner_handle = handle != nullptr ? &inner : nullptr;
-  Status s = SubCacheByLevel(level_index)->Insert(key, obj, helper, charge,
-                                                  inner_handle, priority,
-                                                  compressed, type);
+  Status s = target_cache->Insert(key, obj, helper, charge, inner_handle,
+                                  priority, compressed, type);
   if (!s.ok()) {
     return s;
   }
+  if (route_to_shared) {
+    ClearSharedPoolAdmission(key_hash);
+    shared_pool_admissions_.fetch_add(1, std::memory_order_relaxed);
+  }
   if (handle != nullptr && inner != nullptr) {
-    *handle = NewWrappedHandle(level_index, inner);
+    *handle = NewWrappedHandle(target_cache, inner);
   }
   return s;
 }
@@ -88,12 +108,13 @@ Cache::Handle* MultiLevelCache::CreateStandalone(
     const Slice& key, ObjectPtr obj, const CacheItemHelper* helper,
     size_t charge, bool allow_uncharged) {
   const size_t level_index = RouteLevelByKey(key, RouteCaller::kOther);
-  Cache::Handle* inner = SubCacheByLevel(level_index)->CreateStandalone(
-      key, obj, helper, charge, allow_uncharged);
+  Cache* target_cache = SubCacheByLevel(level_index);
+  Cache::Handle* inner =
+      target_cache->CreateStandalone(key, obj, helper, charge, allow_uncharged);
   if (inner == nullptr) {
     return nullptr;
   }
-  return NewWrappedHandle(level_index, inner);
+  return NewWrappedHandle(target_cache, inner);
 }
 
 Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
@@ -103,35 +124,54 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
   const size_t level_index = RouteLevelByKey(key, RouteCaller::kLookup);
   MaybeRecordLookupSample(level_index, key);
   lookups_[level_index].fetch_add(1, std::memory_order_relaxed);
-  Cache::Handle* inner = SubCacheByLevel(level_index)->Lookup(
-      key, helper, create_context, priority, stats);
+  Cache* level_cache = SubCacheByLevel(level_index);
+  Cache::Handle* inner =
+      level_cache->Lookup(key, helper, create_context, priority, stats);
+  Cache* owner_cache = level_cache;
   if (inner == nullptr) {
-    return nullptr;
+    const bool shared_enabled =
+        !force_route_all_to_l0_.load(std::memory_order_relaxed) &&
+        shared_pool_ratio_ppm_.load(std::memory_order_relaxed) > 0;
+    if (!shared_enabled) {
+      return nullptr;
+    }
+    shared_pool_lookups_.fetch_add(1, std::memory_order_relaxed);
+    inner = SharedCache()->Lookup(key, helper, create_context, priority, stats);
+    if (inner == nullptr) {
+      RecordSharedPoolCandidate(HashCacheKey(key));
+      return nullptr;
+    }
+    shared_pool_hits_.fetch_add(1, std::memory_order_relaxed);
+    owner_cache = SharedCache();
   }
   hits_[level_index].fetch_add(1, std::memory_order_relaxed);
-  return NewWrappedHandle(level_index, inner);
+  return NewWrappedHandle(owner_cache, inner);
 }
 
 bool MultiLevelCache::Ref(Handle* handle) {
   WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return SubCacheByLevel(wrapped->level_index)->Ref(wrapped->inner);
+  return wrapped->owner_cache->Ref(wrapped->inner);
 }
 
 bool MultiLevelCache::Release(Handle* handle, bool erase_if_last_ref) {
   WrappedHandle* wrapped = ToWrappedHandle(handle);
-  const bool erased = SubCacheByLevel(wrapped->level_index)
-                          ->Release(wrapped->inner, erase_if_last_ref);
+  const bool erased =
+      wrapped->owner_cache->Release(wrapped->inner, erase_if_last_ref);
   delete wrapped;
   return erased;
 }
 
 Cache::ObjectPtr MultiLevelCache::Value(Handle* handle) {
   WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return SubCacheByLevel(wrapped->level_index)->Value(wrapped->inner);
+  return wrapped->owner_cache->Value(wrapped->inner);
 }
 
 void MultiLevelCache::Erase(const Slice& key) {
   SubCacheByLevel(RouteLevelByKey(key, RouteCaller::kOther))->Erase(key);
+  if (!force_route_all_to_l0_.load(std::memory_order_relaxed) &&
+      shared_pool_ratio_ppm_.load(std::memory_order_relaxed) > 0) {
+    SharedCache()->Erase(key);
+  }
 }
 
 uint64_t MultiLevelCache::NewId() { return PrimarySubCache()->NewId(); }
@@ -139,8 +179,10 @@ uint64_t MultiLevelCache::NewId() { return PrimarySubCache()->NewId(); }
 void MultiLevelCache::SetCapacity(size_t capacity) {
   total_capacity_.store(capacity, std::memory_order_relaxed);
   const size_t level_count = sub_caches_.size();
-  const size_t per_level_capacity = capacity / level_count;
-  const size_t remainder = capacity % level_count;
+  const size_t shared_capacity = GetSharedPoolCapacity(capacity);
+  const size_t level_budget = capacity - shared_capacity;
+  const size_t per_level_capacity = level_budget / level_count;
+  const size_t remainder = level_budget % level_count;
   std::vector<size_t> capacities;
   capacities.reserve(level_count);
   for (size_t level = 0; level < level_count; ++level) {
@@ -155,9 +197,15 @@ void MultiLevelCache::SetStrictCapacityLimit(bool strict_capacity_limit) {
   for (const auto& sub_cache : sub_caches_) {
     sub_cache->SetStrictCapacityLimit(strict_capacity_limit);
   }
+  if (shared_cache_ != nullptr) {
+    shared_cache_->SetStrictCapacityLimit(strict_capacity_limit);
+  }
 }
 
 bool MultiLevelCache::HasStrictCapacityLimit() const {
+  if (shared_cache_ != nullptr && shared_cache_->HasStrictCapacityLimit()) {
+    return true;
+  }
   return PrimarySubCache()->HasStrictCapacityLimit();
 }
 
@@ -165,6 +213,9 @@ size_t MultiLevelCache::GetCapacity() const {
   size_t total = 0;
   for (const auto& sub_cache : sub_caches_) {
     total += sub_cache->GetCapacity();
+  }
+  if (shared_cache_ != nullptr) {
+    total += shared_cache_->GetCapacity();
   }
   return total;
 }
@@ -174,12 +225,15 @@ size_t MultiLevelCache::GetUsage() const {
   for (const auto& sub_cache : sub_caches_) {
     total += sub_cache->GetUsage();
   }
+  if (shared_cache_ != nullptr) {
+    total += shared_cache_->GetUsage();
+  }
   return total;
 }
 
 size_t MultiLevelCache::GetUsage(Handle* handle) const {
   const WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return SubCacheByLevel(wrapped->level_index)->GetUsage(wrapped->inner);
+  return wrapped->owner_cache->GetUsage(wrapped->inner);
 }
 
 size_t MultiLevelCache::GetPinnedUsage() const {
@@ -187,19 +241,21 @@ size_t MultiLevelCache::GetPinnedUsage() const {
   for (const auto& sub_cache : sub_caches_) {
     total += sub_cache->GetPinnedUsage();
   }
+  if (shared_cache_ != nullptr) {
+    total += shared_cache_->GetPinnedUsage();
+  }
   return total;
 }
 
 size_t MultiLevelCache::GetCharge(Handle* handle) const {
   const WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return SubCacheByLevel(wrapped->level_index)->GetCharge(wrapped->inner);
+  return wrapped->owner_cache->GetCharge(wrapped->inner);
 }
 
 const Cache::CacheItemHelper* MultiLevelCache::GetCacheItemHelper(
     Handle* handle) const {
   const WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return SubCacheByLevel(wrapped->level_index)
-      ->GetCacheItemHelper(wrapped->inner);
+  return wrapped->owner_cache->GetCacheItemHelper(wrapped->inner);
 }
 
 void MultiLevelCache::ApplyToAllEntries(
@@ -209,6 +265,9 @@ void MultiLevelCache::ApplyToAllEntries(
   for (const auto& sub_cache : sub_caches_) {
     sub_cache->ApplyToAllEntries(callback, opts);
   }
+  if (shared_cache_ != nullptr) {
+    shared_cache_->ApplyToAllEntries(callback, opts);
+  }
 }
 
 void MultiLevelCache::ApplyToHandle(
@@ -216,13 +275,16 @@ void MultiLevelCache::ApplyToHandle(
     const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
                              const CacheItemHelper* helper)>& callback) {
   WrappedHandle* wrapped = ToWrappedHandle(handle);
-  Cache* routed = SubCacheByLevel(wrapped->level_index);
-  routed->ApplyToHandle(routed, wrapped->inner, callback);
+  wrapped->owner_cache->ApplyToHandle(wrapped->owner_cache, wrapped->inner,
+                                      callback);
 }
 
 void MultiLevelCache::EraseUnRefEntries() {
   for (const auto& sub_cache : sub_caches_) {
     sub_cache->EraseUnRefEntries();
+  }
+  if (shared_cache_ != nullptr) {
+    shared_cache_->EraseUnRefEntries();
   }
 }
 
@@ -235,6 +297,13 @@ size_t MultiLevelCache::GetOccupancyCount() const {
     }
     total += count;
   }
+  if (shared_cache_ != nullptr) {
+    const size_t count = shared_cache_->GetOccupancyCount();
+    if (count == SIZE_MAX) {
+      return SIZE_MAX;
+    }
+    total += count;
+  }
   return total;
 }
 
@@ -242,6 +311,9 @@ size_t MultiLevelCache::GetTableAddressCount() const {
   size_t total = 0;
   for (const auto& sub_cache : sub_caches_) {
     total += sub_cache->GetTableAddressCount();
+  }
+  if (shared_cache_ != nullptr) {
+    total += shared_cache_->GetTableAddressCount();
   }
   return total;
 }
@@ -316,6 +388,19 @@ std::string MultiLevelCache::PrintStats() const {
       << ", prefix_misses=" << lookup_prefix_misses
       << ", prefix_hit_rate=" << lookup_prefix_hit_rate << "\n";
   oss << "route_normalize_fallbacks=" << route_normalize_fallbacks << "\n";
+  const uint64_t shared_lookups =
+      shared_pool_lookups_.load(std::memory_order_relaxed);
+  const uint64_t shared_hits = shared_pool_hits_.load(std::memory_order_relaxed);
+  const double shared_hit_rate =
+      shared_lookups == 0
+          ? 0.0
+          : static_cast<double>(shared_hits) / static_cast<double>(shared_lookups);
+  oss << "shared_pool: capacity="
+      << (shared_cache_ != nullptr ? shared_cache_->GetCapacity() : 0)
+      << ", lookups=" << shared_lookups << ", hits=" << shared_hits
+      << ", hit_rate=" << shared_hit_rate
+      << ", admissions="
+      << shared_pool_admissions_.load(std::memory_order_relaxed) << "\n";
   oss << "total_hit_rate=" << total_hit_rate << " (" << total_hits << "/"
       << total_lookups << ")\n";
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
@@ -350,6 +435,9 @@ void MultiLevelCache::ResetStats() {
   lookup_route_prefix_hits_.store(0, std::memory_order_relaxed);
   lookup_route_prefix_misses_.store(0, std::memory_order_relaxed);
   route_normalize_fallbacks_.store(0, std::memory_order_relaxed);
+  shared_pool_lookups_.store(0, std::memory_order_relaxed);
+  shared_pool_hits_.store(0, std::memory_order_relaxed);
+  shared_pool_admissions_.store(0, std::memory_order_relaxed);
 }
 
 MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
@@ -406,6 +494,26 @@ void MultiLevelCache::SetForceRouteAllToL0(bool force_route_all_to_l0) {
   std::vector<size_t> l0_only_capacities(sub_caches_.size(), 0);
   l0_only_capacities[0] = total_capacity_.load(std::memory_order_relaxed);
   ApplyCapacities(l0_only_capacities);
+}
+
+void MultiLevelCache::SetSharedPoolRatio(double shared_pool_ratio) {
+  const double clamped = std::max(0.0, std::min(0.9, shared_pool_ratio));
+  const uint32_t ppm =
+      static_cast<uint32_t>(clamped * static_cast<double>(kRatioScalePpm));
+  shared_pool_ratio_ppm_.store(std::min(ppm, kMaxSharedPoolRatioPpm),
+                               std::memory_order_relaxed);
+  SetCapacity(total_capacity_.load(std::memory_order_relaxed));
+}
+
+void MultiLevelCache::SetSharedPoolAdmissionThreshold(
+    uint32_t admission_threshold) {
+  shared_pool_admission_threshold_.store(std::max<uint32_t>(1, admission_threshold),
+                                         std::memory_order_relaxed);
+}
+
+void MultiLevelCache::SetSharedPoolDecayIntervalOps(uint32_t decay_interval_ops) {
+  shared_pool_decay_interval_ops_.store(
+      std::max<uint32_t>(1, decay_interval_ops), std::memory_order_relaxed);
 }
 
 size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
@@ -476,10 +584,11 @@ std::optional<uint64_t> MultiLevelCache::GetCacheKeyPrefix(
 }
 
 MultiLevelCache::WrappedHandle* MultiLevelCache::NewWrappedHandle(
-    size_t level_index, Cache::Handle* inner) {
+    Cache* owner_cache, Cache::Handle* inner) {
   assert(inner != nullptr);
+  assert(owner_cache != nullptr);
   auto* wrapped = new WrappedHandle();
-  wrapped->level_index = level_index;
+  wrapped->owner_cache = owner_cache;
   wrapped->inner = inner;
   return wrapped;
 }
@@ -488,6 +597,7 @@ MultiLevelCache::WrappedHandle* MultiLevelCache::ToWrappedHandle(
     Handle* handle) {
   assert(handle != nullptr);
   auto* wrapped = static_cast<WrappedHandle*>(handle);
+  assert(wrapped->owner_cache != nullptr);
   assert(wrapped->inner != nullptr);
   return wrapped;
 }
@@ -496,6 +606,7 @@ const MultiLevelCache::WrappedHandle* MultiLevelCache::ToWrappedHandle(
     const Handle* handle) {
   assert(handle != nullptr);
   const auto* wrapped = static_cast<const WrappedHandle*>(handle);
+  assert(wrapped->owner_cache != nullptr);
   assert(wrapped->inner != nullptr);
   return wrapped;
 }
@@ -520,8 +631,52 @@ Status MultiLevelCache::ValidateCapacities(
 
 void MultiLevelCache::ApplyCapacities(const std::vector<size_t>& capacities) {
   assert(capacities.size() == sub_caches_.size());
-  for (size_t level = 0; level < capacities.size(); ++level) {
-    sub_caches_[level]->SetCapacity(capacities[level]);
+  std::vector<size_t> level_capacities(capacities.size(), 0);
+  if (force_route_all_to_l0_.load(std::memory_order_relaxed)) {
+    level_capacities[0] = total_capacity_.load(std::memory_order_relaxed);
+    for (size_t level = 0; level < level_capacities.size(); ++level) {
+      sub_caches_[level]->SetCapacity(level_capacities[level]);
+    }
+    if (shared_cache_ != nullptr) {
+      shared_cache_->SetCapacity(0);
+    }
+    return;
+  }
+
+  const size_t total_capacity = total_capacity_.load(std::memory_order_relaxed);
+  const size_t shared_capacity = GetSharedPoolCapacity(total_capacity);
+  const size_t level_budget = total_capacity - shared_capacity;
+  uint64_t requested_total = 0;
+  for (size_t value : capacities) {
+    requested_total += value;
+  }
+  if (requested_total == 0) {
+    const size_t per_level = level_budget / level_capacities.size();
+    const size_t remainder = level_budget % level_capacities.size();
+    for (size_t level = 0; level < level_capacities.size(); ++level) {
+      level_capacities[level] = per_level + (level < remainder ? 1 : 0);
+    }
+  } else {
+    size_t assigned = 0;
+    for (size_t level = 0; level < level_capacities.size(); ++level) {
+      const size_t scaled = static_cast<size_t>(
+          (static_cast<unsigned __int128>(capacities[level]) * level_budget) /
+          requested_total);
+      level_capacities[level] = scaled;
+      assigned += scaled;
+    }
+    for (size_t level = 0;
+         assigned < level_budget && level < level_capacities.size();
+         ++level, ++assigned) {
+      level_capacities[level] += 1;
+    }
+  }
+
+  for (size_t level = 0; level < level_capacities.size(); ++level) {
+    sub_caches_[level]->SetCapacity(level_capacities[level]);
+  }
+  if (shared_cache_ != nullptr) {
+    shared_cache_->SetCapacity(shared_capacity);
   }
 }
 
@@ -533,6 +688,16 @@ Cache* MultiLevelCache::SubCacheByLevel(size_t level_index) {
 const Cache* MultiLevelCache::SubCacheByLevel(size_t level_index) const {
   assert(level_index < sub_caches_.size());
   return sub_caches_[level_index].get();
+}
+
+Cache* MultiLevelCache::SharedCache() {
+  assert(shared_cache_ != nullptr);
+  return shared_cache_.get();
+}
+
+const Cache* MultiLevelCache::SharedCache() const {
+  assert(shared_cache_ != nullptr);
+  return shared_cache_.get();
 }
 
 Cache* MultiLevelCache::PrimarySubCache() {
@@ -615,6 +780,105 @@ void MultiLevelCache::MaybeRecordLookupSample(size_t level_index,
     samples.pop_front();
   }
   samples.push_back(hash);
+}
+
+uint64_t MultiLevelCache::HashCacheKey(const Slice& key) const {
+  return static_cast<uint64_t>(
+      std::hash<std::string_view>{}(std::string_view(key.data(), key.size())));
+}
+
+void MultiLevelCache::RecordSharedPoolCandidate(uint64_t key_hash) {
+  const size_t shard_idx = key_hash % kSharedAdmissionShardCount;
+  SharedAdmissionShard& shard = shared_admission_shards_[shard_idx];
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  MaybeDecaySharedAdmissionShard(&shard);
+  uint32_t& count = shard.miss_scores[key_hash];
+  if (count < 255U) {
+    ++count;
+  }
+  TrimSharedAdmissionShardIfNeeded(&shard);
+}
+
+bool MultiLevelCache::IsSharedPoolAdmissionReady(uint64_t key_hash) {
+  const size_t shard_idx = key_hash % kSharedAdmissionShardCount;
+  SharedAdmissionShard& shard = shared_admission_shards_[shard_idx];
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  MaybeDecaySharedAdmissionShard(&shard);
+  auto it = shard.miss_scores.find(key_hash);
+  if (it == shard.miss_scores.end()) {
+    return false;
+  }
+  const uint32_t threshold =
+      shared_pool_admission_threshold_.load(std::memory_order_relaxed);
+  if (it->second < threshold) {
+    return false;
+  }
+  return true;
+}
+
+void MultiLevelCache::ClearSharedPoolAdmission(uint64_t key_hash) {
+  const size_t shard_idx = key_hash % kSharedAdmissionShardCount;
+  SharedAdmissionShard& shard = shared_admission_shards_[shard_idx];
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  shard.miss_scores.erase(key_hash);
+}
+
+void MultiLevelCache::MaybeDecaySharedAdmissionShard(
+    SharedAdmissionShard* shard) {
+  assert(shard != nullptr);
+  const uint32_t decay_interval =
+      shared_pool_decay_interval_ops_.load(std::memory_order_relaxed);
+  ++shard->ops_since_decay;
+  if (shard->ops_since_decay < decay_interval) {
+    return;
+  }
+  shard->ops_since_decay = 0;
+  for (auto it = shard->miss_scores.begin(); it != shard->miss_scores.end();) {
+    it->second >>= 1;
+    if (it->second == 0) {
+      it = shard->miss_scores.erase(it);
+      continue;
+    }
+    ++it;
+  }
+}
+
+void MultiLevelCache::TrimSharedAdmissionShardIfNeeded(
+    SharedAdmissionShard* shard) {
+  assert(shard != nullptr);
+  if (shard->miss_scores.size() <= kMaxAdmissionCandidatesPerShard) {
+    return;
+  }
+  // Keep memory bounded by dropping low-score entries first.
+  for (auto it = shard->miss_scores.begin();
+       it != shard->miss_scores.end() &&
+       shard->miss_scores.size() > kMaxAdmissionCandidatesPerShard;) {
+    if (it->second <= 1) {
+      it = shard->miss_scores.erase(it);
+      continue;
+    }
+    ++it;
+  }
+  if (shard->miss_scores.size() <= kMaxAdmissionCandidatesPerShard) {
+    return;
+  }
+  for (auto it = shard->miss_scores.begin();
+       it != shard->miss_scores.end() &&
+       shard->miss_scores.size() > kMaxAdmissionCandidatesPerShard;) {
+    it = shard->miss_scores.erase(it);
+  }
+}
+
+size_t MultiLevelCache::GetSharedPoolCapacity(size_t total_capacity) const {
+  if (force_route_all_to_l0_.load(std::memory_order_relaxed)) {
+    return 0;
+  }
+  const uint32_t ppm = shared_pool_ratio_ppm_.load(std::memory_order_relaxed);
+  if (ppm == 0) {
+    return 0;
+  }
+  return static_cast<size_t>(
+      (static_cast<unsigned __int128>(total_capacity) * ppm) / kRatioScalePpm);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

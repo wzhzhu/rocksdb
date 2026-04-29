@@ -617,6 +617,15 @@ DEFINE_bool(multi_level_cache_auto_adjust, true,
 DEFINE_bool(multi_level_cache_force_route_all_to_l0, false,
             "If true, force all MultiLevelCache requests to L0 for "
             "diagnostic A/B experiments.");
+DEFINE_double(multi_level_cache_shared_pool_ratio, 0.0,
+              "Shared-pool capacity ratio for MultiLevelCache in [0, 0.9]. "
+              "0 disables shared pool.");
+DEFINE_uint32(multi_level_cache_shared_pool_admission_threshold, 2,
+              "Lookup miss evidence threshold before admitting a key into "
+              "MultiLevelCache shared pool.");
+DEFINE_uint32(multi_level_cache_shared_pool_decay_interval_ops, 2048,
+              "Per-shard operations interval for shared-pool admission score "
+              "decay in MultiLevelCache. Must be >= 1.");
 DEFINE_string(
     multi_level_cache_allocator_mode, "model",
     "Allocator mode for MultiLevelCache: model | baseline_emulation");
@@ -645,6 +654,14 @@ DEFINE_uint64(
     multi_level_cache_alpha_debug_every_rounds, 10,
     "Print alpha debug once every N allocator rounds when "
     "--multi_level_cache_alpha_debug=true.");
+DEFINE_bool(
+    multi_level_cache_model_bias_debug, false,
+    "If true, print periodic per-level model-vs-observed hit-rate bias "
+    "diagnostics for MultiLevelCache allocator.");
+DEFINE_uint64(
+    multi_level_cache_model_bias_debug_every_rounds, 10,
+    "Print model bias debug once every N allocator rounds when "
+    "--multi_level_cache_model_bias_debug=true.");
 DEFINE_uint32(
     multi_level_cache_alpha_shadow_sample_rate_log2, 8,
     "Lookup sample rate for shadow alpha estimator as 1/(2^x). "
@@ -3186,8 +3203,10 @@ class Benchmark {
           constexpr double kMaxHitRate = 1.0 - kMinMissRate;
           std::vector<uint64_t> debug_delta_lookups(level_count, 0);
           std::vector<uint64_t> debug_delta_hits(level_count, 0);
-          std::vector<double> debug_observed_hit(level_count, 0.0);
+          std::vector<double> debug_observed_hit(level_count, -1.0);
           std::vector<double> debug_shadow_hit(level_count, -1.0);
+          std::vector<double> debug_model_pred_hit(level_count, -1.0);
+          std::vector<double> debug_model_hit_bias(level_count, 0.0);
           for (size_t level = 0; level < level_count; ++level) {
             const uint64_t curr_lookups = stats.lookups[level];
             const uint64_t curr_hits = stats.hits[level];
@@ -3311,6 +3330,20 @@ class Benchmark {
             }
             (*alpha)[level] = final_alpha;
             prev_alpha[level] = final_alpha;
+
+            if (stats.capacities[level] > 0 && level_data > 0.0) {
+              const double exponent =
+                  -(*alpha)[level] *
+                  (static_cast<double>(stats.capacities[level]) / level_data);
+              const double predicted_hit_rate =
+                  std::min(kMaxHitRate,
+                           std::max(0.0, 1.0 - std::exp(exponent)));
+              debug_model_pred_hit[level] = predicted_hit_rate;
+              if (debug_observed_hit[level] >= 0.0) {
+                debug_model_hit_bias[level] =
+                    debug_observed_hit[level] - predicted_hit_rate;
+              }
+            }
           }
           prev_lookups = stats.lookups;
           prev_hits = stats.hits;
@@ -3336,6 +3369,32 @@ class Benchmark {
                   debug_observed_hit[level], debug_shadow_hit[level],
                   stats.capacities[level], (*data)[level], (*lambda)[level],
                   (*alpha)[level]);
+            }
+          }
+          if (FLAGS_multi_level_cache_model_bias_debug &&
+              FLAGS_multi_level_cache_model_bias_debug_every_rounds > 0 &&
+              alpha_debug_round %
+                      FLAGS_multi_level_cache_model_bias_debug_every_rounds ==
+                  0) {
+            std::fprintf(stdout,
+                         "[MLC][model_bias] round=%" PRIu64
+                         " estimator=%s level_count=%zu\n",
+                         alpha_debug_round,
+                         FLAGS_multi_level_cache_alpha_estimator.c_str(),
+                         level_count);
+            for (size_t level = 0; level < level_count; ++level) {
+              const double observed_hit = debug_observed_hit[level];
+              const double predicted_hit = debug_model_pred_hit[level];
+              const double bias = debug_model_hit_bias[level];
+              const double abs_bias = std::fabs(bias);
+              std::fprintf(
+                  stdout,
+                  "[MLC][model_bias] L%zu lookups=%" PRIu64
+                  " hits=%" PRIu64 " capacity=%zu data=%.0f alpha=%.4f "
+                  "obs_hit=%.4f pred_hit=%.4f bias=%.4f abs_bias=%.4f\n",
+                  level, debug_delta_lookups[level], debug_delta_hits[level],
+                  stats.capacities[level], (*data)[level], (*alpha)[level],
+                  observed_hit, predicted_hit, bias, abs_bias);
             }
           }
           return true;
@@ -3407,6 +3466,42 @@ class Benchmark {
               "invalid --multi_level_cache_alpha_shadow_scale=%.3f, must be "
               "> 1.0 when using shadow_cache estimator\n",
               FLAGS_multi_level_cache_alpha_shadow_scale);
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        FLAGS_multi_level_cache_model_bias_debug &&
+        FLAGS_multi_level_cache_model_bias_debug_every_rounds == 0) {
+      fprintf(stderr,
+              "invalid --multi_level_cache_model_bias_debug_every_rounds=%" PRIu64
+              ", must be >= 1 when --multi_level_cache_model_bias_debug=true\n",
+              FLAGS_multi_level_cache_model_bias_debug_every_rounds);
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        (FLAGS_multi_level_cache_shared_pool_ratio < 0.0 ||
+         FLAGS_multi_level_cache_shared_pool_ratio > 0.9)) {
+      fprintf(stderr,
+              "invalid --multi_level_cache_shared_pool_ratio=%.3f, expected "
+              "range [0, 0.9]\n",
+              FLAGS_multi_level_cache_shared_pool_ratio);
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        FLAGS_multi_level_cache_shared_pool_admission_threshold == 0) {
+      fprintf(
+          stderr,
+          "invalid --multi_level_cache_shared_pool_admission_threshold=%u, "
+          "must be >= 1\n",
+          FLAGS_multi_level_cache_shared_pool_admission_threshold);
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        FLAGS_multi_level_cache_shared_pool_decay_interval_ops == 0) {
+      fprintf(
+          stderr,
+          "invalid --multi_level_cache_shared_pool_decay_interval_ops=%u, "
+          "must be >= 1\n",
+          FLAGS_multi_level_cache_shared_pool_decay_interval_ops);
       return false;
     }
     return true;
@@ -3898,6 +3993,12 @@ class Benchmark {
               std::shared_ptr<MultiLevelCache>(cache_, raw);
           multi_level_cache_->SetForceRouteAllToL0(
               FLAGS_multi_level_cache_force_route_all_to_l0);
+          multi_level_cache_->SetSharedPoolRatio(
+              FLAGS_multi_level_cache_shared_pool_ratio);
+          multi_level_cache_->SetSharedPoolAdmissionThreshold(
+              FLAGS_multi_level_cache_shared_pool_admission_threshold);
+          multi_level_cache_->SetSharedPoolDecayIntervalOps(
+              FLAGS_multi_level_cache_shared_pool_decay_interval_ops);
           multi_level_cache_->SetLookupSampleRateLog2(
               FLAGS_multi_level_cache_alpha_shadow_sample_rate_log2);
         }

@@ -3,11 +3,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "rocksdb/advanced_cache.h"
@@ -102,6 +104,9 @@ class MultiLevelCache : public Cache {
   // When enabled, initial capacities are also switched to L0-only so the
   // setup is closer to single-cache baseline behavior.
   void SetForceRouteAllToL0(bool force_route_all_to_l0);
+  void SetSharedPoolRatio(double shared_pool_ratio);
+  void SetSharedPoolAdmissionThreshold(uint32_t admission_threshold);
+  void SetSharedPoolDecayIntervalOps(uint32_t decay_interval_ops);
 
  private:
   enum class RouteCaller {
@@ -111,14 +116,22 @@ class MultiLevelCache : public Cache {
   };
 
   struct WrappedHandle : public Handle {
-    size_t level_index = 0;
+    Cache* owner_cache = nullptr;
     Cache::Handle* inner = nullptr;
+  };
+
+  struct SharedAdmissionShard {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, uint32_t> miss_scores;
+    uint32_t ops_since_decay = 0;
   };
 
   Cache* SubCacheByLevel(size_t level_index);
   const Cache* SubCacheByLevel(size_t level_index) const;
   Cache* PrimarySubCache();
   const Cache* PrimarySubCache() const;
+  Cache* SharedCache();
+  const Cache* SharedCache() const;
 
   size_t RouteLevelByKey(const Slice& key, RouteCaller caller) const;
   std::optional<uint64_t> GetCacheKeyPrefix(const Slice& key) const;
@@ -127,8 +140,15 @@ class MultiLevelCache : public Cache {
   static const char* RouteCallerToString(RouteCaller caller);
   static int64_t ParseDebugMissLimit();
   void MaybeRecordLookupSample(size_t level_index, const Slice& key);
+  uint64_t HashCacheKey(const Slice& key) const;
+  void RecordSharedPoolCandidate(uint64_t key_hash);
+  bool IsSharedPoolAdmissionReady(uint64_t key_hash);
+  void ClearSharedPoolAdmission(uint64_t key_hash);
+  void MaybeDecaySharedAdmissionShard(SharedAdmissionShard* shard);
+  void TrimSharedAdmissionShardIfNeeded(SharedAdmissionShard* shard);
+  size_t GetSharedPoolCapacity(size_t total_capacity) const;
 
-  WrappedHandle* NewWrappedHandle(size_t level_index, Cache::Handle* inner);
+  WrappedHandle* NewWrappedHandle(Cache* owner_cache, Cache::Handle* inner);
   static WrappedHandle* ToWrappedHandle(Handle* handle);
   static const WrappedHandle* ToWrappedHandle(const Handle* handle);
 
@@ -136,6 +156,7 @@ class MultiLevelCache : public Cache {
   void ApplyCapacities(const std::vector<size_t>& capacities);
 
   std::vector<std::shared_ptr<Cache>> sub_caches_;
+  std::shared_ptr<Cache> shared_cache_;
   std::deque<std::atomic<uint64_t>> lookups_;
   std::deque<std::atomic<uint64_t>> hits_;
   std::deque<std::atomic<uint64_t>> level_data_sizes_;
@@ -153,6 +174,15 @@ class MultiLevelCache : public Cache {
   mutable std::atomic<uint64_t> lookup_route_prefix_misses_{0};
   mutable std::atomic<uint64_t> route_normalize_fallbacks_{0};
   mutable std::atomic<int64_t> debug_miss_budget_{0};
+  std::atomic<uint64_t> shared_pool_lookups_{0};
+  std::atomic<uint64_t> shared_pool_hits_{0};
+  std::atomic<uint64_t> shared_pool_admissions_{0};
+  static constexpr size_t kSharedAdmissionShardCount = 64;
+  std::array<SharedAdmissionShard, kSharedAdmissionShardCount>
+      shared_admission_shards_;
+  std::atomic<uint32_t> shared_pool_ratio_ppm_{0};
+  std::atomic<uint32_t> shared_pool_admission_threshold_{2};
+  std::atomic<uint32_t> shared_pool_decay_interval_ops_{2048};
   std::atomic<bool> force_route_all_to_l0_{false};
   std::atomic<size_t> total_capacity_;
 };

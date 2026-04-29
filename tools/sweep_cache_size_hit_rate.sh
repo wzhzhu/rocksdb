@@ -39,6 +39,11 @@ set -euo pipefail
 #   MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2=8
 #   MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS=5
 #   MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES=33554432
+#   MLC_MODEL_BIAS_DEBUG=0
+#   MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS=10
+#   MLC_MODEL_SHARED_POOL_RATIO=0.0
+#   MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD=2
+#   MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS=2048
 #   CACHE_SIZE_MB_LIST=32,64,128,256
 #   INCLUDE_FORCE_L0=1
 #   RESULT_DIR=/tmp/mlc_cache_sweep
@@ -70,6 +75,11 @@ MLC_MODEL_ALPHA_SHADOW_SCALE="${MLC_MODEL_ALPHA_SHADOW_SCALE:-1.5}"
 MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2="${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2:-8}"
 MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS="${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS:-5}"
 MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES="${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES:-33554432}"
+MLC_MODEL_BIAS_DEBUG="${MLC_MODEL_BIAS_DEBUG:-0}"
+MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS="${MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS:-10}"
+MLC_MODEL_SHARED_POOL_RATIO="${MLC_MODEL_SHARED_POOL_RATIO:-0.0}"
+MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD="${MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD:-2}"
+MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS="${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS:-2048}"
 CACHE_SIZE_MB_LIST="${CACHE_SIZE_MB_LIST:-32,64,128,256}"
 INCLUDE_FORCE_L0="${INCLUDE_FORCE_L0:-1}"
 RESULT_DIR="${RESULT_DIR:-/tmp/mlc_cache_sweep}"
@@ -84,6 +94,16 @@ fi
 
 extract_data_hit_rate() {
   local log_file="$1"
+  local hit_line
+  local miss_line
+  hit_line="$(rg "rocksdb\\.block\\.cache\\.data\\.hit COUNT" "${log_file}" -n -m 1 || true)"
+  miss_line="$(rg "rocksdb\\.block\\.cache\\.data\\.miss COUNT" "${log_file}" -n -m 1 || true)"
+  if [[ -z "${hit_line}" || -z "${miss_line}" ]]; then
+    echo "ERROR: failed to parse data block hit/miss counters from ${log_file}" >&2
+    echo "------ log tail ------" >&2
+    tail -n 40 "${log_file}" >&2
+    return 1
+  fi
   awk '
     /rocksdb\.block\.cache\.data\.hit COUNT/ {h=$NF}
     /rocksdb\.block\.cache\.data\.miss COUNT/ {m=$NF}
@@ -196,6 +216,11 @@ run_read_case() {
         "--multi_level_cache_alpha_shadow_sample_rate_log2=${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2}"
         "--multi_level_cache_alpha_shadow_window_rounds=${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS}"
         "--multi_level_cache_alpha_shadow_min_capacity_bytes=${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES}"
+        "--multi_level_cache_model_bias_debug=${MLC_MODEL_BIAS_DEBUG}"
+        "--multi_level_cache_model_bias_debug_every_rounds=${MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS}"
+        "--multi_level_cache_shared_pool_ratio=${MLC_MODEL_SHARED_POOL_RATIO}"
+        "--multi_level_cache_shared_pool_admission_threshold=${MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD}"
+        "--multi_level_cache_shared_pool_decay_interval_ops=${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS}"
       )
       ;;
     mlc_force_l0)
@@ -207,6 +232,7 @@ run_read_case() {
         "--multi_level_cache_adjust_min_active_level_capacity_bytes=0"
         "--multi_level_cache_adjust_smoothing_ratio=1.0"
         "--multi_level_cache_adjust_min_change_bytes=0"
+        "--multi_level_cache_shared_pool_ratio=0"
       )
       ;;
     *)
@@ -217,6 +243,11 @@ run_read_case() {
 
   echo "[${mode_label}] cache=${cache_mb}MB run=${run_id}/${RUNS}" >&2
   "${DB_BENCH_BIN}" "${args[@]}" > "${read_log}" 2>&1
+  if rg -q "^ERROR: unknown command line flag" "${read_log}"; then
+    echo "ERROR: db_bench rejected flags in ${read_log}" >&2
+    tail -n 20 "${read_log}" >&2
+    return 1
+  fi
   local rate
   rate="$(extract_data_hit_rate "${read_log}")"
   printf "%s,%s\n" "${mode_label}" "${rate}"
