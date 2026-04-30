@@ -3198,7 +3198,7 @@ class Benchmark {
           constexpr uint64_t kAlphaConfidenceLookups = 5000;
           constexpr double kAlphaEmaBeta = 0.2;
           constexpr double kAlphaMin = 0.1;
-          constexpr double kAlphaMax = 20.0;
+          constexpr double kAlphaMax = 100.0;
           constexpr double kMinMissRate = 1e-6;
           constexpr double kMaxHitRate = 1.0 - kMinMissRate;
           std::vector<uint64_t> debug_delta_lookups(level_count, 0);
