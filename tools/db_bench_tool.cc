@@ -662,6 +662,10 @@ DEFINE_uint64(
     multi_level_cache_model_bias_debug_every_rounds, 10,
     "Print model bias debug once every N allocator rounds when "
     "--multi_level_cache_model_bias_debug=true.");
+DEFINE_bool(
+    multi_level_cache_use_effective_data_size, false,
+    "If true, use effective working-set estimate (D_eff) as allocator D_i; "
+    "if false, use static per-level total data size (D_raw).");
 DEFINE_uint32(
     multi_level_cache_alpha_shadow_sample_rate_log2, 8,
     "Lookup sample rate for shadow alpha estimator as 1/(2^x). "
@@ -3075,6 +3079,13 @@ class Benchmark {
     std::vector<uint64_t> prev_lookups = snapshot.lookups;
     std::vector<uint64_t> prev_hits = snapshot.hits;
     std::vector<double> prev_alpha(snapshot.lookups.size(), 1.0);
+    std::vector<double> prev_effective_data(snapshot.lookups.size(), 1.0);
+    for (size_t level = 0; level < snapshot.lookups.size(); ++level) {
+      prev_effective_data[level] =
+          snapshot.data_sizes[level] > 0
+              ? static_cast<double>(snapshot.data_sizes[level])
+              : 1.0;
+    }
     struct ShadowLruState {
       size_t capacity_entries = 1;
       std::list<uint64_t> lru;
@@ -3132,6 +3143,8 @@ class Benchmark {
         FLAGS_multi_level_cache_alpha_estimator == "shadow_cache";
     const bool use_constant_one_alpha =
         FLAGS_multi_level_cache_alpha_estimator == "constant_one";
+    const bool use_effective_data_size =
+        FLAGS_multi_level_cache_use_effective_data_size;
     const double shadow_scale =
         std::max(1.01, FLAGS_multi_level_cache_alpha_shadow_scale);
     const size_t shadow_window_rounds =
@@ -3143,8 +3156,10 @@ class Benchmark {
     uint64_t alpha_debug_round = 0;
     MultiLevelCacheAllocator::MetricsProvider provider =
         [cache = multi_level_cache_, prev_lookups, prev_hits,
-         prev_alpha, shadow_base, shadow_scaled, observed_history,
-         shadow_history, use_shadow_alpha, shadow_scale, shadow_window_rounds,
+         prev_alpha, prev_effective_data, shadow_base, shadow_scaled,
+         observed_history,
+         shadow_history, use_shadow_alpha, use_effective_data_size,
+         shadow_scale, shadow_window_rounds,
          shadow_min_capacity_bytes, use_constant_one_alpha,
          estimated_entry_bytes,
          alpha_debug_round](std::vector<double>* lambda,
@@ -3159,6 +3174,7 @@ class Benchmark {
           if (level_count == 0 || prev_lookups.size() != level_count ||
               prev_hits.size() != level_count ||
               prev_alpha.size() != level_count ||
+              prev_effective_data.size() != level_count ||
               shadow_base.size() != level_count ||
               shadow_scaled.size() != level_count ||
               observed_history.size() != level_count ||
@@ -3167,6 +3183,13 @@ class Benchmark {
             prev_lookups = stats.lookups;
             prev_hits = stats.hits;
             prev_alpha.assign(level_count, 1.0);
+            prev_effective_data.assign(level_count, 1.0);
+            for (size_t level = 0; level < level_count; ++level) {
+              prev_effective_data[level] =
+                  stats.data_sizes[level] > 0
+                      ? static_cast<double>(stats.data_sizes[level])
+                      : 1.0;
+            }
             shadow_base.assign(level_count, ShadowLruState{});
             shadow_scaled.assign(level_count, ShadowLruState{});
             observed_history.assign(level_count,
@@ -3199,6 +3222,10 @@ class Benchmark {
           constexpr double kAlphaEmaBeta = 0.2;
           constexpr double kAlphaMin = 0.1;
           constexpr double kAlphaMax = 100.0;
+          constexpr uint64_t kDataConfidenceLookups = 20000;
+          constexpr double kDataEmaBeta = 0.25;
+          constexpr double kDataDriftBetaNoObs = 0.05;
+          constexpr double kDataMinFractionOfRaw = 0.01;
           constexpr double kMinMissRate = 1e-6;
           constexpr double kMaxHitRate = 1.0 - kMinMissRate;
           std::vector<uint64_t> debug_delta_lookups(level_count, 0);
@@ -3207,6 +3234,9 @@ class Benchmark {
           std::vector<double> debug_shadow_hit(level_count, -1.0);
           std::vector<double> debug_model_pred_hit(level_count, -1.0);
           std::vector<double> debug_model_hit_bias(level_count, 0.0);
+          std::vector<double> debug_raw_data(level_count, 0.0);
+          std::vector<double> debug_observed_data(level_count, -1.0);
+          std::vector<double> debug_effective_data(level_count, 0.0);
           for (size_t level = 0; level < level_count; ++level) {
             const uint64_t curr_lookups = stats.lookups[level];
             const uint64_t curr_hits = stats.hits[level];
@@ -3222,13 +3252,16 @@ class Benchmark {
             (*lambda)[level] = delta_lookups > 0
                                    ? static_cast<double>(delta_lookups)
                                    : kLambdaEpsilon;
-            const double level_data = stats.data_sizes[level] > 0
-                                          ? static_cast<double>(stats.data_sizes[level])
-                                          : default_data;
-            (*data)[level] = level_data;
+            const double raw_level_data = stats.data_sizes[level] > 0
+                                              ? static_cast<double>(stats.data_sizes[level])
+                                              : default_data;
+            debug_raw_data[level] = raw_level_data;
             if (use_constant_one_alpha) {
               (*alpha)[level] = 1.0;
+              (*data)[level] = raw_level_data;
               prev_alpha[level] = 1.0;
+              prev_effective_data[level] = raw_level_data;
+              debug_effective_data[level] = raw_level_data;
               continue;
             }
 
@@ -3239,7 +3272,7 @@ class Benchmark {
             //   4) EMA smooth across windows
             double derived_alpha = prev_alpha[level];
             const size_t capacity_bytes = stats.capacities[level];
-            if (delta_lookups > 0 && capacity_bytes > 0 && level_data > 0.0) {
+            if (delta_lookups > 0 && capacity_bytes > 0 && raw_level_data > 0.0) {
               observed_history[level].push_back({delta_hits, delta_lookups});
               while (observed_history[level].size() > shadow_window_rounds) {
                 observed_history[level].pop_front();
@@ -3258,7 +3291,8 @@ class Benchmark {
               const double miss_rate =
                   std::max(kMinMissRate, 1.0 - observed_hit_rate);
               derived_alpha =
-                  -(level_data / static_cast<double>(stats.capacities[level])) *
+                  -(raw_level_data /
+                    static_cast<double>(stats.capacities[level])) *
                   std::log(miss_rate);
 
               if (use_shadow_alpha) {
@@ -3306,7 +3340,7 @@ class Benchmark {
                   const double denom = c1 * c1 + c2 * c2;
                   if (denom > 0.0) {
                     const double slope = (c1 * y_obs + c2 * y_shadow) / denom;
-                    derived_alpha = std::max(0.0, slope * level_data);
+                    derived_alpha = std::max(0.0, slope * raw_level_data);
                   }
                 }
                 shadow_base[level].ResetWindowCounters();
@@ -3331,10 +3365,49 @@ class Benchmark {
             (*alpha)[level] = final_alpha;
             prev_alpha[level] = final_alpha;
 
-            if (stats.capacities[level] > 0 && level_data > 0.0) {
+            const double previous_effective_data =
+                prev_effective_data[level] > 0.0 ? prev_effective_data[level]
+                                                 : raw_level_data;
+            const bool has_observed_hit = debug_observed_hit[level] >= 0.0;
+            double target_effective_data = raw_level_data;
+            if (has_observed_hit && capacity_bytes > 0 && final_alpha > 0.0) {
+              const double miss_rate =
+                  std::max(kMinMissRate, 1.0 - debug_observed_hit[level]);
+              const double observed_effective_data =
+                  -(final_alpha * static_cast<double>(capacity_bytes)) /
+                  std::log(miss_rate);
+              if (std::isfinite(observed_effective_data) &&
+                  observed_effective_data > 0.0) {
+                debug_observed_data[level] = observed_effective_data;
+                const double data_confidence =
+                    std::min(1.0, static_cast<double>(delta_lookups) /
+                                      static_cast<double>(kDataConfidenceLookups));
+                target_effective_data =
+                    data_confidence * observed_effective_data +
+                    (1.0 - data_confidence) * raw_level_data;
+              }
+            }
+            const double data_beta =
+                has_observed_hit ? kDataEmaBeta : kDataDriftBetaNoObs;
+            double effective_level_data =
+                previous_effective_data +
+                data_beta * (target_effective_data - previous_effective_data);
+            const double data_lower_bound =
+                std::max(1.0, raw_level_data * kDataMinFractionOfRaw);
+            const double data_upper_bound = std::max(raw_level_data, data_lower_bound);
+            effective_level_data = std::max(
+                data_lower_bound, std::min(effective_level_data, data_upper_bound));
+            (*data)[level] =
+                use_effective_data_size ? effective_level_data : raw_level_data;
+            prev_effective_data[level] = effective_level_data;
+            debug_effective_data[level] = effective_level_data;
+
+            const double model_data = (*data)[level];
+            if (stats.capacities[level] > 0 && model_data > 0.0) {
               const double exponent =
                   -(*alpha)[level] *
-                  (static_cast<double>(stats.capacities[level]) / level_data);
+                  (static_cast<double>(stats.capacities[level]) /
+                   model_data);
               const double predicted_hit_rate =
                   std::min(kMaxHitRate,
                            std::max(0.0, 1.0 - std::exp(exponent)));
@@ -3391,10 +3464,13 @@ class Benchmark {
                   stdout,
                   "[MLC][model_bias] L%zu lookups=%" PRIu64
                   " hits=%" PRIu64 " capacity=%zu data=%.0f alpha=%.4f "
-                  "obs_hit=%.4f pred_hit=%.4f bias=%.4f abs_bias=%.4f\n",
+                  "obs_hit=%.4f pred_hit=%.4f bias=%.4f abs_bias=%.4f "
+                  "D_raw=%.0f D_obs=%.0f D_eff=%.0f D_model=%.0f\n",
                   level, debug_delta_lookups[level], debug_delta_hits[level],
                   stats.capacities[level], (*data)[level], (*alpha)[level],
-                  observed_hit, predicted_hit, bias, abs_bias);
+                  observed_hit, predicted_hit, bias, abs_bias,
+                  debug_raw_data[level], debug_observed_data[level],
+                  debug_effective_data[level], (*data)[level]);
             }
           }
           return true;

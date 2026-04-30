@@ -35,6 +35,8 @@ set -euo pipefail
 #   MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES=0
 #   MLC_MODEL_ALPHA_ESTIMATOR=shadow_cache   # single estimator (compat mode)
 #   MLC_MODEL_ALPHA_ESTIMATOR_LIST=constant_one,robust_hit_rate,shadow_cache
+#   INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT=1
+#   MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST=robust_hit_rate
 #   MLC_MODEL_ALPHA_SHADOW_SCALE=1.5
 #   MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2=8
 #   MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS=5
@@ -71,6 +73,8 @@ MLC_MODEL_MIN_CHANGE_BYTES="${MLC_MODEL_MIN_CHANGE_BYTES:-0}"
 MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES="${MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES:-0}"
 MLC_MODEL_ALPHA_ESTIMATOR="${MLC_MODEL_ALPHA_ESTIMATOR:-shadow_cache}"
 MLC_MODEL_ALPHA_ESTIMATOR_LIST="${MLC_MODEL_ALPHA_ESTIMATOR_LIST:-${MLC_MODEL_ALPHA_ESTIMATOR}}"
+INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT="${INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT:-1}"
+MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST="${MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST:-robust_hit_rate}"
 MLC_MODEL_ALPHA_SHADOW_SCALE="${MLC_MODEL_ALPHA_SHADOW_SCALE:-1.5}"
 MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2="${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2:-8}"
 MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS="${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS:-5}"
@@ -172,10 +176,16 @@ run_read_case() {
   local mode_kind="${mode}"
   local mode_label="${mode}"
   local alpha_estimator="${MLC_MODEL_ALPHA_ESTIMATOR}"
+  local use_effective_data_size=0
   if [[ "${mode}" == mlc_model:* ]]; then
     mode_kind="mlc_model"
     alpha_estimator="${mode#mlc_model:}"
     mode_label="mlc_model_${alpha_estimator}"
+  elif [[ "${mode}" == mlc_model_eff:* ]]; then
+    mode_kind="mlc_model"
+    alpha_estimator="${mode#mlc_model_eff:}"
+    mode_label="mlc_model_${alpha_estimator}_d_eff"
+    use_effective_data_size=1
   fi
   local read_log="${RESULT_DIR}/${mode_label}_c${cache_mb}_r${run_id}_read.log"
 
@@ -218,6 +228,7 @@ run_read_case() {
         "--multi_level_cache_alpha_shadow_min_capacity_bytes=${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES}"
         "--multi_level_cache_model_bias_debug=${MLC_MODEL_BIAS_DEBUG}"
         "--multi_level_cache_model_bias_debug_every_rounds=${MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS}"
+        "--multi_level_cache_use_effective_data_size=${use_effective_data_size}"
         "--multi_level_cache_shared_pool_ratio=${MLC_MODEL_SHARED_POOL_RATIO}"
         "--multi_level_cache_shared_pool_admission_threshold=${MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD}"
         "--multi_level_cache_shared_pool_decay_interval_ops=${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS}"
@@ -266,6 +277,14 @@ for estimator in "${model_alpha_list[@]}"; do
     read_modes+=("mlc_model:${estimator}")
   fi
 done
+if [[ "${INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT}" == "1" ]]; then
+  IFS=',' read -r -a effective_alpha_list <<< "${MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST}"
+  for estimator in "${effective_alpha_list[@]}"; do
+    if [[ -n "${estimator}" ]]; then
+      read_modes+=("mlc_model_eff:${estimator}")
+    fi
+  done
+fi
 
 IFS=',' read -r -a cache_list <<< "${CACHE_SIZE_MB_LIST}"
 for cache_mb in "${cache_list[@]}"; do
