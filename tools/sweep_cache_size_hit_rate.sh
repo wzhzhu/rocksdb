@@ -259,7 +259,7 @@ run_read_case() {
       ;;
     mlc_model_cacheus_robust_hit_rate)
       args+=(
-        "--cache_type=lru_cache"
+        "--cache_type=cacheus_cache"
         "--use_multi_level_cache=true"
         "--multi_level_cache_auto_adjust=true"
         "--multi_level_cache_allocator_mode=model"
@@ -277,7 +277,6 @@ run_read_case() {
         "--multi_level_cache_shared_pool_ratio=${MLC_MODEL_SHARED_POOL_RATIO}"
         "--multi_level_cache_shared_pool_admission_threshold=${MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD}"
         "--multi_level_cache_shared_pool_decay_interval_ops=${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS}"
-        "--multi_level_cache_sub_cache_uri=${MLC_MODEL_CACHEUS_SUB_CACHE_URI}"
       )
       ;;
     mlc_force_l0)
