@@ -7,7 +7,9 @@ set -euo pipefail
 # 1) Prepare DB once per (cache_size, run) using fillrandom.
 # 2) Reuse the same DB for multiple read cases:
 #    - baseline_lru
+#    - baseline_hcc (optional)
 #    - mlc_model
+#    - mlc_model_hcc (optional)
 #    - mlc_force_l0 (optional)
 #
 # Usage:
@@ -35,14 +37,21 @@ set -euo pipefail
 #   MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES=0
 #   MLC_MODEL_ALPHA_ESTIMATOR=shadow_cache   # single estimator (compat mode)
 #   MLC_MODEL_ALPHA_ESTIMATOR_LIST=constant_one,robust_hit_rate,shadow_cache
+#   INCLUDE_BASELINE_HCC=1
+#   INCLUDE_MLC_MODEL_HCC=1
+#   MLC_MODEL_HCC_ALPHA_ESTIMATOR_LIST=constant_one,robust_hit_rate,shadow_cache
 #   INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT=1
 #   MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST=robust_hit_rate
 #   MLC_MODEL_ALPHA_SHADOW_SCALE=1.5
 #   MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2=8
 #   MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS=5
 #   MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES=33554432
+#   MLC_MODEL_DATA_SIZE_WINDOW_ROUNDS=5
+#   MLC_MODEL_DATA_SIZE_WINDOW_MS=5000
 #   MLC_MODEL_BIAS_DEBUG=0
 #   MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS=10
+#   MLC_MODEL_COMPACTION_SHIFT_RATIO=0.0
+#   MLC_MODEL_COMPACTION_SHIFT_MAX_TOTAL_RATIO=0.1
 #   MLC_MODEL_SHARED_POOL_RATIO=0.0
 #   MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD=2
 #   MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS=2048
@@ -73,14 +82,21 @@ MLC_MODEL_MIN_CHANGE_BYTES="${MLC_MODEL_MIN_CHANGE_BYTES:-0}"
 MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES="${MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES:-0}"
 MLC_MODEL_ALPHA_ESTIMATOR="${MLC_MODEL_ALPHA_ESTIMATOR:-shadow_cache}"
 MLC_MODEL_ALPHA_ESTIMATOR_LIST="${MLC_MODEL_ALPHA_ESTIMATOR_LIST:-${MLC_MODEL_ALPHA_ESTIMATOR}}"
+INCLUDE_BASELINE_HCC="${INCLUDE_BASELINE_HCC:-1}"
+INCLUDE_MLC_MODEL_HCC="${INCLUDE_MLC_MODEL_HCC:-1}"
+MLC_MODEL_HCC_ALPHA_ESTIMATOR_LIST="${MLC_MODEL_HCC_ALPHA_ESTIMATOR_LIST:-${MLC_MODEL_ALPHA_ESTIMATOR_LIST}}"
 INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT="${INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT:-1}"
 MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST="${MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST:-robust_hit_rate}"
 MLC_MODEL_ALPHA_SHADOW_SCALE="${MLC_MODEL_ALPHA_SHADOW_SCALE:-1.5}"
 MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2="${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2:-8}"
 MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS="${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS:-5}"
 MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES="${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES:-33554432}"
+MLC_MODEL_DATA_SIZE_WINDOW_ROUNDS="${MLC_MODEL_DATA_SIZE_WINDOW_ROUNDS:-5}"
+MLC_MODEL_DATA_SIZE_WINDOW_MS="${MLC_MODEL_DATA_SIZE_WINDOW_MS:-5000}"
 MLC_MODEL_BIAS_DEBUG="${MLC_MODEL_BIAS_DEBUG:-0}"
 MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS="${MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS:-10}"
+MLC_MODEL_COMPACTION_SHIFT_RATIO="${MLC_MODEL_COMPACTION_SHIFT_RATIO:-0.0}"
+MLC_MODEL_COMPACTION_SHIFT_MAX_TOTAL_RATIO="${MLC_MODEL_COMPACTION_SHIFT_MAX_TOTAL_RATIO:-0.1}"
 MLC_MODEL_SHARED_POOL_RATIO="${MLC_MODEL_SHARED_POOL_RATIO:-0.0}"
 MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD="${MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD:-2}"
 MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS="${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS:-2048}"
@@ -176,11 +192,17 @@ run_read_case() {
   local mode_kind="${mode}"
   local mode_label="${mode}"
   local alpha_estimator="${MLC_MODEL_ALPHA_ESTIMATOR}"
+  local mlc_cache_type="lru_cache"
   local use_effective_data_size=0
   if [[ "${mode}" == mlc_model:* ]]; then
     mode_kind="mlc_model"
     alpha_estimator="${mode#mlc_model:}"
     mode_label="mlc_model_${alpha_estimator}"
+  elif [[ "${mode}" == mlc_model_hcc:* ]]; then
+    mode_kind="mlc_model"
+    alpha_estimator="${mode#mlc_model_hcc:}"
+    mode_label="mlc_model_hcc_${alpha_estimator}"
+    mlc_cache_type="hyper_clock_cache"
   elif [[ "${mode}" == mlc_model_eff:* ]]; then
     mode_kind="mlc_model"
     alpha_estimator="${mode#mlc_model_eff:}"
@@ -213,9 +235,13 @@ run_read_case() {
     baseline_lru)
       args+=("--use_multi_level_cache=false" "--cache_type=lru_cache")
       ;;
+    baseline_hcc)
+      args+=("--use_multi_level_cache=false" "--cache_type=hyper_clock_cache")
+      ;;
     mlc_model)
       args+=(
         "--use_multi_level_cache=true"
+        "--cache_type=${mlc_cache_type}"
         "--multi_level_cache_auto_adjust=true"
         "--multi_level_cache_allocator_mode=model"
         "--multi_level_cache_adjust_smoothing_ratio=${MLC_MODEL_SMOOTHING_RATIO}"
@@ -226,8 +252,12 @@ run_read_case() {
         "--multi_level_cache_alpha_shadow_sample_rate_log2=${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2}"
         "--multi_level_cache_alpha_shadow_window_rounds=${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS}"
         "--multi_level_cache_alpha_shadow_min_capacity_bytes=${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES}"
+        "--multi_level_cache_data_size_window_rounds=${MLC_MODEL_DATA_SIZE_WINDOW_ROUNDS}"
+        "--multi_level_cache_data_size_window_ms=${MLC_MODEL_DATA_SIZE_WINDOW_MS}"
         "--multi_level_cache_model_bias_debug=${MLC_MODEL_BIAS_DEBUG}"
         "--multi_level_cache_model_bias_debug_every_rounds=${MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS}"
+        "--multi_level_cache_compaction_shift_ratio=${MLC_MODEL_COMPACTION_SHIFT_RATIO}"
+        "--multi_level_cache_compaction_shift_max_total_ratio=${MLC_MODEL_COMPACTION_SHIFT_MAX_TOTAL_RATIO}"
         "--multi_level_cache_use_effective_data_size=${use_effective_data_size}"
         "--multi_level_cache_shared_pool_ratio=${MLC_MODEL_SHARED_POOL_RATIO}"
         "--multi_level_cache_shared_pool_admission_threshold=${MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD}"
@@ -268,6 +298,9 @@ csv_file="${RESULT_DIR}/summary.csv"
 echo "cache_mb,mode,run,data_hit_rate" > "${csv_file}"
 
 read_modes=(baseline_lru)
+if [[ "${INCLUDE_BASELINE_HCC}" == "1" ]]; then
+  read_modes+=(baseline_hcc)
+fi
 if [[ "${INCLUDE_FORCE_L0}" == "1" ]]; then
   read_modes+=(mlc_force_l0)
 fi
@@ -277,6 +310,14 @@ for estimator in "${model_alpha_list[@]}"; do
     read_modes+=("mlc_model:${estimator}")
   fi
 done
+if [[ "${INCLUDE_MLC_MODEL_HCC}" == "1" ]]; then
+  IFS=',' read -r -a model_hcc_alpha_list <<< "${MLC_MODEL_HCC_ALPHA_ESTIMATOR_LIST}"
+  for estimator in "${model_hcc_alpha_list[@]}"; do
+    if [[ -n "${estimator}" ]]; then
+      read_modes+=("mlc_model_hcc:${estimator}")
+    fi
+  done
+fi
 if [[ "${INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT}" == "1" ]]; then
   IFS=',' read -r -a effective_alpha_list <<< "${MLC_MODEL_EFFECTIVE_DATA_ESTIMATOR_LIST}"
   for estimator in "${effective_alpha_list[@]}"; do

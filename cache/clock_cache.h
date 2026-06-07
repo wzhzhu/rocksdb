@@ -419,15 +419,18 @@ struct ClockHandle : public ClockHandleBasicData {
 class BaseClockTable {
  public:
   struct BaseOpts {
-    explicit BaseOpts(int _eviction_effort_cap)
-        : eviction_effort_cap(_eviction_effort_cap) {}
+    explicit BaseOpts(int _eviction_effort_cap, bool _probation_insert = false)
+        : eviction_effort_cap(_eviction_effort_cap),
+          probation_insert(_probation_insert) {}
     explicit BaseOpts(const HyperClockCacheOptions& opts)
-        : BaseOpts(opts.eviction_effort_cap) {}
+        : BaseOpts(opts.eviction_effort_cap, opts.probation_insert) {}
     int eviction_effort_cap;
+    bool probation_insert;
   };
 
   BaseClockTable(size_t capacity, bool strict_capacity_limit,
                  int eviction_effort_cap,
+                 bool probation_insert,
                  CacheMetadataChargePolicy metadata_charge_policy,
                  MemoryAllocator* allocator,
                  const Cache::EvictionCallback* eviction_callback,
@@ -534,6 +537,8 @@ class BaseClockTable {
   // It is normal for this to occur rarely in normal operation.
   // (Relaxed: a simple stat counter.)
   RelaxedAtomic<uint64_t> eviction_effort_exceeded_count_{};
+
+  const bool probation_insert_;
 
   // TODO: is this separation needed if we don't do background evictions?
   ALIGN_AS(CACHE_LINE_SIZE)

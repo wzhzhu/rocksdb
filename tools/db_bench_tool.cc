@@ -45,6 +45,7 @@
 
 #include "cache/multi_level_cache_allocator.h"
 #include "cache/multi_level_cache.h"
+#include "cache/sr_hyper_clock_cache.h"
 #include "cache/cache_key.h"
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
@@ -607,10 +608,18 @@ DEFINE_double(cache_high_pri_pool_ratio, 0.0,
 DEFINE_double(cache_low_pri_pool_ratio, 0.0,
               "Ratio of block cache reserve for low pri blocks.");
 
-DEFINE_string(cache_type, "hyper_clock_cache", "Type of block cache.");
+DEFINE_string(cache_type, "hyper_clock_cache",
+              "Type of block cache (e.g., lru_cache, hyper_clock_cache, "
+              "sr_hyper_clock_cache).");
 DEFINE_bool(use_multi_level_cache, false,
             "If true, use MultiLevelCache for block cache. "
-            "This mode currently uses per-level LRU sub-caches.");
+            "Sub-cache policy follows --cache_type (lru_cache or "
+            "*hyper_clock_cache).");
+DEFINE_int32(
+    multi_level_cache_srhcc_start_level, -1,
+    "If >= 0 and --use_multi_level_cache=true with HCC-family cache type, "
+    "levels [start_level, num_levels) use SRHCC probation insertion while "
+    "lower levels keep normal HCC behavior. -1 disables mixed per-level mode.");
 DEFINE_bool(multi_level_cache_auto_adjust, true,
             "If true and --use_multi_level_cache=true, automatically start "
             "the MultiLevelCacheAllocator during db_bench run.");
@@ -639,6 +648,17 @@ DEFINE_uint64(
 DEFINE_uint64(
     multi_level_cache_adjust_min_active_level_capacity_bytes, 4 << 20,
     "Allocator minimum capacity floor for each active level (data_size > 0).");
+DEFINE_double(
+    multi_level_cache_compaction_shift_ratio, 0.0,
+    "Compaction-aware per-round capacity transfer ratio in [0,1]. "
+    "0 disables transfer.");
+DEFINE_double(
+    multi_level_cache_compaction_shift_max_total_ratio, 0.1,
+    "Per-round upper bound for total compaction-aware transfer as "
+    "a fraction of total cache in [0,1].");
+DEFINE_bool(
+    multi_level_cache_compaction_shift_debug, false,
+    "If true, print per-round compaction-aware capacity transfer logs.");
 DEFINE_string(
     multi_level_cache_alpha_estimator, "robust_hit_rate",
     "Alpha estimator for MultiLevelCache allocator: constant_one | "
@@ -666,6 +686,13 @@ DEFINE_bool(
     multi_level_cache_use_effective_data_size, false,
     "If true, use effective working-set estimate (D_eff) as allocator D_i; "
     "if false, use static per-level total data size (D_raw).");
+DEFINE_uint32(
+    multi_level_cache_data_size_window_rounds, 5,
+    "Maximum samples retained per level for D_raw smoothing. "
+    "Used as a memory guard in addition to time window.");
+DEFINE_uint64(
+    multi_level_cache_data_size_window_ms, 5000,
+    "Time window (ms) for smoothing per-level D_raw before model solving.");
 DEFINE_uint32(
     multi_level_cache_alpha_shadow_sample_rate_log2, 8,
     "Lookup sample rate for shadow alpha estimator as 1/(2^x). "
@@ -3139,6 +3166,8 @@ class Benchmark {
         snapshot.lookups.size());
     std::vector<std::deque<std::pair<uint64_t, uint64_t>>> shadow_history(
         snapshot.lookups.size());
+    std::vector<std::deque<std::pair<uint64_t, double>>> raw_data_history(
+        snapshot.lookups.size());
     const bool use_shadow_alpha =
         FLAGS_multi_level_cache_alpha_estimator == "shadow_cache";
     const bool use_constant_one_alpha =
@@ -3149,6 +3178,10 @@ class Benchmark {
         std::max(1.01, FLAGS_multi_level_cache_alpha_shadow_scale);
     const size_t shadow_window_rounds =
         std::max<uint32_t>(1, FLAGS_multi_level_cache_alpha_shadow_window_rounds);
+    const size_t data_size_window_rounds =
+        std::max<uint32_t>(1, FLAGS_multi_level_cache_data_size_window_rounds);
+    const uint64_t data_size_window_us =
+        std::max<uint64_t>(1, FLAGS_multi_level_cache_data_size_window_ms) * 1000;
     const size_t shadow_min_capacity_bytes = static_cast<size_t>(
         FLAGS_multi_level_cache_alpha_shadow_min_capacity_bytes);
     const size_t estimated_entry_bytes =
@@ -3158,8 +3191,10 @@ class Benchmark {
         [cache = multi_level_cache_, prev_lookups, prev_hits,
          prev_alpha, prev_effective_data, shadow_base, shadow_scaled,
          observed_history,
-         shadow_history, use_shadow_alpha, use_effective_data_size,
+         shadow_history, raw_data_history, use_shadow_alpha,
+         use_effective_data_size,
          shadow_scale, shadow_window_rounds,
+         data_size_window_rounds, data_size_window_us,
          shadow_min_capacity_bytes, use_constant_one_alpha,
          estimated_entry_bytes,
          alpha_debug_round](std::vector<double>* lambda,
@@ -3179,6 +3214,7 @@ class Benchmark {
               shadow_scaled.size() != level_count ||
               observed_history.size() != level_count ||
               shadow_history.size() != level_count ||
+              raw_data_history.size() != level_count ||
               lookup_samples.size() != level_count) {
             prev_lookups = stats.lookups;
             prev_hits = stats.hits;
@@ -3196,6 +3232,8 @@ class Benchmark {
                                     std::deque<std::pair<uint64_t, uint64_t>>{});
             shadow_history.assign(level_count,
                                   std::deque<std::pair<uint64_t, uint64_t>>{});
+            raw_data_history.assign(
+                level_count, std::deque<std::pair<uint64_t, double>>{});
             return false;
           }
 
@@ -3235,8 +3273,12 @@ class Benchmark {
           std::vector<double> debug_model_pred_hit(level_count, -1.0);
           std::vector<double> debug_model_hit_bias(level_count, 0.0);
           std::vector<double> debug_raw_data(level_count, 0.0);
+          std::vector<double> debug_raw_data_instant(level_count, 0.0);
           std::vector<double> debug_observed_data(level_count, -1.0);
           std::vector<double> debug_effective_data(level_count, 0.0);
+          const uint64_t now_us = FLAGS_env->NowMicros();
+          const uint64_t data_window_start =
+              now_us > data_size_window_us ? now_us - data_size_window_us : 0;
           for (size_t level = 0; level < level_count; ++level) {
             const uint64_t curr_lookups = stats.lookups[level];
             const uint64_t curr_hits = stats.hits[level];
@@ -3252,9 +3294,47 @@ class Benchmark {
             (*lambda)[level] = delta_lookups > 0
                                    ? static_cast<double>(delta_lookups)
                                    : kLambdaEpsilon;
-            const double raw_level_data = stats.data_sizes[level] > 0
-                                              ? static_cast<double>(stats.data_sizes[level])
-                                              : default_data;
+            const double raw_level_data_instant =
+                stats.data_sizes[level] > 0
+                    ? static_cast<double>(stats.data_sizes[level])
+                    : default_data;
+            debug_raw_data_instant[level] = raw_level_data_instant;
+            auto& raw_history = raw_data_history[level];
+            raw_history.push_back({now_us, raw_level_data_instant});
+            while (raw_history.size() >= 2 &&
+                   raw_history[1].first <= data_window_start) {
+              raw_history.pop_front();
+            }
+            while (raw_history.size() > data_size_window_rounds) {
+              raw_history.pop_front();
+            }
+            double raw_level_data = raw_level_data_instant;
+            if (!raw_history.empty() && now_us > data_window_start) {
+              uint64_t prev_ts = data_window_start;
+              double prev_val = raw_history.front().second;
+              if (raw_history.front().first <= data_window_start) {
+                prev_val = raw_history.front().second;
+              }
+              double weighted_sum = 0.0;
+              for (const auto& sample : raw_history) {
+                const uint64_t sample_ts = std::min(now_us, sample.first);
+                if (sample_ts > prev_ts) {
+                  weighted_sum += prev_val *
+                                  static_cast<double>(sample_ts - prev_ts);
+                }
+                prev_ts = std::max(prev_ts, sample_ts);
+                prev_val = sample.second;
+              }
+              if (now_us > prev_ts) {
+                weighted_sum +=
+                    prev_val * static_cast<double>(now_us - prev_ts);
+              }
+              const double denom =
+                  static_cast<double>(now_us - data_window_start);
+              if (denom > 0.0) {
+                raw_level_data = weighted_sum / denom;
+              }
+            }
             debug_raw_data[level] = raw_level_data;
             if (use_constant_one_alpha) {
               (*alpha)[level] = 1.0;
@@ -3465,11 +3545,12 @@ class Benchmark {
                   "[MLC][model_bias] L%zu lookups=%" PRIu64
                   " hits=%" PRIu64 " capacity=%zu data=%.0f alpha=%.4f "
                   "obs_hit=%.4f pred_hit=%.4f bias=%.4f abs_bias=%.4f "
-                  "D_raw=%.0f D_obs=%.0f D_eff=%.0f D_model=%.0f\n",
+                  "D_raw=%.0f D_raw_inst=%.0f D_obs=%.0f D_eff=%.0f D_model=%.0f\n",
                   level, debug_delta_lookups[level], debug_delta_hits[level],
                   stats.capacities[level], (*data)[level], (*alpha)[level],
                   observed_hit, predicted_hit, bias, abs_bias,
-                  debug_raw_data[level], debug_observed_data[level],
+                  debug_raw_data[level], debug_raw_data_instant[level],
+                  debug_observed_data[level],
                   debug_effective_data[level], (*data)[level]);
             }
           }
@@ -3483,6 +3564,10 @@ class Benchmark {
         static_cast<size_t>(FLAGS_multi_level_cache_adjust_min_change_bytes);
     options.min_active_level_capacity_bytes = static_cast<size_t>(
         FLAGS_multi_level_cache_adjust_min_active_level_capacity_bytes);
+    options.compaction_shift_ratio = FLAGS_multi_level_cache_compaction_shift_ratio;
+    options.compaction_shift_max_total_ratio =
+        FLAGS_multi_level_cache_compaction_shift_max_total_ratio;
+    options.compaction_shift_debug = FLAGS_multi_level_cache_compaction_shift_debug;
     if (FLAGS_multi_level_cache_allocator_mode == "baseline_emulation") {
       options.mode = MultiLevelAllocatorMode::kBaselineEmulation;
     } else {
@@ -3494,11 +3579,18 @@ class Benchmark {
     fprintf(stdout,
             "=== MultiLevelCache Allocator (db_bench) started: interval_ms=%" PRIu64
             ", smoothing_ratio=%.3f, min_change_bytes=%" PRIu64
-            ", min_active_level_cap=%" PRIu64 ", mode=%s, alpha_estimator=%s ===\n",
+            ", min_active_level_cap=%" PRIu64
+            ", data_size_window_rounds=%u, data_size_window_ms=%" PRIu64
+            ", compaction_shift_ratio=%.3f, compaction_shift_max_total_ratio=%.3f"
+            ", mode=%s, alpha_estimator=%s ===\n",
             FLAGS_multi_level_cache_adjust_interval_ms,
             FLAGS_multi_level_cache_adjust_smoothing_ratio,
             FLAGS_multi_level_cache_adjust_min_change_bytes,
             FLAGS_multi_level_cache_adjust_min_active_level_capacity_bytes,
+            FLAGS_multi_level_cache_data_size_window_rounds,
+            FLAGS_multi_level_cache_data_size_window_ms,
+            FLAGS_multi_level_cache_compaction_shift_ratio,
+            FLAGS_multi_level_cache_compaction_shift_max_total_ratio,
             FLAGS_multi_level_cache_allocator_mode.c_str(),
             FLAGS_multi_level_cache_alpha_estimator.c_str());
   }
@@ -3515,6 +3607,30 @@ class Benchmark {
               "--use_multi_level_cache=true\n",
               FLAGS_num_levels, kMaxEncodedCacheKeyLevel + 1);
       return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        FLAGS_multi_level_cache_srhcc_start_level >= 0) {
+      const bool hcc_family =
+          FLAGS_cache_type == "sr_hyper_clock_cache" ||
+          EndsWith(FLAGS_cache_type, "hyper_clock_cache");
+      if (!hcc_family) {
+        fprintf(stderr,
+                "invalid --multi_level_cache_srhcc_start_level=%d with "
+                "--cache_type=%s. This option requires HCC-family cache type.\n",
+                FLAGS_multi_level_cache_srhcc_start_level,
+                FLAGS_cache_type.c_str());
+        return false;
+      }
+      const size_t level_count =
+          FLAGS_num_levels > 0 ? static_cast<size_t>(FLAGS_num_levels) : 1U;
+      if (static_cast<size_t>(FLAGS_multi_level_cache_srhcc_start_level) >=
+          level_count) {
+        fprintf(stderr,
+                "invalid --multi_level_cache_srhcc_start_level=%d, expected "
+                "range [-1, %zu)\n",
+                FLAGS_multi_level_cache_srhcc_start_level, level_count);
+        return false;
+      }
     }
     if (FLAGS_use_multi_level_cache && FLAGS_multi_level_cache_auto_adjust &&
         FLAGS_multi_level_cache_allocator_mode != "model" &&
@@ -3551,6 +3667,25 @@ class Benchmark {
               "invalid --multi_level_cache_model_bias_debug_every_rounds=%" PRIu64
               ", must be >= 1 when --multi_level_cache_model_bias_debug=true\n",
               FLAGS_multi_level_cache_model_bias_debug_every_rounds);
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        (FLAGS_multi_level_cache_compaction_shift_ratio < 0.0 ||
+         FLAGS_multi_level_cache_compaction_shift_ratio > 1.0)) {
+      fprintf(stderr,
+              "invalid --multi_level_cache_compaction_shift_ratio=%.3f, "
+              "expected range [0, 1]\n",
+              FLAGS_multi_level_cache_compaction_shift_ratio);
+      return false;
+    }
+    if (FLAGS_use_multi_level_cache &&
+        (FLAGS_multi_level_cache_compaction_shift_max_total_ratio < 0.0 ||
+         FLAGS_multi_level_cache_compaction_shift_max_total_ratio > 1.0)) {
+      fprintf(
+          stderr,
+          "invalid --multi_level_cache_compaction_shift_max_total_ratio=%.3f, "
+          "expected range [0, 1]\n",
+          FLAGS_multi_level_cache_compaction_shift_max_total_ratio);
       return false;
     }
     if (FLAGS_use_multi_level_cache &&
@@ -3930,24 +4065,83 @@ class Benchmark {
                 FLAGS_num_levels, kMaxEncodedCacheKeyLevel + 1);
         db_bench_exit(1);
       }
-      if (FLAGS_cache_type != "lru_cache") {
-        fprintf(
-            stderr,
-            "Warning: --use_multi_level_cache ignores --cache_type=%s and uses "
-            "level-partitioned LRU sub-caches.\n",
-            FLAGS_cache_type.c_str());
-      }
       const size_t level_count =
           FLAGS_num_levels > 0 ? static_cast<size_t>(FLAGS_num_levels) : 1U;
-      LRUCacheOptions mlc_lru_opts(
-          static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
-          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
-          GetCacheAllocator(), kDefaultToAdaptiveMutex,
-          kDefaultCacheMetadataChargePolicy, FLAGS_cache_low_pri_pool_ratio);
-      mlc_lru_opts.hash_seed = GetCacheHashSeed();
-      return std::make_shared<MultiLevelCache>(
-          level_count, static_cast<size_t>(capacity), mlc_lru_opts,
-          FLAGS_multi_level_cache_force_route_all_to_l0);
+      if (FLAGS_cache_type == "lru_cache") {
+        LRUCacheOptions mlc_lru_opts(
+            static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
+            false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
+            GetCacheAllocator(), kDefaultToAdaptiveMutex,
+            kDefaultCacheMetadataChargePolicy, FLAGS_cache_low_pri_pool_ratio);
+        mlc_lru_opts.hash_seed = GetCacheHashSeed();
+        return std::make_shared<MultiLevelCache>(
+            level_count, static_cast<size_t>(capacity), mlc_lru_opts,
+            FLAGS_multi_level_cache_force_route_all_to_l0);
+      }
+      if (FLAGS_cache_type == "sr_hyper_clock_cache" ||
+          EndsWith(FLAGS_cache_type, "hyper_clock_cache")) {
+        size_t estimated_entry_charge;
+        if (FLAGS_cache_type == "fixed_hyper_clock_cache") {
+          estimated_entry_charge = FLAGS_block_size;
+        } else if (FLAGS_cache_type == "auto_hyper_clock_cache" ||
+                   FLAGS_cache_type == "hyper_clock_cache" ||
+                   FLAGS_cache_type == "sr_hyper_clock_cache") {
+          estimated_entry_charge = 0;
+        } else {
+          fprintf(stderr, "Cache type not supported.");
+          db_bench_exit(1);
+        }
+        HyperClockCacheOptions mlc_hcc_opts_base(
+            static_cast<size_t>(capacity), estimated_entry_charge,
+            FLAGS_cache_numshardbits);
+        mlc_hcc_opts_base.hash_seed = GetCacheHashSeed();
+
+        const bool default_probation_insert =
+            (FLAGS_cache_type == "sr_hyper_clock_cache");
+        const int32_t srhcc_start_level =
+            FLAGS_multi_level_cache_srhcc_start_level;
+        const bool has_mixed_srhcc = srhcc_start_level >= 0;
+
+        const size_t total_capacity = static_cast<size_t>(capacity);
+        const size_t per_level_capacity =
+            FLAGS_multi_level_cache_force_route_all_to_l0
+                ? 0
+                : (total_capacity / level_count);
+        const size_t remainder = FLAGS_multi_level_cache_force_route_all_to_l0
+                                     ? 0
+                                     : (total_capacity % level_count);
+        std::vector<std::shared_ptr<Cache>> sub_caches;
+        sub_caches.reserve(level_count);
+        for (size_t level = 0; level < level_count; ++level) {
+          size_t level_capacity = per_level_capacity + (level < remainder ? 1 : 0);
+          if (FLAGS_multi_level_cache_force_route_all_to_l0 && level == 0) {
+            level_capacity = total_capacity;
+          }
+          HyperClockCacheOptions level_opts = mlc_hcc_opts_base;
+          level_opts.capacity = std::max<size_t>(level_capacity, 1);
+          bool probation_insert = default_probation_insert;
+          if (has_mixed_srhcc &&
+              level >= static_cast<size_t>(srhcc_start_level)) {
+            probation_insert = true;
+          }
+          level_opts.probation_insert = probation_insert;
+          sub_caches.emplace_back(level_opts.MakeSharedCache());
+        }
+
+        HyperClockCacheOptions shared_opts = mlc_hcc_opts_base;
+        shared_opts.capacity = 1;
+        shared_opts.probation_insert = default_probation_insert;
+        auto shared_cache = shared_opts.MakeSharedCache();
+        return std::make_shared<MultiLevelCache>(
+            std::move(sub_caches), std::move(shared_cache), total_capacity);
+      }
+      fprintf(stderr,
+              "Unsupported --cache_type=%s with --use_multi_level_cache=true. "
+              "Supported: lru_cache, hyper_clock_cache, "
+              "auto_hyper_clock_cache, fixed_hyper_clock_cache, "
+              "sr_hyper_clock_cache\n",
+              FLAGS_cache_type.c_str());
+      db_bench_exit(1);
     }
 
     if (!FLAGS_cache_uri.empty()) {
@@ -3961,6 +4155,21 @@ class Benchmark {
     } else if (FLAGS_cache_type == "clock_cache") {
       fprintf(stderr, "Old clock cache implementation has been removed.\n");
       db_bench_exit(1);
+    } else if (FLAGS_cache_type == "sr_hyper_clock_cache") {
+      if (use_tiered_cache) {
+        fprintf(stderr,
+                "sr_hyper_clock_cache is not supported with tiered cache\n");
+        db_bench_exit(1);
+      }
+      HyperClockCacheOptions opts(FLAGS_cache_size, /*estimated_entry_charge=*/0,
+                                  FLAGS_cache_numshardbits);
+      opts.hash_seed = GetCacheHashSeed();
+      if (!FLAGS_secondary_cache_uri.empty()) {
+        opts.secondary_cache = secondary_cache;
+      } else if (FLAGS_use_compressed_secondary_cache) {
+        opts.secondary_cache = NewCompressedSecondaryCache(secondary_cache_opts);
+      }
+      block_cache = NewSRHyperClockCache(opts);
     } else if (EndsWith(FLAGS_cache_type, "hyper_clock_cache")) {
       size_t estimated_entry_charge;
       if (FLAGS_cache_type == "fixed_hyper_clock_cache") {

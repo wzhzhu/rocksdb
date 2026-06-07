@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <numeric>
 #include <utility>
@@ -35,6 +37,104 @@ double ClampRatio(double ratio) {
   return ratio;
 }
 
+void ApplyCompactionAwareShiftByDataDelta(
+    const MultiLevelCache::LevelMetricsSnapshot& snapshot,
+    const std::vector<uint64_t>& prev_data_sizes,
+    const std::vector<uint64_t>& prev_lookups,
+    const std::vector<uint64_t>& prev_hits,
+    double shift_ratio,
+    double max_total_shift_ratio,
+    bool enable_debug,
+    uint64_t round_id,
+    std::vector<size_t>* capacities) {
+  if (capacities == nullptr || capacities->size() < 2 || shift_ratio <= 0.0) {
+    return;
+  }
+  const size_t level_count = capacities->size();
+  if (snapshot.data_sizes.size() != level_count ||
+      snapshot.lookups.size() != level_count ||
+      snapshot.hits.size() != level_count ||
+      snapshot.capacities.size() != level_count ||
+      prev_data_sizes.size() != level_count ||
+      prev_lookups.size() != level_count ||
+      prev_hits.size() != level_count) {
+    return;
+  }
+  const double clamped_shift_ratio = ClampRatio(shift_ratio);
+  if (clamped_shift_ratio <= 0.0) {
+    return;
+  }
+  const double clamped_max_total_ratio = ClampRatio(max_total_shift_ratio);
+  const size_t total_capacity =
+      std::accumulate(capacities->begin(), capacities->end(), static_cast<size_t>(0));
+  const size_t max_total_shift = static_cast<size_t>(
+      std::floor(static_cast<double>(total_capacity) * clamped_max_total_ratio));
+  if (max_total_shift == 0) {
+    return;
+  }
+
+  size_t total_shifted = 0;
+  for (size_t level = 0; level + 1 < level_count; ++level) {
+    const uint64_t prev_data = prev_data_sizes[level];
+    const uint64_t curr_data = snapshot.data_sizes[level];
+    if (prev_data == 0 || curr_data >= prev_data) {
+      continue;
+    }
+    const uint64_t moved_data = prev_data - curr_data;
+    const double overlap_fraction =
+        std::min(1.0, static_cast<double>(moved_data) / static_cast<double>(prev_data));
+
+    const uint64_t curr_lookups = snapshot.lookups[level];
+    const uint64_t curr_hits = snapshot.hits[level];
+    const uint64_t delta_lookups =
+        curr_lookups >= prev_lookups[level] ? curr_lookups - prev_lookups[level] : 0;
+    const uint64_t delta_hits =
+        curr_hits >= prev_hits[level] ? curr_hits - prev_hits[level] : 0;
+    const double recent_hit_rate =
+        delta_lookups > 0
+            ? std::max(0.0, std::min(1.0, static_cast<double>(delta_hits) /
+                                              static_cast<double>(delta_lookups)))
+            : (curr_lookups > 0
+                   ? std::max(0.0, std::min(1.0, static_cast<double>(curr_hits) /
+                                                     static_cast<double>(curr_lookups)))
+                   : 0.0);
+
+    const double cached_hot_bytes_estimate =
+        static_cast<double>(snapshot.capacities[level]) * recent_hit_rate *
+        overlap_fraction;
+    size_t shift_bytes = static_cast<size_t>(
+        std::floor(clamped_shift_ratio * cached_hot_bytes_estimate));
+    if (shift_bytes == 0) {
+      continue;
+    }
+    shift_bytes = std::min(shift_bytes, (*capacities)[level]);
+    if (shift_bytes == 0) {
+      continue;
+    }
+    if (total_shifted >= max_total_shift) {
+      break;
+    }
+    shift_bytes = std::min(shift_bytes, max_total_shift - total_shifted);
+    if (shift_bytes == 0) {
+      continue;
+    }
+
+    (*capacities)[level] -= shift_bytes;
+    (*capacities)[level + 1] += shift_bytes;
+    total_shifted += shift_bytes;
+
+    if (enable_debug) {
+      std::fprintf(stdout,
+                   "[MLC][compaction_shift] round=%" PRIu64
+                   " L%zu->L%zu moved_data=%" PRIu64
+                   " overlap=%.4f hit=%.4f shift=%zu shifted_total=%zu cap_from=%zu cap_to=%zu\n",
+                   round_id, level, level + 1, moved_data, overlap_fraction,
+                   recent_hit_rate, shift_bytes, total_shifted,
+                   (*capacities)[level], (*capacities)[level + 1]);
+    }
+  }
+}
+
 }  // namespace
 
 MultiLevelCacheAllocator::MultiLevelCacheAllocator(
@@ -53,6 +153,9 @@ MultiLevelCacheAllocator::MultiLevelCacheAllocator(
     options_.solver_epsilon = 1e-9;
   }
   options_.smoothing_ratio = ClampRatio(options_.smoothing_ratio);
+  options_.compaction_shift_ratio = ClampRatio(options_.compaction_shift_ratio);
+  options_.compaction_shift_max_total_ratio =
+      ClampRatio(options_.compaction_shift_max_total_ratio);
 }
 
 MultiLevelCacheAllocator::~MultiLevelCacheAllocator() { Stop(); }
@@ -386,6 +489,10 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     return Status::OK();
   }
   const size_t total_capacity = cache_->GetCapacity();
+  const bool has_prev =
+      prev_data_sizes_.size() == level_count &&
+      prev_lookups_.size() == level_count &&
+      prev_hits_.size() == level_count;
 
   std::vector<double> lambda;
   std::vector<double> data;
@@ -396,6 +503,9 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     target_capacities[0] = total_capacity;
   } else {
     if (!provider_(&lambda, &data, &alpha)) {
+      prev_data_sizes_ = snapshot.data_sizes;
+      prev_lookups_ = snapshot.lookups;
+      prev_hits_ = snapshot.hits;
       return Status::OK();
     }
     Status solve_status =
@@ -416,6 +526,18 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                              total_capacity,
                              options_.min_active_level_capacity_bytes,
                              &capacities_to_apply);
+  if (options_.mode == MultiLevelAllocatorMode::kModel && has_prev &&
+      options_.compaction_shift_ratio > 0.0) {
+    ApplyCompactionAwareShiftByDataDelta(
+        snapshot, prev_data_sizes_, prev_lookups_, prev_hits_,
+        options_.compaction_shift_ratio,
+        options_.compaction_shift_max_total_ratio,
+        options_.compaction_shift_debug, round_id_, &capacities_to_apply);
+    EnforceMinActiveLevelFloor(capacities_to_apply, snapshot.data_sizes,
+                               total_capacity,
+                               options_.min_active_level_capacity_bytes,
+                               &capacities_to_apply);
+  }
 
   if (!last_capacities_.empty() &&
       last_capacities_.size() == capacities_to_apply.size()) {
@@ -426,11 +548,19 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       total_change += static_cast<uint64_t>(lhs > rhs ? lhs - rhs : rhs - lhs);
     }
     if (total_change < options_.min_total_change_bytes) {
+      prev_data_sizes_ = snapshot.data_sizes;
+      prev_lookups_ = snapshot.lookups;
+      prev_hits_ = snapshot.hits;
+      ++round_id_;
       return Status::OK();
     }
   }
 
   Status adjust = cache_->AdjustCapacities(capacities_to_apply);
+  prev_data_sizes_ = snapshot.data_sizes;
+  prev_lookups_ = snapshot.lookups;
+  prev_hits_ = snapshot.hits;
+  ++round_id_;
   if (adjust.ok()) {
     last_capacities_ = std::move(capacities_to_apply);
   }

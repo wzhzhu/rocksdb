@@ -461,6 +461,11 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
   // keep operations very fast.
   int eviction_effort_cap = 30;
 
+  // SRHCC mode: if true, new insertions use probation-style countdown
+  // initialization. This preserves existing SlotMeta bit layout while making
+  // one-hit scan entries more likely to be evicted on first sweep.
+  bool probation_insert = false;
+
   explicit HyperClockCacheOptions(
       size_t _capacity, size_t _estimated_entry_charge = 0,
       int _num_shard_bits = -1, bool _strict_capacity_limit = false,

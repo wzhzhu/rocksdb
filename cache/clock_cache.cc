@@ -42,7 +42,16 @@ using SlotMeta = ClockHandle::SlotMeta;
 using AcquireCounter = SlotMeta::AcquireCounter;
 using ReleaseCounter = SlotMeta::ReleaseCounter;
 
-inline uint32_t GetInitialCountdown(Cache::Priority priority) {
+inline uint32_t GetInitialCountdown(Cache::Priority priority,
+                                    bool probation_insert) {
+  if (probation_insert) {
+    if (priority == Cache::Priority::LOW) {
+      return 0;
+    }
+    if (priority == Cache::Priority::BOTTOM) {
+      return 1;
+    }
+  }
   // Set initial clock data from priority
   // TODO: configuration parameters for priority handling and clock cycle
   // count?
@@ -290,9 +299,20 @@ inline void FinishSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
   SlotMeta new_meta;
   new_meta.SetVisible();
 
-  // Maybe with an outstanding reference
-  new_meta.SetAcquireCounter(initial_countdown);
-  new_meta.SetReleaseCounter(initial_countdown - (keep_ref ? 1 : 0));
+  // Maybe with an outstanding reference.
+  // Support initial_countdown == 0 for probation-style insertion.
+  if (!keep_ref) {
+    new_meta.SetAcquireCounter(initial_countdown);
+    new_meta.SetReleaseCounter(initial_countdown);
+  } else if (initial_countdown > 0) {
+    new_meta.SetAcquireCounter(initial_countdown);
+    new_meta.SetReleaseCounter(initial_countdown - 1);
+  } else {
+    // keep_ref requires positive refcount; use (1,0) so that after release
+    // this entry naturally moves to (1,1) hot-like state.
+    new_meta.SetAcquireCounter(1);
+    new_meta.SetReleaseCounter(0);
+  }
 
 #ifndef NDEBUG
   // Save the state transition, with assertion
@@ -365,11 +385,13 @@ void ClockHandleBasicData::FreeData(MemoryAllocator* allocator) const {
 
 BaseClockTable::BaseClockTable(size_t capacity, bool strict_capacity_limit,
                                int eviction_effort_cap,
+                               bool probation_insert,
                                CacheMetadataChargePolicy metadata_charge_policy,
                                MemoryAllocator* allocator,
                                const Cache::EvictionCallback* eviction_callback,
                                const uint32_t* hash_seed)
-    : capacity_(capacity),
+    : probation_insert_(probation_insert),
+      capacity_(capacity),
       eec_and_scl_(EecAndScl{}
                        .With<EvictionEffortCap>(
                            SanitizeEvictionEffortCap(eviction_effort_cap))
@@ -637,8 +659,7 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     // * Have to insert into a suboptimal location (more probes) so that the
     // old entry can be kept around as well.
 
-    uint32_t initial_countdown = GetInitialCountdown(priority);
-    assert(initial_countdown > 0);
+    uint32_t initial_countdown = GetInitialCountdown(priority, probation_insert_);
 
     HandleImpl* e =
         derived.DoInsert(proto, initial_countdown, handle != nullptr, state);
@@ -721,6 +742,7 @@ FixedHyperClockTable::FixedHyperClockTable(
     const Cache::EvictionCallback* eviction_callback, const uint32_t* hash_seed,
     const Opts& opts)
     : BaseClockTable(capacity, strict_capacity_limit, opts.eviction_effort_cap,
+                     opts.probation_insert,
                      metadata_charge_policy, allocator, eviction_callback,
                      hash_seed),
       length_bits_(CalcHashBits(capacity, opts.estimated_value_size,
@@ -1935,6 +1957,7 @@ AutoHyperClockTable::AutoHyperClockTable(
     const Cache::EvictionCallback* eviction_callback, const uint32_t* hash_seed,
     const Opts& opts)
     : BaseClockTable(capacity, strict_capacity_limit, opts.eviction_effort_cap,
+                     opts.probation_insert,
                      metadata_charge_policy, allocator, eviction_callback,
                      hash_seed),
       array_(MemMapping::AllocateLazyZeroed(

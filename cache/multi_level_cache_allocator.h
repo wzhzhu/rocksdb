@@ -43,6 +43,14 @@ struct MultiLevelAllocationOptions {
   // Minimum capacity for each active level (data_size > 0), applied before
   // AdjustCapacities.
   size_t min_active_level_capacity_bytes = 0;
+  // Compaction-aware capacity transfer ratio in [0, 1].
+  // 0 disables this heuristic.
+  double compaction_shift_ratio = 0.0;
+  // Per-round upper bound of total transfer as a fraction of total cache.
+  // Applied only when compaction_shift_ratio > 0.
+  double compaction_shift_max_total_ratio = 0.1;
+  // Enable per-round debug logging for compaction-aware transfer.
+  bool compaction_shift_debug = false;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -106,6 +114,10 @@ class MultiLevelCacheAllocator {
   std::thread worker_;
   mutable std::mutex mu_;
   std::vector<size_t> last_capacities_;
+  std::vector<uint64_t> prev_data_sizes_;
+  std::vector<uint64_t> prev_lookups_;
+  std::vector<uint64_t> prev_hits_;
+  uint64_t round_id_ = 0;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

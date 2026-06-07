@@ -21,6 +21,23 @@ size_t SafeLevelCount(size_t num_levels) {
   return std::max<size_t>(num_levels, 1);
 }
 
+template <typename CacheOptionsT>
+std::shared_ptr<Cache> MakeSubCacheWithCapacity(const CacheOptionsT& base_options,
+                                                size_t capacity) {
+  CacheOptionsT options = base_options;
+  options.capacity = capacity;
+  return options.MakeSharedCache();
+}
+
+std::shared_ptr<Cache> MakeSubCacheWithCapacity(
+    const HyperClockCacheOptions& base_options, size_t capacity) {
+  HyperClockCacheOptions options = base_options;
+  // Auto HCC may fail to initialize when constructed with zero capacity.
+  // Use a tiny bootstrap capacity; runtime SetCapacity(0) is still allowed.
+  options.capacity = std::max<size_t>(capacity, 1);
+  return options.MakeSharedCache();
+}
+
 constexpr uint32_t kRatioScalePpm = 1000000U;
 constexpr uint32_t kMaxSharedPoolRatioPpm = 900000U;
 constexpr size_t kMaxAdmissionCandidatesPerShard = 4096;
@@ -51,24 +68,47 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
     if (initial_force_route_all_to_l0 && level == 0) {
       level_capacity = total_capacity;
     }
-    LRUCacheOptions options = lru_options;
-    options.capacity = level_capacity;
-    sub_caches_.emplace_back(options.MakeSharedCache());
+    sub_caches_.emplace_back(
+        MakeSubCacheWithCapacity(lru_options, level_capacity));
   }
-  LRUCacheOptions shared_options = lru_options;
-  shared_options.capacity = 0;
-  shared_cache_ = shared_options.MakeSharedCache();
+  shared_cache_ = MakeSubCacheWithCapacity(lru_options, 0);
+  InitializePerLevelState(level_count);
+}
 
-  lookups_.resize(level_count);
-  hits_.resize(level_count);
-  level_data_sizes_.resize(level_count);
-  lookup_sample_mutexes_.resize(level_count);
-  lookup_samples_.resize(level_count);
+MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
+                                 const HyperClockCacheOptions& hcc_options,
+                                 bool initial_force_route_all_to_l0)
+    : debug_miss_budget_(ParseDebugMissLimit()), total_capacity_(total_capacity) {
+  const size_t level_count = SafeLevelCount(num_levels);
+  sub_caches_.reserve(level_count);
+
+  const size_t per_level_capacity =
+      initial_force_route_all_to_l0 ? 0 : (total_capacity / level_count);
+  const size_t remainder = initial_force_route_all_to_l0
+                               ? 0
+                               : (total_capacity % level_count);
   for (size_t level = 0; level < level_count; ++level) {
-    lookups_[level].store(0, std::memory_order_relaxed);
-    hits_[level].store(0, std::memory_order_relaxed);
-    level_data_sizes_[level].store(0, std::memory_order_relaxed);
+    size_t level_capacity = per_level_capacity + (level < remainder ? 1 : 0);
+    if (initial_force_route_all_to_l0 && level == 0) {
+      level_capacity = total_capacity;
+    }
+    sub_caches_.emplace_back(
+        MakeSubCacheWithCapacity(hcc_options, level_capacity));
   }
+  shared_cache_ = MakeSubCacheWithCapacity(hcc_options, 0);
+  InitializePerLevelState(level_count);
+}
+
+MultiLevelCache::MultiLevelCache(std::vector<std::shared_ptr<Cache>> sub_caches,
+                                 std::shared_ptr<Cache> shared_cache,
+                                 size_t total_capacity)
+    : sub_caches_(std::move(sub_caches)),
+      shared_cache_(std::move(shared_cache)),
+      debug_miss_budget_(ParseDebugMissLimit()),
+      total_capacity_(total_capacity) {
+  assert(!sub_caches_.empty());
+  assert(shared_cache_ != nullptr);
+  InitializePerLevelState(sub_caches_.size());
 }
 
 const char* MultiLevelCache::Name() const { return "MultiLevelCache"; }
@@ -879,6 +919,19 @@ size_t MultiLevelCache::GetSharedPoolCapacity(size_t total_capacity) const {
   }
   return static_cast<size_t>(
       (static_cast<unsigned __int128>(total_capacity) * ppm) / kRatioScalePpm);
+}
+
+void MultiLevelCache::InitializePerLevelState(size_t level_count) {
+  lookups_.resize(level_count);
+  hits_.resize(level_count);
+  level_data_sizes_.resize(level_count);
+  lookup_sample_mutexes_.resize(level_count);
+  lookup_samples_.resize(level_count);
+  for (size_t level = 0; level < level_count; ++level) {
+    lookups_[level].store(0, std::memory_order_relaxed);
+    hits_[level].store(0, std::memory_order_relaxed);
+    level_data_sizes_[level].store(0, std::memory_order_relaxed);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -34,6 +34,11 @@ class MultiLevelCache : public Cache {
   MultiLevelCache(size_t num_levels, size_t total_capacity,
                   const LRUCacheOptions& lru_options,
                   bool initial_force_route_all_to_l0 = false);
+  MultiLevelCache(size_t num_levels, size_t total_capacity,
+                  const HyperClockCacheOptions& hcc_options,
+                  bool initial_force_route_all_to_l0 = false);
+  MultiLevelCache(std::vector<std::shared_ptr<Cache>> sub_caches,
+                  std::shared_ptr<Cache> shared_cache, size_t total_capacity);
 
   const char* Name() const override;
 
@@ -154,6 +159,7 @@ class MultiLevelCache : public Cache {
 
   Status ValidateCapacities(const std::vector<size_t>& capacities) const;
   void ApplyCapacities(const std::vector<size_t>& capacities);
+  void InitializePerLevelState(size_t level_count);
 
   std::vector<std::shared_ptr<Cache>> sub_caches_;
   std::shared_ptr<Cache> shared_cache_;
