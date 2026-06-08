@@ -46,6 +46,7 @@
 #include "cache/multi_level_cache_allocator.h"
 #include "cache/multi_level_cache.h"
 #include "cache/sr_hyper_clock_cache.h"
+#include "cache/arc_cache.h"
 #include "cache/cacheus_cache.h"
 #include "cache/cache_key.h"
 #include "db/db_impl/db_impl.h"
@@ -611,7 +612,12 @@ DEFINE_double(cache_low_pri_pool_ratio, 0.0,
 
 DEFINE_string(cache_type, "hyper_clock_cache",
               "Type of block cache (e.g., lru_cache, hyper_clock_cache, "
-              "sr_hyper_clock_cache, cacheus_cache).");
+              "sr_hyper_clock_cache, cacheus_cache, arc_cache).");
+DEFINE_uint64(
+    cache_pending_max_age_ops, 65536,
+    "Max age in cache operations for pending miss->insert tokens used by "
+    "cacheus_cache and arc_cache wrappers. Smaller values reduce stale-token "
+    "reuse under concurrency.");
 DEFINE_bool(use_multi_level_cache, false,
             "If true, use MultiLevelCache for block cache. "
             "Sub-cache policy is controlled by --cache_type or "
@@ -4124,11 +4130,28 @@ class Benchmark {
       }
 
       if (FLAGS_cache_type == "cacheus_cache") {
+        CacheusTuningOptions tuning_options;
+        tuning_options.pending_max_age_ops = FLAGS_cache_pending_max_age_ops;
         MultiLevelCache::SubCacheFactory sub_cache_factory =
-            [mlc_lru_opts](size_t level_capacity) mutable {
+            [mlc_lru_opts, tuning_options](size_t level_capacity) mutable {
           LRUCacheOptions options = mlc_lru_opts;
           options.capacity = level_capacity;
-          return NewCacheusCache(options);
+          return NewCacheusCache(options, tuning_options);
+        };
+        return std::make_shared<MultiLevelCache>(
+            level_count, static_cast<size_t>(capacity),
+            std::move(sub_cache_factory),
+            FLAGS_multi_level_cache_force_route_all_to_l0);
+      }
+
+      if (FLAGS_cache_type == "arc_cache") {
+        ARCTuningOptions tuning_options;
+        tuning_options.pending_max_age_ops = FLAGS_cache_pending_max_age_ops;
+        MultiLevelCache::SubCacheFactory sub_cache_factory =
+            [mlc_lru_opts, tuning_options](size_t level_capacity) mutable {
+          LRUCacheOptions options = mlc_lru_opts;
+          options.capacity = level_capacity;
+          return NewARCCache(options, tuning_options);
         };
         return std::make_shared<MultiLevelCache>(
             level_count, static_cast<size_t>(capacity),
@@ -4196,7 +4219,8 @@ class Benchmark {
 
       fprintf(stderr,
               "Unsupported --cache_type=%s with --use_multi_level_cache=true. "
-              "Supported: lru_cache, cacheus_cache, hyper_clock_cache, "
+              "Supported: lru_cache, cacheus_cache, arc_cache, "
+              "hyper_clock_cache, "
               "auto_hyper_clock_cache, fixed_hyper_clock_cache, "
               "sr_hyper_clock_cache, or --multi_level_cache_sub_cache_uri\n",
               FLAGS_cache_type.c_str());
@@ -4310,7 +4334,30 @@ class Benchmark {
       } else if (FLAGS_use_compressed_secondary_cache) {
         opts.secondary_cache = NewCompressedSecondaryCache(secondary_cache_opts);
       }
-      block_cache = NewCacheusCache(opts);
+      CacheusTuningOptions tuning_options;
+      tuning_options.pending_max_age_ops = FLAGS_cache_pending_max_age_ops;
+      block_cache = NewCacheusCache(opts, tuning_options);
+    } else if (FLAGS_cache_type == "arc_cache") {
+      if (use_tiered_cache) {
+        fprintf(stderr,
+                "--cache_type=arc_cache is not currently supported with "
+                "--use_tiered_cache\n");
+        db_bench_exit(1);
+      }
+      LRUCacheOptions opts(
+          static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
+          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
+          GetCacheAllocator(), kDefaultToAdaptiveMutex,
+          kDefaultCacheMetadataChargePolicy, FLAGS_cache_low_pri_pool_ratio);
+      opts.hash_seed = GetCacheHashSeed();
+      if (!FLAGS_secondary_cache_uri.empty()) {
+        opts.secondary_cache = secondary_cache;
+      } else if (FLAGS_use_compressed_secondary_cache) {
+        opts.secondary_cache = NewCompressedSecondaryCache(secondary_cache_opts);
+      }
+      ARCTuningOptions tuning_options;
+      tuning_options.pending_max_age_ops = FLAGS_cache_pending_max_age_ops;
+      block_cache = NewARCCache(opts, tuning_options);
     } else {
       fprintf(stderr, "Cache type not supported.");
       db_bench_exit(1);

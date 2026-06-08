@@ -6,6 +6,7 @@
 #include <limits>
 #include <sstream>
 
+#include "cache/clock_cache.h"
 #include "cache/lru_cache.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -106,10 +107,21 @@ size_t ComputeBackingCapacity(size_t logical_capacity) {
   return std::max(logical_capacity, scaled);
 }
 
-LRUCacheOptions BuildBackingOptions(const LRUCacheOptions& options) {
-  LRUCacheOptions backing = options;
-  backing.capacity = ComputeBackingCapacity(options.capacity);
-  backing.strict_capacity_limit = false;
+std::shared_ptr<Cache> BuildBackingCache(const LRUCacheOptions& options) {
+  HyperClockCacheOptions backing_opts(
+      ComputeBackingCapacity(options.capacity),
+      /*estimated_entry_charge=*/0, options.num_shard_bits,
+      /*strict_capacity_limit=*/false, options.memory_allocator,
+      options.metadata_charge_policy);
+  backing_opts.hash_seed = options.hash_seed;
+  backing_opts.secondary_cache = options.secondary_cache;
+  std::shared_ptr<Cache> backing = backing_opts.MakeSharedCache();
+  if (backing == nullptr) {
+    LRUCacheOptions fallback = options;
+    fallback.capacity = ComputeBackingCapacity(options.capacity);
+    fallback.strict_capacity_limit = false;
+    backing = fallback.MakeSharedCache();
+  }
   return backing;
 }
 
@@ -143,11 +155,13 @@ CacheusCache::CacheusCache(std::shared_ptr<Cache> target, size_t capacity,
   }
   learning_rate_reset_ = std::min(1.0, std::max(0.001, learning_rate_));
   learning_rate_curr_ = learning_rate_;
+  pending_max_age_ops_ = std::max<uint64_t>(1, tuning_options.pending_max_age_ops);
 
   target_->SetEvictionCallback([this](const Slice& key, Handle* /*h*/,
                                       bool /*was_hit*/) {
     std::lock_guard<std::mutex> lock(mu_);
     const std::string key_str = SliceToKey(key);
+    pending_erased_keys_.erase(key_str);
     auto it = entries_.find(key_str);
     if (it == entries_.end()) {
       return false;
@@ -538,6 +552,14 @@ CacheusCache::PendingInsertMeta CacheusCache::ConsumePendingInsertMetaLocked(
     result = it->second;
     result.valid = true;
     pending_insert_meta_.erase(it);
+    if (request_counter_ > result.observed_at_op &&
+        request_counter_ - result.observed_at_op > pending_max_age_ops_) {
+      result.valid = false;
+      result.source = PendingInsertMeta::Source::kUnknown;
+      result.freq = 1;
+      result.is_new = false;
+      result.force_to_s = false;
+    }
   }
   return result;
 }
@@ -602,6 +624,8 @@ Status CacheusCache::Insert(const Slice& key, ObjectPtr value,
   std::vector<std::string> evicted_keys;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    ++request_counter_;
+    pending_erased_keys_.erase(key_str);
     ResetStepTraceLocked();
     ++time_;
     UpdateLearningRateLocked();
@@ -676,6 +700,9 @@ Status CacheusCache::Insert(const Slice& key, ObjectPtr value,
     EnsureCapacityLocked(logical_charge, &evicted_keys);
     RecordInsertLocked(key_str, logical_charge, is_new, seeded_freq, force_to_s,
                        force_to_s || was_full_before_insert);
+    for (const std::string& evicted : evicted_keys) {
+      pending_erased_keys_.insert(evicted);
+    }
   }
 
   for (const std::string& evicted : evicted_keys) {
@@ -690,15 +717,47 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
                                     Priority priority, Statistics* stats) {
   const std::string key_str = SliceToKey(key);
   Handle* handle = target_->Lookup(key, helper, create_context, priority, stats);
-  if (handle == nullptr) {
+  bool tombstoned_hit = false;
+  if (handle != nullptr) {
     std::lock_guard<std::mutex> lock(mu_);
+    ++request_counter_;
+    tombstoned_hit = pending_erased_keys_.find(key_str) != pending_erased_keys_.end();
+    if (tombstoned_hit) {
+      ++tombstone_lookup_dropped_count_;
+    }
+  }
+  if (handle == nullptr || tombstoned_hit) {
+    if (tombstoned_hit) {
+      target_->Release(handle);
+      target_->Erase(key);
+      handle = nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    ++request_counter_;
     ++total_miss_count_;
+    auto live_it = entries_.find(key_str);
+    if (live_it != entries_.end()) {
+      EntryMeta meta = live_it->second;
+      if (meta.is_demoted && dem_count_ > 0) {
+        --dem_count_;
+      }
+      RemoveFromQueuesLocked(key_str, meta);
+      auto lfu_it = lfu_pos_.find(key_str);
+      if (lfu_it != lfu_pos_.end()) {
+        lfu_set_.erase(lfu_it->second);
+        lfu_pos_.erase(lfu_it);
+      }
+      usage_ = (usage_ >= meta.charge) ? (usage_ - meta.charge) : 0;
+      entries_.erase(live_it);
+      ++desync_backing_miss_reconciled_count_;
+    }
     PendingInsertMeta pending;
     pending.valid = true;
     pending.source = PendingInsertMeta::Source::kMiss;
     pending.freq = 1;
     pending.is_new = (capacity_ > 0 && usage_ >= capacity_);
     pending.force_to_s = false;
+    pending.observed_at_op = request_counter_;
     auto lru_it = lru_hist_pos_.find(key_str);
     if (lru_it != lru_hist_pos_.end()) {
       ++lru_hist_hit_count_;
@@ -737,6 +796,9 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
       const size_t charge = target_->GetCharge(handle);
       const size_t logical_charge = entry_charge_equivalent_ ? 1 : charge;
       EnsureCapacityLocked(logical_charge, &evicted_keys);
+      for (const std::string& evicted : evicted_keys) {
+        pending_erased_keys_.insert(evicted);
+      }
       RecordInsertLocked(key_str, logical_charge, false, 1, false, false);
     }
     TouchOnHitLocked(key_str);
@@ -752,6 +814,7 @@ void CacheusCache::Erase(const Slice& key) {
   const std::string key_str = SliceToKey(key);
   {
     std::lock_guard<std::mutex> lock(mu_);
+    pending_erased_keys_.insert(key_str);
     RemoveEntryLocked(key_str, -1);
   }
   target_->Erase(key);
@@ -770,6 +833,9 @@ void CacheusCache::SetCapacity(size_t capacity) {
                       ? configured_period_len_
                       : std::max<uint64_t>(1, capacity_ / 4096);
     EnsureCapacityLocked(0, &evicted_keys);
+    for (const std::string& evicted : evicted_keys) {
+      pending_erased_keys_.insert(evicted);
+    }
   }
   for (const std::string& evicted : evicted_keys) {
     target_->Erase(Slice(evicted));
@@ -806,6 +872,12 @@ std::string CacheusCache::GetPrintableOptions() const {
   oss << "cacheus.period_hits=" << period_hits_ << "\n";
   oss << "cacheus.total_hits=" << total_hit_count_ << "\n";
   oss << "cacheus.total_misses=" << total_miss_count_ << "\n";
+  oss << "cacheus.pending_max_age_ops=" << pending_max_age_ops_ << "\n";
+  oss << "cacheus.desync_backing_miss_reconciled="
+      << desync_backing_miss_reconciled_count_ << "\n";
+  oss << "cacheus.tombstone_lookup_dropped=" << tombstone_lookup_dropped_count_
+      << "\n";
+  oss << "cacheus.tombstone_size=" << pending_erased_keys_.size() << "\n";
   oss << "cacheus.lru_hist_hits=" << lru_hist_hit_count_ << "\n";
   oss << "cacheus.lfu_hist_hits=" << lfu_hist_hit_count_ << "\n";
   oss << "cacheus.evict_lru_count=" << evict_lru_count_ << "\n";
@@ -913,8 +985,7 @@ std::shared_ptr<Cache> NewCacheusCache(const LRUCacheOptions& options) {
 std::shared_ptr<Cache> NewCacheusCache(
     const LRUCacheOptions& options, const CacheusTuningOptions& tuning_options) {
   return std::make_shared<CacheusCache>(
-      BuildBackingOptions(options).MakeSharedCache(), options.capacity,
-      tuning_options);
+      BuildBackingCache(options), options.capacity, tuning_options);
 }
 
 std::shared_ptr<Cache> NewCacheusCache(size_t capacity, int num_shard_bits) {

@@ -10,6 +10,7 @@ load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 oncall("rocksdb_point_of_contact")
 
 cpp_library_wrapper(name="rocksdb_lib", srcs=[
+        "cache/arc_cache.cc",
         "cache/cache.cc",
         "cache/cache_entry_roles.cc",
         "cache/cache_helpers.cc",

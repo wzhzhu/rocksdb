@@ -9,10 +9,12 @@
 
 #include "rocksdb/cache.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <vector>
 
+#include "cache/arc_cache.h"
 #include "cache/cacheus_cache.h"
 #include "cache/lru_cache.h"
 #include "rocksdb/secondary_cache.h"
@@ -74,6 +76,11 @@ struct CacheusCreateOptions {
   uint64_t period_len = 0;
   uint64_t rng_seed = 123;
   bool entry_charge_equivalent = false;
+  uint64_t pending_max_age_ops = 65536;
+};
+
+struct ArcCreateOptions {
+  uint64_t pending_max_age_ops = 65536;
 };
 
 std::string TrimCopy(std::string s) {
@@ -209,6 +216,68 @@ Status ParseCacheusOptionsFromArgs(std::string* args,
         return s;
       }
       cacheus_options->entry_charge_equivalent = parsed;
+    } else if (key == "pending_max_age_ops") {
+      uint64_t parsed = 0;
+      Status s = ParseUint64Strict(value, &parsed);
+      if (!s.ok()) {
+        return s;
+      }
+      cacheus_options->pending_max_age_ops = std::max<uint64_t>(1, parsed);
+    } else {
+      passthrough.emplace_back(std::move(token));
+    }
+    if (end == args->size()) {
+      break;
+    }
+  }
+
+  std::string filtered;
+  for (size_t i = 0; i < passthrough.size(); ++i) {
+    if (i > 0) {
+      filtered.append(";");
+    }
+    filtered.append(passthrough[i]);
+  }
+  *args = std::move(filtered);
+  return Status::OK();
+}
+
+Status ParseArcOptionsFromArgs(std::string* args, ArcCreateOptions* arc_options) {
+  if (args == nullptr || arc_options == nullptr) {
+    return Status::InvalidArgument("null arguments for arc parsing");
+  }
+  std::vector<std::string> passthrough;
+  size_t start = 0;
+  while (start <= args->size()) {
+    size_t end = args->find(';', start);
+    if (end == std::string::npos) {
+      end = args->size();
+    }
+    std::string token = TrimCopy(args->substr(start, end - start));
+    start = end + 1;
+    if (token.empty()) {
+      if (end == args->size()) {
+        break;
+      }
+      continue;
+    }
+    size_t eq = token.find('=');
+    if (eq == std::string::npos) {
+      passthrough.emplace_back(std::move(token));
+      if (end == args->size()) {
+        break;
+      }
+      continue;
+    }
+    const std::string key = TrimCopy(token.substr(0, eq));
+    const std::string value = TrimCopy(token.substr(eq + 1));
+    if (key == "pending_max_age_ops") {
+      uint64_t parsed = 0;
+      Status s = ParseUint64Strict(value, &parsed);
+      if (!s.ok()) {
+        return s;
+      }
+      arc_options->pending_max_age_ops = std::max<uint64_t>(1, parsed);
     } else {
       passthrough.emplace_back(std::move(token));
     }
@@ -319,9 +388,30 @@ Status Cache::CreateFromString(const ConfigOptions& config_options,
       tuning_options.rng_seed = cacheus_create_opts.rng_seed;
       tuning_options.entry_charge_equivalent =
           cacheus_create_opts.entry_charge_equivalent;
+      tuning_options.pending_max_age_ops =
+          cacheus_create_opts.pending_max_age_ops;
       cache = NewCacheusCache(cache_opts, tuning_options);
     }
     if (status.ok()) {
+      result->swap(cache);
+    }
+  } else if (StartsWith(value, "arc://")) {
+    std::string args = value;
+    args.erase(0, std::strlen("arc://"));
+    ArcCreateOptions arc_create_opts;
+    status = ParseArcOptionsFromArgs(&args, &arc_create_opts);
+    LRUCacheOptions cache_opts;
+    if (status.ok() && args.empty()) {
+      cache_opts = LRUCacheOptions(8ULL << 20, -1, false, 0.5);
+    } else if (status.ok()) {
+      status = OptionTypeInfo::ParseStruct(config_options, "",
+                                           &lru_cache_options_type_info, "",
+                                           args, &cache_opts);
+    }
+    if (status.ok()) {
+      ARCTuningOptions tuning_options;
+      tuning_options.pending_max_age_ops = arc_create_opts.pending_max_age_ops;
+      cache = NewARCCache(cache_opts, tuning_options);
       result->swap(cache);
     }
   } else if (value.find("://") == std::string::npos) {

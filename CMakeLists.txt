@@ -687,6 +687,7 @@ find_package(Threads REQUIRED)
 # Main library source code
 
 set(SOURCES
+        cache/arc_cache.cc
         cache/cache.cc
         cache/cacheus_cache.cc
         cache/cache_entry_roles.cc

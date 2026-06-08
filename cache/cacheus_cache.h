@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rocksdb/advanced_cache.h"
@@ -21,6 +22,7 @@ struct CacheusTuningOptions {
   uint64_t period_len = 0;
   uint64_t rng_seed = 123;
   bool entry_charge_equivalent = false;
+  uint64_t pending_max_age_ops = 65536;
 };
 
 // Cacheus cache skeleton.
@@ -107,6 +109,7 @@ class CacheusCache : public CacheWrapper {
     uint64_t freq = 1;
     bool is_new = false;
     bool force_to_s = false;
+    uint64_t observed_at_op = 0;
   };
 
   struct LfuNodeComp {
@@ -182,6 +185,8 @@ class CacheusCache : public CacheWrapper {
   uint64_t total_miss_count_ = 0;
   uint64_t lru_hist_hit_count_ = 0;
   uint64_t lfu_hist_hit_count_ = 0;
+  uint64_t desync_backing_miss_reconciled_count_ = 0;
+  uint64_t tombstone_lookup_dropped_count_ = 0;
   std::string last_evicted_key_;
   int last_evicted_policy_ = -2;
 
@@ -199,6 +204,9 @@ class CacheusCache : public CacheWrapper {
   std::unordered_map<std::string, HistListIt> lru_hist_pos_;
   std::unordered_map<std::string, HistListIt> lfu_hist_pos_;
   std::unordered_map<std::string, PendingInsertMeta> pending_insert_meta_;
+  std::unordered_set<std::string> pending_erased_keys_;
+  uint64_t request_counter_ = 0;
+  uint64_t pending_max_age_ops_ = 65536;
 
   uint32_t mt_state_[624];
   int mt_index_ = 625;
