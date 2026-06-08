@@ -464,6 +464,14 @@ class BaseClockTable {
     }
   }
 
+  void SetProbationInsert(bool probation_insert) {
+    probation_insert_.store(probation_insert, std::memory_order_relaxed);
+  }
+
+  bool GetProbationInsert() const {
+    return probation_insert_.load(std::memory_order_relaxed);
+  }
+
   uint32_t GetHashSeed() const { return hash_seed_; }
 
   uint64_t GetYieldCount() const { return yield_count_.LoadRelaxed(); }
@@ -538,7 +546,7 @@ class BaseClockTable {
   // (Relaxed: a simple stat counter.)
   RelaxedAtomic<uint64_t> eviction_effort_exceeded_count_{};
 
-  const bool probation_insert_;
+  std::atomic<bool> probation_insert_{false};
 
   // TODO: is this separation needed if we don't do background evictions?
   ALIGN_AS(CACHE_LINE_SIZE)
@@ -1126,6 +1134,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
 
   void SetStrictCapacityLimit(bool strict_capacity_limit);
 
+  void SetProbationInsert(bool probation_insert);
+  bool GetProbationInsert() const;
+
   Status Insert(const Slice& key, const UniqueId64x2& hashed_key,
                 Cache::ObjectPtr value, const Cache::CacheItemHelper* helper,
                 size_t charge, HandleImpl** handle, Cache::Priority priority);
@@ -1215,6 +1226,24 @@ class BaseHyperClockCache : public ShardedCache<ClockCacheShard<Table>> {
 
   void ReportProblems(
       const std::shared_ptr<Logger>& /*info_log*/) const override;
+
+  void SetProbationInsert(bool probation_insert) {
+    this->ForEachShard([probation_insert](Shard* shard) {
+      shard->SetProbationInsert(probation_insert);
+    });
+  }
+
+  bool GetProbationInsert() const {
+    bool probation_insert = false;
+    bool initialized = false;
+    this->ForEachShard([&](const Shard* shard) {
+      if (!initialized) {
+        probation_insert = shard->GetProbationInsert();
+        initialized = true;
+      }
+    });
+    return probation_insert;
+  }
 };
 
 class FixedHyperClockCache

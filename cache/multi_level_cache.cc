@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "cache/cache_key.h"
+#include "cache/clock_cache.h"
 #include "util/coding.h"
 namespace ROCKSDB_NAMESPACE {
 
@@ -125,6 +126,8 @@ MultiLevelCache::MultiLevelCache(std::vector<std::shared_ptr<Cache>> sub_caches,
   assert(shared_cache_ != nullptr);
   InitializePerLevelState(sub_caches_.size());
 }
+
+MultiLevelCache::~MultiLevelCache() { StopDynamicSRHCCWorker(); }
 
 const char* MultiLevelCache::Name() const { return "MultiLevelCache"; }
 
@@ -492,6 +495,8 @@ std::string MultiLevelCache::PrintStats() const {
     const uint64_t level_hits = hits_[level].load(std::memory_order_relaxed);
     const uint64_t level_data_size =
         level_data_sizes_[level].load(std::memory_order_relaxed);
+    const bool probation_insert =
+        level_probation_insert_enabled_[level].load(std::memory_order_relaxed);
     const double level_hit_rate =
         level_lookups == 0 ? 0.0
                            : static_cast<double>(level_hits) /
@@ -499,7 +504,8 @@ std::string MultiLevelCache::PrintStats() const {
     oss << "L" << level << ": capacity=" << sub_caches_[level]->GetCapacity()
         << ", lookups=" << level_lookups << ", hits=" << level_hits
         << ", hit_rate=" << level_hit_rate
-        << ", data_size=" << level_data_size << "\n";
+        << ", data_size=" << level_data_size
+        << ", probation_insert=" << (probation_insert ? 1 : 0) << "\n";
   }
   return oss.str();
 }
@@ -543,10 +549,27 @@ MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
 std::vector<std::vector<uint64_t>> MultiLevelCache::DrainLookupSamples() {
   std::vector<std::vector<uint64_t>> drained(sub_caches_.size());
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
-    std::lock_guard<std::mutex> lock(lookup_sample_mutexes_[level]);
-    auto& src = lookup_samples_[level];
-    drained[level].assign(src.begin(), src.end());
-    src.clear();
+    LevelSampleRing* ring = lookup_sample_rings_[level].get();
+    if (ring == nullptr) {
+      continue;
+    }
+    const uint64_t end = ring->write_seq.load(std::memory_order_acquire);
+    uint64_t start = ring->consumed_seq.load(std::memory_order_relaxed);
+    if (end <= start) {
+      continue;
+    }
+    if (end - start > kLookupSampleRingSize) {
+      start = end - kLookupSampleRingSize;
+    }
+    drained[level].reserve(static_cast<size_t>(end - start));
+    for (uint64_t seq = start; seq < end; ++seq) {
+      const size_t idx = static_cast<size_t>(seq % kLookupSampleRingSize);
+      if (ring->seq[idx].load(std::memory_order_acquire) == seq + 1) {
+        drained[level].push_back(
+            ring->values[idx].load(std::memory_order_relaxed));
+      }
+    }
+    ring->consumed_seq.store(end, std::memory_order_release);
   }
   return drained;
 }
@@ -597,6 +620,42 @@ void MultiLevelCache::SetSharedPoolAdmissionThreshold(
 void MultiLevelCache::SetSharedPoolDecayIntervalOps(uint32_t decay_interval_ops) {
   shared_pool_decay_interval_ops_.store(
       std::max<uint32_t>(1, decay_interval_ops), std::memory_order_relaxed);
+}
+
+void MultiLevelCache::ConfigureDynamicSRHCC(bool enabled,
+                                            uint32_t check_interval_ops,
+                                            uint32_t min_samples,
+                                            double unique_ratio_enable_threshold,
+                                            double unique_ratio_disable_threshold,
+                                            uint32_t sample_rate_log2,
+                                            uint32_t poll_interval_ms) {
+  dynamic_srhcc_check_interval_ops_.store(std::max<uint32_t>(64, check_interval_ops),
+                                          std::memory_order_relaxed);
+  dynamic_srhcc_min_samples_.store(std::max<uint32_t>(8, min_samples),
+                                   std::memory_order_relaxed);
+  dynamic_srhcc_sample_rate_log2_.store(std::min<uint32_t>(20, sample_rate_log2),
+                                        std::memory_order_relaxed);
+  dynamic_srhcc_poll_interval_ms_.store(std::max<uint32_t>(10, poll_interval_ms),
+                                        std::memory_order_relaxed);
+  const double clamped_enable =
+      std::max(0.0, std::min(1.0, unique_ratio_enable_threshold));
+  const double clamped_disable_raw =
+      std::max(0.0, std::min(1.0, unique_ratio_disable_threshold));
+  const double clamped_disable =
+      std::min(clamped_enable, clamped_disable_raw);
+  dynamic_srhcc_unique_ratio_enable_ppm_.store(
+      static_cast<uint32_t>(clamped_enable * kRatioScalePpm),
+      std::memory_order_relaxed);
+  dynamic_srhcc_unique_ratio_disable_ppm_.store(
+      static_cast<uint32_t>(clamped_disable * kRatioScalePpm),
+      std::memory_order_relaxed);
+  SetLookupSampleRateLog2(dynamic_srhcc_sample_rate_log2_.load(std::memory_order_relaxed));
+  dynamic_srhcc_enabled_.store(enabled, std::memory_order_relaxed);
+  if (enabled) {
+    StartDynamicSRHCCWorker();
+  } else {
+    StopDynamicSRHCCWorker();
+  }
 }
 
 size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
@@ -843,7 +902,6 @@ int64_t MultiLevelCache::ParseDebugMissLimit() {
 
 void MultiLevelCache::MaybeRecordLookupSample(size_t level_index,
                                               const Slice& key) {
-  static constexpr size_t kMaxSamplesPerLevel = 8192;
   const uint32_t log2_rate =
       lookup_sample_rate_log2_.load(std::memory_order_relaxed);
   const uint64_t sample_mask =
@@ -852,17 +910,162 @@ void MultiLevelCache::MaybeRecordLookupSample(size_t level_index,
        sample_mask) != 0) {
     return;
   }
-  if (level_index >= lookup_samples_.size()) {
+  if (level_index >= lookup_sample_rings_.size()) {
+    return;
+  }
+  LevelSampleRing* ring = lookup_sample_rings_[level_index].get();
+  if (ring == nullptr) {
     return;
   }
   const uint64_t hash = static_cast<uint64_t>(
       std::hash<std::string_view>{}(std::string_view(key.data(), key.size())));
-  std::lock_guard<std::mutex> lock(lookup_sample_mutexes_[level_index]);
-  auto& samples = lookup_samples_[level_index];
-  if (samples.size() >= kMaxSamplesPerLevel) {
-    samples.pop_front();
+  const uint64_t seq =
+      ring->write_seq.fetch_add(1, std::memory_order_relaxed);
+  const size_t idx = static_cast<size_t>(seq % kLookupSampleRingSize);
+  ring->values[idx].store(hash, std::memory_order_relaxed);
+  ring->seq[idx].store(seq + 1, std::memory_order_release);
+}
+
+void MultiLevelCache::MaybeAdaptLevelMode(size_t level_index) {
+  if (!dynamic_srhcc_enabled_.load(std::memory_order_relaxed) ||
+      level_index >= sub_caches_.size()) {
+    return;
   }
-  samples.push_back(hash);
+  const uint64_t curr_lookups = lookups_[level_index].load(std::memory_order_relaxed);
+  const uint64_t prev_lookups =
+      adapt_last_lookups_[level_index].load(std::memory_order_relaxed);
+  const uint32_t interval =
+      dynamic_srhcc_check_interval_ops_.load(std::memory_order_relaxed);
+  if (curr_lookups <= prev_lookups || (curr_lookups - prev_lookups) < interval) {
+    return;
+  }
+
+  const uint64_t curr_hits = hits_[level_index].load(std::memory_order_relaxed);
+
+  std::vector<uint64_t> samples;
+  LevelSampleRing* ring = lookup_sample_rings_[level_index].get();
+  if (ring == nullptr) {
+    return;
+  }
+  const uint64_t end = ring->write_seq.load(std::memory_order_acquire);
+  uint64_t start = ring->consumed_seq.load(std::memory_order_relaxed);
+  if (end <= start) {
+    return;
+  }
+  if (end - start > kLookupSampleRingSize) {
+    start = end - kLookupSampleRingSize;
+  }
+  samples.reserve(static_cast<size_t>(end - start));
+  for (uint64_t seq = start; seq < end; ++seq) {
+    const size_t idx = static_cast<size_t>(seq % kLookupSampleRingSize);
+    if (ring->seq[idx].load(std::memory_order_acquire) == seq + 1) {
+      samples.push_back(ring->values[idx].load(std::memory_order_relaxed));
+    }
+  }
+  if (samples.size() <
+      dynamic_srhcc_min_samples_.load(std::memory_order_relaxed)) {
+    // Keep accumulating sample evidence and keep current lookup window.
+    return;
+  }
+
+  adapt_last_lookups_[level_index].store(curr_lookups,
+                                         std::memory_order_relaxed);
+  adapt_last_hits_[level_index].store(curr_hits, std::memory_order_relaxed);
+  ring->consumed_seq.store(end, std::memory_order_release);
+
+  std::sort(samples.begin(), samples.end());
+  const size_t unique_count = static_cast<size_t>(
+      std::distance(samples.begin(), std::unique(samples.begin(), samples.end())));
+  const double unique_ratio =
+      static_cast<double>(unique_count) / static_cast<double>(samples.size());
+  const double unique_enable_threshold =
+      static_cast<double>(
+          dynamic_srhcc_unique_ratio_enable_ppm_.load(
+              std::memory_order_relaxed)) /
+      kRatioScalePpm;
+  const double unique_disable_threshold =
+      static_cast<double>(
+          dynamic_srhcc_unique_ratio_disable_ppm_.load(
+              std::memory_order_relaxed)) /
+      kRatioScalePpm;
+
+  const bool current_mode =
+      level_probation_insert_enabled_[level_index].load(std::memory_order_relaxed);
+  bool target_mode = current_mode;
+  if (!current_mode) {
+    if (unique_ratio >= unique_enable_threshold) {
+      target_mode = true;
+    }
+  } else if (unique_ratio <= unique_disable_threshold) {
+    target_mode = false;
+  }
+
+  if (target_mode != current_mode &&
+      MaybeSetLevelProbationInsert(level_index, target_mode)) {
+    level_probation_insert_enabled_[level_index].store(target_mode,
+                                                       std::memory_order_relaxed);
+  }
+}
+
+bool MultiLevelCache::MaybeSetLevelProbationInsert(size_t level_index,
+                                                   bool probation_insert) {
+  Cache* cache = SubCacheByLevel(level_index);
+  if (auto* fixed =
+          dynamic_cast<clock_cache::FixedHyperClockCache*>(cache)) {
+    fixed->SetProbationInsert(probation_insert);
+    return true;
+  }
+  if (auto* auto_hcc =
+          dynamic_cast<clock_cache::AutoHyperClockCache*>(cache)) {
+    auto_hcc->SetProbationInsert(probation_insert);
+    return true;
+  }
+  return false;
+}
+
+void MultiLevelCache::StartDynamicSRHCCWorker() {
+  std::lock_guard<std::mutex> lock(dynamic_srhcc_mu_);
+  if (dynamic_srhcc_running_.load(std::memory_order_acquire)) {
+    return;
+  }
+  dynamic_srhcc_running_.store(true, std::memory_order_release);
+  dynamic_srhcc_worker_ =
+      std::thread(&MultiLevelCache::DynamicSRHCCBackgroundLoop, this);
+}
+
+void MultiLevelCache::StopDynamicSRHCCWorker() {
+  {
+    std::lock_guard<std::mutex> lock(dynamic_srhcc_mu_);
+    if (!dynamic_srhcc_running_.load(std::memory_order_acquire)) {
+      return;
+    }
+    dynamic_srhcc_running_.store(false, std::memory_order_release);
+  }
+  dynamic_srhcc_cv_.notify_all();
+  if (dynamic_srhcc_worker_.joinable()) {
+    dynamic_srhcc_worker_.join();
+  }
+}
+
+void MultiLevelCache::DynamicSRHCCBackgroundLoop() {
+  while (dynamic_srhcc_running_.load(std::memory_order_acquire)) {
+    EvaluateDynamicSRHCCAllLevels();
+    std::unique_lock<std::mutex> lock(dynamic_srhcc_mu_);
+    dynamic_srhcc_cv_.wait_for(
+        lock,
+        std::chrono::milliseconds(
+            dynamic_srhcc_poll_interval_ms_.load(std::memory_order_relaxed)),
+        [this]() { return !dynamic_srhcc_running_.load(std::memory_order_acquire); });
+  }
+}
+
+void MultiLevelCache::EvaluateDynamicSRHCCAllLevels() {
+  if (!dynamic_srhcc_enabled_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    MaybeAdaptLevelMode(level);
+  }
 }
 
 uint64_t MultiLevelCache::HashCacheKey(const Slice& key) const {
@@ -968,12 +1171,36 @@ void MultiLevelCache::InitializePerLevelState(size_t level_count) {
   lookups_.resize(level_count);
   hits_.resize(level_count);
   level_data_sizes_.resize(level_count);
-  lookup_sample_mutexes_.resize(level_count);
-  lookup_samples_.resize(level_count);
+  lookup_sample_rings_.resize(level_count);
+  adapt_last_lookups_.resize(level_count);
+  adapt_last_hits_.resize(level_count);
+  level_probation_insert_enabled_.resize(level_count);
   for (size_t level = 0; level < level_count; ++level) {
     lookups_[level].store(0, std::memory_order_relaxed);
     hits_[level].store(0, std::memory_order_relaxed);
     level_data_sizes_[level].store(0, std::memory_order_relaxed);
+    lookup_sample_rings_[level] = std::make_unique<LevelSampleRing>();
+    lookup_sample_rings_[level]->seq =
+        std::make_unique<std::atomic<uint64_t>[]>(kLookupSampleRingSize);
+    lookup_sample_rings_[level]->values =
+        std::make_unique<std::atomic<uint64_t>[]>(kLookupSampleRingSize);
+    lookup_sample_rings_[level]->write_seq.store(0, std::memory_order_relaxed);
+    lookup_sample_rings_[level]->consumed_seq.store(0,
+                                                    std::memory_order_relaxed);
+    for (size_t i = 0; i < kLookupSampleRingSize; ++i) {
+      lookup_sample_rings_[level]->seq[i].store(0, std::memory_order_relaxed);
+      lookup_sample_rings_[level]->values[i].store(0, std::memory_order_relaxed);
+    }
+    adapt_last_lookups_[level].store(0, std::memory_order_relaxed);
+    adapt_last_hits_[level].store(0, std::memory_order_relaxed);
+    level_probation_insert_enabled_[level].store(false,
+                                                 std::memory_order_relaxed);
+    // Best effort initialization for HCC/SR-HCC sub-caches.
+    const bool initialized = MaybeSetLevelProbationInsert(level, false);
+    if (initialized) {
+      level_probation_insert_enabled_[level].store(false,
+                                                   std::memory_order_relaxed);
+    }
   }
 }
 

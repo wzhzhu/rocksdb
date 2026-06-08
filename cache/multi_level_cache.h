@@ -4,12 +4,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +47,7 @@ class MultiLevelCache : public Cache {
                   bool initial_force_route_all_to_l0 = false);
   MultiLevelCache(std::vector<std::shared_ptr<Cache>> sub_caches,
                   std::shared_ptr<Cache> shared_cache, size_t total_capacity);
+  ~MultiLevelCache() override;
 
   const char* Name() const override;
   std::string GetPrintableOptions() const override;
@@ -119,6 +122,12 @@ class MultiLevelCache : public Cache {
   void SetSharedPoolRatio(double shared_pool_ratio);
   void SetSharedPoolAdmissionThreshold(uint32_t admission_threshold);
   void SetSharedPoolDecayIntervalOps(uint32_t decay_interval_ops);
+  void ConfigureDynamicSRHCC(bool enabled, uint32_t check_interval_ops = 4096,
+                             uint32_t min_samples = 64,
+                             double unique_ratio_enable_threshold = 0.50,
+                             double unique_ratio_disable_threshold = 0.30,
+                             uint32_t sample_rate_log2 = 7,
+                             uint32_t poll_interval_ms = 200);
 
  private:
   enum class RouteCaller {
@@ -138,6 +147,13 @@ class MultiLevelCache : public Cache {
     uint32_t ops_since_decay = 0;
   };
 
+  struct LevelSampleRing {
+    std::unique_ptr<std::atomic<uint64_t>[]> seq;
+    std::unique_ptr<std::atomic<uint64_t>[]> values;
+    std::atomic<uint64_t> write_seq{0};
+    std::atomic<uint64_t> consumed_seq{0};
+  };
+
   Cache* SubCacheByLevel(size_t level_index);
   const Cache* SubCacheByLevel(size_t level_index) const;
   Cache* PrimarySubCache();
@@ -152,6 +168,12 @@ class MultiLevelCache : public Cache {
   static const char* RouteCallerToString(RouteCaller caller);
   static int64_t ParseDebugMissLimit();
   void MaybeRecordLookupSample(size_t level_index, const Slice& key);
+  void MaybeAdaptLevelMode(size_t level_index);
+  bool MaybeSetLevelProbationInsert(size_t level_index, bool probation_insert);
+  void StartDynamicSRHCCWorker();
+  void StopDynamicSRHCCWorker();
+  void DynamicSRHCCBackgroundLoop();
+  void EvaluateDynamicSRHCCAllLevels();
   uint64_t HashCacheKey(const Slice& key) const;
   void RecordSharedPoolCandidate(uint64_t key_hash);
   bool IsSharedPoolAdmissionReady(uint64_t key_hash);
@@ -173,10 +195,11 @@ class MultiLevelCache : public Cache {
   std::deque<std::atomic<uint64_t>> lookups_;
   std::deque<std::atomic<uint64_t>> hits_;
   std::deque<std::atomic<uint64_t>> level_data_sizes_;
-  std::deque<std::mutex> lookup_sample_mutexes_;
-  std::vector<std::deque<uint64_t>> lookup_samples_;
   std::atomic<uint64_t> lookup_sample_seq_{0};
   std::atomic<uint32_t> lookup_sample_rate_log2_{10};
+  // Large enough to absorb full-sampling bursts under high concurrency.
+  static constexpr size_t kLookupSampleRingSize = 65536;
+  std::vector<std::unique_ptr<LevelSampleRing>> lookup_sample_rings_;
   mutable std::atomic<uint64_t> insert_route_queries_{0};
   mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
   mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};
@@ -197,6 +220,20 @@ class MultiLevelCache : public Cache {
   std::atomic<uint32_t> shared_pool_admission_threshold_{2};
   std::atomic<uint32_t> shared_pool_decay_interval_ops_{2048};
   std::atomic<bool> force_route_all_to_l0_{false};
+  std::atomic<bool> dynamic_srhcc_enabled_{false};
+  std::atomic<uint32_t> dynamic_srhcc_check_interval_ops_{4096};
+  std::atomic<uint32_t> dynamic_srhcc_min_samples_{64};
+  std::atomic<uint32_t> dynamic_srhcc_sample_rate_log2_{7};
+  std::atomic<uint32_t> dynamic_srhcc_poll_interval_ms_{200};
+  std::atomic<uint32_t> dynamic_srhcc_unique_ratio_enable_ppm_{500000};
+  std::atomic<uint32_t> dynamic_srhcc_unique_ratio_disable_ppm_{300000};
+  std::deque<std::atomic<uint64_t>> adapt_last_lookups_;
+  std::deque<std::atomic<uint64_t>> adapt_last_hits_;
+  std::deque<std::atomic<bool>> level_probation_insert_enabled_;
+  std::atomic<bool> dynamic_srhcc_running_{false};
+  std::mutex dynamic_srhcc_mu_;
+  std::condition_variable dynamic_srhcc_cv_;
+  std::thread dynamic_srhcc_worker_;
   std::atomic<size_t> total_capacity_;
 };
 

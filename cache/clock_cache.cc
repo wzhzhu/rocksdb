@@ -659,7 +659,8 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     // * Have to insert into a suboptimal location (more probes) so that the
     // old entry can be kept around as well.
 
-    uint32_t initial_countdown = GetInitialCountdown(priority, probation_insert_);
+    uint32_t initial_countdown =
+        GetInitialCountdown(priority, probation_insert_.load(std::memory_order_relaxed));
 
     HandleImpl* e =
         derived.DoInsert(proto, initial_countdown, handle != nullptr, state);
@@ -1256,6 +1257,16 @@ void ClockCacheShard<Table>::SetStrictCapacityLimit(
     bool strict_capacity_limit) {
   table_.SetStrictCapacityLimit(strict_capacity_limit);
   // next Insert will take care of any necessary evictions
+}
+
+template <class Table>
+void ClockCacheShard<Table>::SetProbationInsert(bool probation_insert) {
+  table_.SetProbationInsert(probation_insert);
+}
+
+template <class Table>
+bool ClockCacheShard<Table>::GetProbationInsert() const {
+  return table_.GetProbationInsert();
 }
 
 template <class Table>
