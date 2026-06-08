@@ -57,6 +57,9 @@ set -euo pipefail
 #   MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS=2048
 #   CACHE_SIZE_MB_LIST=32,64,128,256
 #   INCLUDE_FORCE_L0=1
+#   INCLUDE_BASELINE_CACHEUS=1
+#   INCLUDE_MLC_MODEL_CACHEUS_ROBUST_HIT_RATE=1
+#   MLC_MODEL_CACHEUS_SUB_CACHE_URI=cacheus://
 #   RESULT_DIR=/tmp/mlc_cache_sweep
 #   DB_ROOT=/tmp/mlc_cache_sweep_db
 
@@ -102,6 +105,9 @@ MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD="${MLC_MODEL_SHARED_POOL_ADMISSION_THR
 MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS="${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS:-2048}"
 CACHE_SIZE_MB_LIST="${CACHE_SIZE_MB_LIST:-32,64,128,256}"
 INCLUDE_FORCE_L0="${INCLUDE_FORCE_L0:-1}"
+INCLUDE_BASELINE_CACHEUS="${INCLUDE_BASELINE_CACHEUS:-1}"
+INCLUDE_MLC_MODEL_CACHEUS_ROBUST_HIT_RATE="${INCLUDE_MLC_MODEL_CACHEUS_ROBUST_HIT_RATE:-1}"
+MLC_MODEL_CACHEUS_SUB_CACHE_URI="${MLC_MODEL_CACHEUS_SUB_CACHE_URI:-cacheus://}"
 RESULT_DIR="${RESULT_DIR:-/tmp/mlc_cache_sweep}"
 DB_ROOT="${DB_ROOT:-/tmp/mlc_cache_sweep_db}"
 
@@ -111,6 +117,19 @@ if [[ ! -x "${DB_BENCH_BIN}" ]]; then
   echo "ERROR: db_bench not executable: ${DB_BENCH_BIN}" >&2
   exit 1
 fi
+
+ensure_cacheus_supported() {
+  local help_output
+  help_output="$("${DB_BENCH_BIN}" --help 2>&1 || true)"
+  if ! printf "%s\n" "${help_output}" | rg -q "cacheus_cache"; then
+    cat >&2 <<EOF
+ERROR: ${DB_BENCH_BIN} does not advertise cacheus_cache support.
+Please use a db_bench binary built from your current rocksdb tree
+(e.g. ./build-tests/db_bench) before enabling cacheus comparison modes.
+EOF
+    return 1
+  fi
+}
 
 extract_data_hit_rate() {
   local log_file="$1"
@@ -238,6 +257,9 @@ run_read_case() {
     baseline_hcc)
       args+=("--use_multi_level_cache=false" "--cache_type=hyper_clock_cache")
       ;;
+    baseline_cacheus)
+      args+=("--use_multi_level_cache=false" "--cache_type=cacheus_cache")
+      ;;
     mlc_model)
       args+=(
         "--use_multi_level_cache=true"
@@ -264,8 +286,31 @@ run_read_case() {
         "--multi_level_cache_shared_pool_decay_interval_ops=${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS}"
       )
       ;;
+    mlc_model_cacheus_robust_hit_rate)
+      args+=(
+        "--cache_type=cacheus_cache"
+        "--use_multi_level_cache=true"
+        "--multi_level_cache_auto_adjust=true"
+        "--multi_level_cache_allocator_mode=model"
+        "--multi_level_cache_adjust_smoothing_ratio=${MLC_MODEL_SMOOTHING_RATIO}"
+        "--multi_level_cache_adjust_min_change_bytes=${MLC_MODEL_MIN_CHANGE_BYTES}"
+        "--multi_level_cache_adjust_min_active_level_capacity_bytes=${MLC_MODEL_MIN_ACTIVE_LEVEL_CAPACITY_BYTES}"
+        "--multi_level_cache_alpha_estimator=robust_hit_rate"
+        "--multi_level_cache_alpha_shadow_scale=${MLC_MODEL_ALPHA_SHADOW_SCALE}"
+        "--multi_level_cache_alpha_shadow_sample_rate_log2=${MLC_MODEL_ALPHA_SHADOW_SAMPLE_RATE_LOG2}"
+        "--multi_level_cache_alpha_shadow_window_rounds=${MLC_MODEL_ALPHA_SHADOW_WINDOW_ROUNDS}"
+        "--multi_level_cache_alpha_shadow_min_capacity_bytes=${MLC_MODEL_ALPHA_SHADOW_MIN_CAPACITY_BYTES}"
+        "--multi_level_cache_model_bias_debug=${MLC_MODEL_BIAS_DEBUG}"
+        "--multi_level_cache_model_bias_debug_every_rounds=${MLC_MODEL_BIAS_DEBUG_EVERY_ROUNDS}"
+        "--multi_level_cache_use_effective_data_size=0"
+        "--multi_level_cache_shared_pool_ratio=${MLC_MODEL_SHARED_POOL_RATIO}"
+        "--multi_level_cache_shared_pool_admission_threshold=${MLC_MODEL_SHARED_POOL_ADMISSION_THRESHOLD}"
+        "--multi_level_cache_shared_pool_decay_interval_ops=${MLC_MODEL_SHARED_POOL_DECAY_INTERVAL_OPS}"
+      )
+      ;;
     mlc_force_l0)
       args+=(
+        "--cache_type=lru_cache"
         "--use_multi_level_cache=true"
         "--multi_level_cache_auto_adjust=true"
         "--multi_level_cache_allocator_mode=baseline_emulation"
@@ -284,6 +329,11 @@ run_read_case() {
 
   echo "[${mode_label}] cache=${cache_mb}MB run=${run_id}/${RUNS}" >&2
   "${DB_BENCH_BIN}" "${args[@]}" > "${read_log}" 2>&1
+  if rg -q "Cache type not supported\\.|Unsupported --cache_type=cacheus_cache" "${read_log}"; then
+    echo "ERROR: ${mode_label} is not supported by ${DB_BENCH_BIN}" >&2
+    tail -n 20 "${read_log}" >&2
+    return 1
+  fi
   if rg -q "^ERROR: unknown command line flag" "${read_log}"; then
     echo "ERROR: db_bench rejected flags in ${read_log}" >&2
     tail -n 20 "${read_log}" >&2
@@ -300,6 +350,9 @@ echo "cache_mb,mode,run,data_hit_rate" > "${csv_file}"
 read_modes=(baseline_lru)
 if [[ "${INCLUDE_BASELINE_HCC}" == "1" ]]; then
   read_modes+=(baseline_hcc)
+fi
+if [[ "${INCLUDE_BASELINE_CACHEUS}" == "1" ]]; then
+  read_modes+=(baseline_cacheus)
 fi
 if [[ "${INCLUDE_FORCE_L0}" == "1" ]]; then
   read_modes+=(mlc_force_l0)
@@ -326,6 +379,13 @@ if [[ "${INCLUDE_MLC_MODEL_EFFECTIVE_DATA_VARIANT}" == "1" ]]; then
     fi
   done
 fi
+if [[ "${INCLUDE_MLC_MODEL_CACHEUS_ROBUST_HIT_RATE}" == "1" ]]; then
+  read_modes+=(mlc_model_cacheus_robust_hit_rate)
+fi
+if [[ "${INCLUDE_BASELINE_CACHEUS}" == "1" || \
+      "${INCLUDE_MLC_MODEL_CACHEUS_ROBUST_HIT_RATE}" == "1" ]]; then
+  ensure_cacheus_supported
+fi
 
 IFS=',' read -r -a cache_list <<< "${CACHE_SIZE_MB_LIST}"
 for cache_mb in "${cache_list[@]}"; do
@@ -339,7 +399,10 @@ for cache_mb in "${cache_list[@]}"; do
     fi
 
     for mode in "${read_modes[@]}"; do
-      result="$(run_read_case "${mode}" "${cache_mb}" "${run_id}" "${db_path}")"
+      if ! result="$(run_read_case "${mode}" "${cache_mb}" "${run_id}" "${db_path}")"; then
+        echo "ERROR: failed mode=${mode}, cache=${cache_mb}MB, run=${run_id}" >&2
+        exit 1
+      fi
       mode_label="${result%%,*}"
       rate="${result#*,}"
       echo "${cache_mb},${mode_label},${run_id},${rate}" >> "${csv_file}"

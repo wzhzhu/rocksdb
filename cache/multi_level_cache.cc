@@ -54,8 +54,21 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity)
 MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
                                  const LRUCacheOptions& lru_options,
                                  bool initial_force_route_all_to_l0)
+    : MultiLevelCache(
+          num_levels, total_capacity,
+          [&lru_options](size_t level_capacity) {
+            LRUCacheOptions options = lru_options;
+            options.capacity = level_capacity;
+            return options.MakeSharedCache();
+          },
+          initial_force_route_all_to_l0) {}
+
+MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
+                                 SubCacheFactory sub_cache_factory,
+                                 bool initial_force_route_all_to_l0)
     : debug_miss_budget_(ParseDebugMissLimit()), total_capacity_(total_capacity) {
   const size_t level_count = SafeLevelCount(num_levels);
+  assert(sub_cache_factory != nullptr);
   sub_caches_.reserve(level_count);
 
   const size_t per_level_capacity =
@@ -68,10 +81,12 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
     if (initial_force_route_all_to_l0 && level == 0) {
       level_capacity = total_capacity;
     }
-    sub_caches_.emplace_back(
-        MakeSubCacheWithCapacity(lru_options, level_capacity));
+    auto sub_cache = sub_cache_factory(level_capacity);
+    assert(sub_cache != nullptr);
+    sub_caches_.emplace_back(std::move(sub_cache));
   }
-  shared_cache_ = MakeSubCacheWithCapacity(lru_options, 0);
+  shared_cache_ = sub_cache_factory(0);
+  assert(shared_cache_ != nullptr);
   InitializePerLevelState(level_count);
 }
 
@@ -112,6 +127,34 @@ MultiLevelCache::MultiLevelCache(std::vector<std::shared_ptr<Cache>> sub_caches,
 }
 
 const char* MultiLevelCache::Name() const { return "MultiLevelCache"; }
+
+std::string MultiLevelCache::GetPrintableOptions() const {
+  std::ostringstream oss;
+  oss << "multilevel_cache.levels=" << sub_caches_.size() << "\n";
+  oss << "multilevel_cache.total_capacity="
+      << total_capacity_.load(std::memory_order_relaxed) << "\n";
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    const auto& sub = sub_caches_[level];
+    oss << "multilevel_cache.level[" << level
+        << "].name=" << sub->Name() << "\n";
+    const std::string sub_opts = sub->GetPrintableOptions();
+    if (!sub_opts.empty()) {
+      oss << "multilevel_cache.level[" << level << "].stats_begin\n";
+      oss << sub_opts << "\n";
+      oss << "multilevel_cache.level[" << level << "].stats_end\n";
+    }
+  }
+  if (shared_cache_ != nullptr) {
+    oss << "multilevel_cache.shared.name=" << shared_cache_->Name() << "\n";
+    const std::string shared_opts = shared_cache_->GetPrintableOptions();
+    if (!shared_opts.empty()) {
+      oss << "multilevel_cache.shared.stats_begin\n";
+      oss << shared_opts << "\n";
+      oss << "multilevel_cache.shared.stats_end\n";
+    }
+  }
+  return oss.str();
+}
 
 Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
                                const CacheItemHelper* helper, size_t charge,

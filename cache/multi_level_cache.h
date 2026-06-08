@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,8 @@ namespace ROCKSDB_NAMESPACE {
 // Routing decodes level directly from cache key prefix.
 class MultiLevelCache : public Cache {
  public:
+  using SubCacheFactory = std::function<std::shared_ptr<Cache>(size_t)>;
+
   struct LevelMetricsSnapshot {
     std::vector<uint64_t> lookups;
     std::vector<uint64_t> hits;
@@ -37,10 +40,14 @@ class MultiLevelCache : public Cache {
   MultiLevelCache(size_t num_levels, size_t total_capacity,
                   const HyperClockCacheOptions& hcc_options,
                   bool initial_force_route_all_to_l0 = false);
+  MultiLevelCache(size_t num_levels, size_t total_capacity,
+                  SubCacheFactory sub_cache_factory,
+                  bool initial_force_route_all_to_l0 = false);
   MultiLevelCache(std::vector<std::shared_ptr<Cache>> sub_caches,
                   std::shared_ptr<Cache> shared_cache, size_t total_capacity);
 
   const char* Name() const override;
+  std::string GetPrintableOptions() const override;
 
   Status Insert(const Slice& key, ObjectPtr obj, const CacheItemHelper* helper,
                 size_t charge, Handle** handle = nullptr,

@@ -46,6 +46,7 @@
 #include "cache/multi_level_cache_allocator.h"
 #include "cache/multi_level_cache.h"
 #include "cache/sr_hyper_clock_cache.h"
+#include "cache/cacheus_cache.h"
 #include "cache/cache_key.h"
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
@@ -610,11 +611,15 @@ DEFINE_double(cache_low_pri_pool_ratio, 0.0,
 
 DEFINE_string(cache_type, "hyper_clock_cache",
               "Type of block cache (e.g., lru_cache, hyper_clock_cache, "
-              "sr_hyper_clock_cache).");
+              "sr_hyper_clock_cache, cacheus_cache).");
 DEFINE_bool(use_multi_level_cache, false,
             "If true, use MultiLevelCache for block cache. "
-            "Sub-cache policy follows --cache_type (lru_cache or "
-            "*hyper_clock_cache).");
+            "Sub-cache policy is controlled by --cache_type or "
+            "--multi_level_cache_sub_cache_uri.");
+DEFINE_string(multi_level_cache_sub_cache_uri, "",
+              "Optional URI for per-level sub-cache creation when "
+              "--use_multi_level_cache=true (e.g. cacheus://...). "
+              "When set, it overrides --cache_type inside MultiLevelCache.");
 DEFINE_int32(
     multi_level_cache_srhcc_start_level, -1,
     "If >= 0 and --use_multi_level_cache=true with HCC-family cache type, "
@@ -1623,6 +1628,9 @@ DEFINE_int64(stats_interval_seconds, 0,
 DEFINE_int32(stats_per_interval, 0,
              "Reports additional stats per interval when this is greater than "
              "0.");
+DEFINE_bool(cache_printable_stats_per_interval, true,
+            "If true, periodically prints block-cache printable stats when "
+            "--stats_per_interval is enabled.");
 
 DEFINE_uint64(slow_usecs, 1000000,
               "A message is printed for operations that take at least this "
@@ -2443,6 +2451,8 @@ static std::unordered_map<OperationType, std::string, std::hash<unsigned char>>
                            {kOthers, "op"},         {kMultiScan, "multiscan"}};
 
 class CombinedStats;
+static std::atomic<ROCKSDB_NAMESPACE::Cache*> g_db_bench_block_cache_for_stats{
+    nullptr};
 class Stats {
  private:
   SystemClock* clock_;
@@ -2680,6 +2690,17 @@ class Stats {
                       fprintf(stderr, "Level[%d]: %s\n", level, stats.c_str());
                     }
                   }
+                }
+              }
+            }
+            if (FLAGS_cache_printable_stats_per_interval) {
+              auto* block_cache =
+                  g_db_bench_block_cache_for_stats.load(std::memory_order_relaxed);
+              if (block_cache != nullptr) {
+                const std::string cache_stats = block_cache->GetPrintableOptions();
+                if (!cache_stats.empty()) {
+                  fprintf(stderr, "=== BlockCache Printable Stats ===\n%s\n",
+                          cache_stats.c_str());
                 }
               }
             }
@@ -4067,17 +4088,54 @@ class Benchmark {
       }
       const size_t level_count =
           FLAGS_num_levels > 0 ? static_cast<size_t>(FLAGS_num_levels) : 1U;
+      LRUCacheOptions mlc_lru_opts(
+          static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
+          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
+          GetCacheAllocator(), kDefaultToAdaptiveMutex,
+          kDefaultCacheMetadataChargePolicy, FLAGS_cache_low_pri_pool_ratio);
+      mlc_lru_opts.hash_seed = GetCacheHashSeed();
+      if (!FLAGS_multi_level_cache_sub_cache_uri.empty()) {
+        const std::string sub_cache_uri = FLAGS_multi_level_cache_sub_cache_uri;
+        MultiLevelCache::SubCacheFactory sub_cache_factory =
+            [sub_cache_uri](size_t level_capacity) {
+          std::shared_ptr<Cache> sub_cache;
+          Status s =
+              Cache::CreateFromString(ConfigOptions(), sub_cache_uri, &sub_cache);
+          if (!s.ok() || sub_cache == nullptr) {
+            fprintf(stderr,
+                    "Failed to create MultiLevelCache sub-cache from URI: %s "
+                    "status=%s\n",
+                    sub_cache_uri.c_str(), s.ToString().c_str());
+            db_bench_exit(1);
+          }
+          sub_cache->SetCapacity(level_capacity);
+          return sub_cache;
+        };
+        return std::make_shared<MultiLevelCache>(
+            level_count, static_cast<size_t>(capacity),
+            std::move(sub_cache_factory),
+            FLAGS_multi_level_cache_force_route_all_to_l0);
+      }
+
       if (FLAGS_cache_type == "lru_cache") {
-        LRUCacheOptions mlc_lru_opts(
-            static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
-            false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
-            GetCacheAllocator(), kDefaultToAdaptiveMutex,
-            kDefaultCacheMetadataChargePolicy, FLAGS_cache_low_pri_pool_ratio);
-        mlc_lru_opts.hash_seed = GetCacheHashSeed();
         return std::make_shared<MultiLevelCache>(
             level_count, static_cast<size_t>(capacity), mlc_lru_opts,
             FLAGS_multi_level_cache_force_route_all_to_l0);
       }
+
+      if (FLAGS_cache_type == "cacheus_cache") {
+        MultiLevelCache::SubCacheFactory sub_cache_factory =
+            [mlc_lru_opts](size_t level_capacity) mutable {
+          LRUCacheOptions options = mlc_lru_opts;
+          options.capacity = level_capacity;
+          return NewCacheusCache(options);
+        };
+        return std::make_shared<MultiLevelCache>(
+            level_count, static_cast<size_t>(capacity),
+            std::move(sub_cache_factory),
+            FLAGS_multi_level_cache_force_route_all_to_l0);
+      }
+
       if (FLAGS_cache_type == "sr_hyper_clock_cache" ||
           EndsWith(FLAGS_cache_type, "hyper_clock_cache")) {
         size_t estimated_entry_charge;
@@ -4135,11 +4193,12 @@ class Benchmark {
         return std::make_shared<MultiLevelCache>(
             std::move(sub_caches), std::move(shared_cache), total_capacity);
       }
+
       fprintf(stderr,
               "Unsupported --cache_type=%s with --use_multi_level_cache=true. "
-              "Supported: lru_cache, hyper_clock_cache, "
+              "Supported: lru_cache, cacheus_cache, hyper_clock_cache, "
               "auto_hyper_clock_cache, fixed_hyper_clock_cache, "
-              "sr_hyper_clock_cache\n",
+              "sr_hyper_clock_cache, or --multi_level_cache_sub_cache_uri\n",
               FLAGS_cache_type.c_str());
       db_bench_exit(1);
     }
@@ -4233,6 +4292,25 @@ class Benchmark {
         }
         block_cache = opts.MakeSharedCache();
       }
+    } else if (FLAGS_cache_type == "cacheus_cache") {
+      if (use_tiered_cache) {
+        fprintf(stderr,
+                "--cache_type=cacheus_cache is not currently supported with "
+                "--use_tiered_cache\n");
+        db_bench_exit(1);
+      }
+      LRUCacheOptions opts(
+          static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
+          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
+          GetCacheAllocator(), kDefaultToAdaptiveMutex,
+          kDefaultCacheMetadataChargePolicy, FLAGS_cache_low_pri_pool_ratio);
+      opts.hash_seed = GetCacheHashSeed();
+      if (!FLAGS_secondary_cache_uri.empty()) {
+        opts.secondary_cache = secondary_cache;
+      } else if (FLAGS_use_compressed_secondary_cache) {
+        opts.secondary_cache = NewCompressedSecondaryCache(secondary_cache_opts);
+      }
+      block_cache = NewCacheusCache(opts);
     } else {
       fprintf(stderr, "Cache type not supported.");
       db_bench_exit(1);
@@ -4308,6 +4386,8 @@ class Benchmark {
         cache_ = NewSimCache(cache_, FLAGS_simcache_size, 0);
       }
     }
+    g_db_bench_block_cache_for_stats.store(cache_.get(),
+                                           std::memory_order_relaxed);
 
     if (report_file_operations_) {
       FLAGS_env = new CompositeEnvWrapper(
@@ -4365,6 +4445,7 @@ class Benchmark {
   }
 
   ~Benchmark() {
+    g_db_bench_block_cache_for_stats.store(nullptr, std::memory_order_relaxed);
     if (multi_level_allocator_ != nullptr) {
       multi_level_allocator_->Stop();
       multi_level_allocator_.reset();

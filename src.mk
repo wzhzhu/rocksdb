@@ -1,6 +1,7 @@
 # These are the sources from which librocksdb.a is built:
 LIB_SOURCES =                                                   \
   cache/cache.cc                                                \
+  cache/cacheus_cache.cc                                        \
   cache/cache_entry_roles.cc                                    \
   cache/cache_key.cc                                            \
   cache/cache_helpers.cc                                        \
@@ -473,6 +474,7 @@ BENCH_MAIN_SOURCES =                                                    \
 TEST_MAIN_SOURCES =                                                     \
   cache/cache_test.cc                                                   \
   cache/cache_reservation_manager_test.cc                               \
+  cache/cacheus_cache_test.cc                                           \
   cache/compressed_secondary_cache_test.cc                              \
   cache/lru_cache_test.cc                                               \
   cache/tiered_secondary_cache_test.cc					                        \
