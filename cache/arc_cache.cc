@@ -72,7 +72,6 @@ void ARCCache::AdvanceGenerationLocked(const std::string& key) {
   ++state.generation;
   state.last_touched_at_op = request_counter_;
   pending_erased_keys_.erase(key);
-  MaybeCleanupKeySyncLocked(key);
 }
 
 void ARCCache::MaybeCleanupKeySyncLocked(const std::string& key) {
