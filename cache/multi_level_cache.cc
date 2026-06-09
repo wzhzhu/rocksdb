@@ -554,7 +554,7 @@ std::vector<std::vector<uint64_t>> MultiLevelCache::DrainLookupSamples() {
       continue;
     }
     const uint64_t end = ring->write_seq.load(std::memory_order_acquire);
-    uint64_t start = ring->consumed_seq.load(std::memory_order_relaxed);
+    uint64_t start = ring->drained_seq.load(std::memory_order_relaxed);
     if (end <= start) {
       continue;
     }
@@ -569,7 +569,7 @@ std::vector<std::vector<uint64_t>> MultiLevelCache::DrainLookupSamples() {
             ring->values[idx].load(std::memory_order_relaxed));
       }
     }
-    ring->consumed_seq.store(end, std::memory_order_release);
+    ring->drained_seq.store(end, std::memory_order_release);
   }
   return drained;
 }
@@ -1187,6 +1187,8 @@ void MultiLevelCache::InitializePerLevelState(size_t level_count) {
     lookup_sample_rings_[level]->write_seq.store(0, std::memory_order_relaxed);
     lookup_sample_rings_[level]->consumed_seq.store(0,
                                                     std::memory_order_relaxed);
+    lookup_sample_rings_[level]->drained_seq.store(0,
+                                                   std::memory_order_relaxed);
     for (size_t i = 0; i < kLookupSampleRingSize; ++i) {
       lookup_sample_rings_[level]->seq[i].store(0, std::memory_order_relaxed);
       lookup_sample_rings_[level]->values[i].store(0, std::memory_order_relaxed);

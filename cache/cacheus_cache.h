@@ -7,7 +7,6 @@
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "rocksdb/advanced_cache.h"
@@ -150,6 +149,9 @@ class CacheusCache : public CacheWrapper {
   void RemoveFromQueuesLocked(const std::string& key, const EntryMeta& meta);
   void UpdateLfuLocked(const std::string& key, const EntryMeta& meta);
   PendingInsertMeta ConsumePendingInsertMetaLocked(const std::string& key);
+  void MarkTombstoneLocked(const std::string& key);
+  bool IsTombstonedLocked(const std::string& key);
+  void MaybePruneTombstonesLocked();
   double RandomUnitLocked();
   std::string SliceToKey(const Slice& key) const;
 
@@ -204,9 +206,10 @@ class CacheusCache : public CacheWrapper {
   std::unordered_map<std::string, HistListIt> lru_hist_pos_;
   std::unordered_map<std::string, HistListIt> lfu_hist_pos_;
   std::unordered_map<std::string, PendingInsertMeta> pending_insert_meta_;
-  std::unordered_set<std::string> pending_erased_keys_;
+  std::unordered_map<std::string, uint64_t> pending_erased_keys_;
   uint64_t request_counter_ = 0;
   uint64_t pending_max_age_ops_ = 65536;
+  static constexpr uint64_t kTombstonePruneIntervalOps = 1024;
 
   uint32_t mt_state_[624];
   int mt_index_ = 625;

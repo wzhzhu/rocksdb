@@ -6,7 +6,6 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "rocksdb/advanced_cache.h"
@@ -69,6 +68,9 @@ class ARCCache : public CacheWrapper {
                        size_t* usage, size_t target_limit);
   void AdjustTargetLocked(bool hit_b1);
   void EnsureResidentLimitLocked(std::vector<std::string>* evicted_keys);
+  void MarkTombstoneLocked(const std::string& key);
+  bool IsTombstonedLocked(const std::string& key);
+  void MaybePruneTombstonesLocked();
   bool IsResident(ListType type) const;
 
   mutable std::mutex mu_;
@@ -85,11 +87,12 @@ class ARCCache : public CacheWrapper {
   std::list<std::string> b2_;
   std::unordered_map<std::string, EntryMeta> entries_;
   std::unordered_map<std::string, PendingState> pending_state_;
-  std::unordered_set<std::string> pending_erased_keys_;
+  std::unordered_map<std::string, uint64_t> pending_erased_keys_;
   uint64_t desync_backing_miss_reconciled_count_ = 0;
   uint64_t tombstone_lookup_dropped_count_ = 0;
   uint64_t request_counter_ = 0;
   uint64_t pending_max_age_ops_ = 65536;
+  static constexpr uint64_t kTombstonePruneIntervalOps = 1024;
 };
 
 std::shared_ptr<Cache> NewARCCache(const LRUCacheOptions& options);

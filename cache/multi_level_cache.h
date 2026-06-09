@@ -152,6 +152,7 @@ class MultiLevelCache : public Cache {
     std::unique_ptr<std::atomic<uint64_t>[]> values;
     std::atomic<uint64_t> write_seq{0};
     std::atomic<uint64_t> consumed_seq{0};
+    std::atomic<uint64_t> drained_seq{0};
   };
 
   Cache* SubCacheByLevel(size_t level_index);

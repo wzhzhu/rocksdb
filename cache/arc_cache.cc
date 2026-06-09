@@ -67,6 +67,37 @@ std::string ARCCache::SliceToKey(const Slice& key) const {
   return std::string(key.data(), key.size());
 }
 
+void ARCCache::MarkTombstoneLocked(const std::string& key) {
+  pending_erased_keys_[key] = request_counter_;
+}
+
+bool ARCCache::IsTombstonedLocked(const std::string& key) {
+  auto it = pending_erased_keys_.find(key);
+  if (it == pending_erased_keys_.end()) {
+    return false;
+  }
+  if (request_counter_ > it->second &&
+      request_counter_ - it->second > pending_max_age_ops_) {
+    pending_erased_keys_.erase(it);
+    return false;
+  }
+  return true;
+}
+
+void ARCCache::MaybePruneTombstonesLocked() {
+  if ((request_counter_ % kTombstonePruneIntervalOps) != 0) {
+    return;
+  }
+  for (auto it = pending_erased_keys_.begin(); it != pending_erased_keys_.end();) {
+    if (request_counter_ > it->second &&
+        request_counter_ - it->second > pending_max_age_ops_) {
+      it = pending_erased_keys_.erase(it);
+      continue;
+    }
+    ++it;
+  }
+}
+
 bool ARCCache::IsResident(ListType type) const {
   return type == ListType::kT1 || type == ListType::kT2;
 }
@@ -251,15 +282,16 @@ Status ARCCache::Insert(const Slice& key, ObjectPtr value,
   {
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
+    MaybePruneTombstonesLocked();
     pending_erased_keys_.erase(key_str);
     if (capacity_ == 0) {
       pending_state_.erase(key_str);
-      pending_erased_keys_.insert(key_str);
+      MarkTombstoneLocked(key_str);
       evicted_keys.push_back(key_str);
     } else if (charge > capacity_) {
       pending_state_.erase(key_str);
       RemoveLocked(key_str);
-      pending_erased_keys_.insert(key_str);
+      MarkTombstoneLocked(key_str);
       evicted_keys.push_back(key_str);
     } else {
       PendingState pending;
@@ -304,7 +336,7 @@ Status ARCCache::Insert(const Slice& key, ObjectPtr value,
             } else if (!t1_.empty()) {
               const std::string victim = t1_.back();
               RemoveLocked(victim);
-              pending_erased_keys_.insert(victim);
+              MarkTombstoneLocked(victim);
               evicted_keys.push_back(victim);
             }
           } else if (usage_t1_ + usage_b1_ < capacity_) {
@@ -321,7 +353,7 @@ Status ARCCache::Insert(const Slice& key, ObjectPtr value,
       }
       EnsureResidentLimitLocked(&evicted_keys);
       for (const std::string& evicted : evicted_keys) {
-        pending_erased_keys_.insert(evicted);
+        MarkTombstoneLocked(evicted);
       }
     }
   }
@@ -341,9 +373,9 @@ Cache::Handle* ARCCache::Lookup(const Slice& key, const CacheItemHelper* helper,
   {
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
+    MaybePruneTombstonesLocked();
     if (handle != nullptr) {
-      tombstoned_hit =
-          pending_erased_keys_.find(key_str) != pending_erased_keys_.end();
+      tombstoned_hit = IsTombstonedLocked(key_str);
       if (!tombstoned_hit) {
         auto it = entries_.find(key_str);
         if (it == entries_.end()) {
@@ -383,7 +415,9 @@ void ARCCache::Erase(const Slice& key) {
   const std::string key_str = SliceToKey(key);
   {
     std::lock_guard<std::mutex> lock(mu_);
-    pending_erased_keys_.insert(key_str);
+    ++request_counter_;
+    MaybePruneTombstonesLocked();
+    MarkTombstoneLocked(key_str);
     RemoveLocked(key_str);
     pending_state_.erase(key_str);
   }
@@ -394,11 +428,13 @@ void ARCCache::SetCapacity(size_t capacity) {
   std::vector<std::string> evicted_keys;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    ++request_counter_;
+    MaybePruneTombstonesLocked();
     capacity_ = capacity;
     target_t1_ = std::min(target_t1_, capacity_);
     EnsureResidentLimitLocked(&evicted_keys);
     for (const std::string& evicted_key : evicted_keys) {
-      pending_erased_keys_.insert(evicted_key);
+      MarkTombstoneLocked(evicted_key);
     }
     TrimGhostLocked(&b1_, ListType::kB1, &usage_b1_, capacity_);
     TrimGhostLocked(&b2_, ListType::kB2, &usage_b2_, capacity_);

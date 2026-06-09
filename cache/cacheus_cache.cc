@@ -183,6 +183,37 @@ std::string CacheusCache::SliceToKey(const Slice& key) const {
   return std::string(key.data(), key.size());
 }
 
+void CacheusCache::MarkTombstoneLocked(const std::string& key) {
+  pending_erased_keys_[key] = request_counter_;
+}
+
+bool CacheusCache::IsTombstonedLocked(const std::string& key) {
+  auto it = pending_erased_keys_.find(key);
+  if (it == pending_erased_keys_.end()) {
+    return false;
+  }
+  if (request_counter_ > it->second &&
+      request_counter_ - it->second > pending_max_age_ops_) {
+    pending_erased_keys_.erase(it);
+    return false;
+  }
+  return true;
+}
+
+void CacheusCache::MaybePruneTombstonesLocked() {
+  if ((request_counter_ % kTombstonePruneIntervalOps) != 0) {
+    return;
+  }
+  for (auto it = pending_erased_keys_.begin(); it != pending_erased_keys_.end();) {
+    if (request_counter_ > it->second &&
+        request_counter_ - it->second > pending_max_age_ops_) {
+      it = pending_erased_keys_.erase(it);
+      continue;
+    }
+    ++it;
+  }
+}
+
 void CacheusCache::RecomputePartitionLimitsLocked() {
   if (capacity_ == 0) {
     s_limit_ = 0;
@@ -625,6 +656,7 @@ Status CacheusCache::Insert(const Slice& key, ObjectPtr value,
   {
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
+    MaybePruneTombstonesLocked();
     pending_erased_keys_.erase(key_str);
     ResetStepTraceLocked();
     ++time_;
@@ -701,7 +733,7 @@ Status CacheusCache::Insert(const Slice& key, ObjectPtr value,
     RecordInsertLocked(key_str, logical_charge, is_new, seeded_freq, force_to_s,
                        force_to_s || was_full_before_insert);
     for (const std::string& evicted : evicted_keys) {
-      pending_erased_keys_.insert(evicted);
+      MarkTombstoneLocked(evicted);
     }
   }
 
@@ -721,7 +753,8 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
   if (handle != nullptr) {
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
-    tombstoned_hit = pending_erased_keys_.find(key_str) != pending_erased_keys_.end();
+    MaybePruneTombstonesLocked();
+    tombstoned_hit = IsTombstonedLocked(key_str);
     if (tombstoned_hit) {
       ++tombstone_lookup_dropped_count_;
     }
@@ -734,6 +767,7 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
     }
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
+    MaybePruneTombstonesLocked();
     ++total_miss_count_;
     auto live_it = entries_.find(key_str);
     if (live_it != entries_.end()) {
@@ -787,6 +821,8 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
   std::vector<std::string> evicted_keys;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    ++request_counter_;
+    MaybePruneTombstonesLocked();
     ++total_hit_count_;
     ResetStepTraceLocked();
     ++time_;
@@ -797,7 +833,7 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
       const size_t logical_charge = entry_charge_equivalent_ ? 1 : charge;
       EnsureCapacityLocked(logical_charge, &evicted_keys);
       for (const std::string& evicted : evicted_keys) {
-        pending_erased_keys_.insert(evicted);
+        MarkTombstoneLocked(evicted);
       }
       RecordInsertLocked(key_str, logical_charge, false, 1, false, false);
     }
@@ -814,7 +850,9 @@ void CacheusCache::Erase(const Slice& key) {
   const std::string key_str = SliceToKey(key);
   {
     std::lock_guard<std::mutex> lock(mu_);
-    pending_erased_keys_.insert(key_str);
+    ++request_counter_;
+    MaybePruneTombstonesLocked();
+    MarkTombstoneLocked(key_str);
     RemoveEntryLocked(key_str, -1);
   }
   target_->Erase(key);
@@ -824,6 +862,8 @@ void CacheusCache::SetCapacity(size_t capacity) {
   std::vector<std::string> evicted_keys;
   {
     std::lock_guard<std::mutex> lock(mu_);
+    ++request_counter_;
+    MaybePruneTombstonesLocked();
     capacity_ = capacity;
     RecomputePartitionLimitsLocked();
     history_limit_ = configured_history_size_ > 0
@@ -834,7 +874,7 @@ void CacheusCache::SetCapacity(size_t capacity) {
                       : std::max<uint64_t>(1, capacity_ / 4096);
     EnsureCapacityLocked(0, &evicted_keys);
     for (const std::string& evicted : evicted_keys) {
-      pending_erased_keys_.insert(evicted);
+      MarkTombstoneLocked(evicted);
     }
   }
   for (const std::string& evicted : evicted_keys) {
