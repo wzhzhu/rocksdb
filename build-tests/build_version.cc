@@ -8,17 +8,17 @@
 
 // The build script may replace these values with real values based
 // on whether or not GIT is available and the platform settings
-static const std::string rocksdb_build_git_sha  = "rocksdb_build_git_sha:ed89d9213545031255558bb83e843bcc1f7d4131";
+static const std::string rocksdb_build_git_sha  = "rocksdb_build_git_sha:c737998e02b9865903e2012f726840745ed79f8b";
 static const std::string rocksdb_build_git_tag = "rocksdb_build_git_tag:main";
 #define HAS_GIT_CHANGES 1
 #if HAS_GIT_CHANGES == 0
 // If HAS_GIT_CHANGES is 0, the GIT date is used.
 // Use the time the branch/tag was last modified
-static const std::string rocksdb_build_date = "rocksdb_build_date:2026-04-30 07:34:52";
+static const std::string rocksdb_build_date = "rocksdb_build_date:2026-06-08 06:48:27";
 #else
 // If HAS_GIT_CHANGES is > 0, the branch/tag has modifications.
 // Use the time the build was created.
-static const std::string rocksdb_build_date = "rocksdb_build_date:2026-04-30 07:56:42";
+static const std::string rocksdb_build_date = "rocksdb_build_date:2026-06-08 09:44:32";
 #endif
 
 extern "C" {
