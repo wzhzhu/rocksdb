@@ -87,6 +87,7 @@ class ARCCache : public CacheWrapper {
   bool IsTombstonedLocked(const std::string& key);
   void OnBackingEraseAckLocked(const std::string& key);
   void MaybePruneTombstonesLocked();
+  void MaybePrunePendingStateLocked();
   bool IsResident(ListType type) const;
 
   mutable std::mutex mu_;
@@ -113,6 +114,8 @@ class ARCCache : public CacheWrapper {
   uint64_t pending_max_age_ops_ = 65536;
   std::string tombstone_prune_resume_key_;
   bool tombstone_prune_resume_valid_ = false;
+  std::string pending_state_prune_resume_key_;
+  bool pending_state_prune_resume_valid_ = false;
   static constexpr uint64_t kTombstonePruneIntervalOps = 8192;
   static constexpr size_t kTombstonePruneScanBudget = 64;
 };

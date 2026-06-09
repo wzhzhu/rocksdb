@@ -148,17 +148,68 @@ void ARCCache::MaybePruneTombstonesLocked() {
   if (pending_erased_keys_.empty()) {
     tombstone_prune_resume_valid_ = false;
     tombstone_prune_resume_key_.clear();
-    return;
-  }
-  size_t scan_budget =
-      std::min(kTombstonePruneScanBudget, pending_erased_keys_.size());
-  auto it = pending_erased_keys_.begin();
-  if (tombstone_prune_resume_valid_) {
-    auto resume_it = pending_erased_keys_.find(tombstone_prune_resume_key_);
-    if (resume_it != pending_erased_keys_.end()) {
-      it = std::next(resume_it);
+  } else {
+    size_t scan_budget =
+        std::min(kTombstonePruneScanBudget, pending_erased_keys_.size());
+    auto it = pending_erased_keys_.begin();
+    if (tombstone_prune_resume_valid_) {
+      auto resume_it = pending_erased_keys_.find(tombstone_prune_resume_key_);
+      if (resume_it != pending_erased_keys_.end()) {
+        it = std::next(resume_it);
+        if (it == pending_erased_keys_.end()) {
+          it = pending_erased_keys_.begin();
+        }
+      }
+    }
+
+    std::vector<std::string> expired_keys;
+    expired_keys.reserve(scan_budget);
+    std::string last_scanned_key;
+    for (size_t scanned = 0; scanned < scan_budget; ++scanned) {
       if (it == pending_erased_keys_.end()) {
         it = pending_erased_keys_.begin();
+        if (it == pending_erased_keys_.end()) {
+          break;
+        }
+      }
+      last_scanned_key = it->first;
+      if (request_counter_ > it->second.created_at_op &&
+          request_counter_ - it->second.created_at_op > pending_max_age_ops_) {
+        expired_keys.push_back(it->first);
+      }
+      ++it;
+    }
+
+    if (!last_scanned_key.empty()) {
+      tombstone_prune_resume_key_ = last_scanned_key;
+      tombstone_prune_resume_valid_ = true;
+    } else {
+      tombstone_prune_resume_valid_ = false;
+      tombstone_prune_resume_key_.clear();
+    }
+
+    for (const auto& key : expired_keys) {
+      pending_erased_keys_.erase(key);
+      MaybeCleanupKeySyncLocked(key);
+    }
+  }
+  MaybePrunePendingStateLocked();
+}
+
+void ARCCache::MaybePrunePendingStateLocked() {
+  if (pending_state_.empty()) {
+    pending_state_prune_resume_valid_ = false;
+    pending_state_prune_resume_key_.clear();
+    return;
+  }
+  size_t scan_budget = std::min(kTombstonePruneScanBudget, pending_state_.size());
+  auto it = pending_state_.begin();
+  if (pending_state_prune_resume_valid_) {
+    auto resume_it = pending_state_.find(pending_state_prune_resume_key_);
+    if (resume_it != pending_state_.end()) {
+      it = std::next(resume_it);
+      if (it == pending_state_.end()) {
+        it = pending_state_.begin();
       }
     }
   }
@@ -167,31 +218,30 @@ void ARCCache::MaybePruneTombstonesLocked() {
   expired_keys.reserve(scan_budget);
   std::string last_scanned_key;
   for (size_t scanned = 0; scanned < scan_budget; ++scanned) {
-    if (it == pending_erased_keys_.end()) {
-      it = pending_erased_keys_.begin();
-      if (it == pending_erased_keys_.end()) {
+    if (it == pending_state_.end()) {
+      it = pending_state_.begin();
+      if (it == pending_state_.end()) {
         break;
       }
     }
     last_scanned_key = it->first;
-    if (request_counter_ > it->second.created_at_op &&
-        request_counter_ - it->second.created_at_op > pending_max_age_ops_) {
+    if (request_counter_ > it->second.observed_at_op &&
+        request_counter_ - it->second.observed_at_op > pending_max_age_ops_) {
       expired_keys.push_back(it->first);
     }
     ++it;
   }
 
   if (!last_scanned_key.empty()) {
-    tombstone_prune_resume_key_ = last_scanned_key;
-    tombstone_prune_resume_valid_ = true;
+    pending_state_prune_resume_key_ = last_scanned_key;
+    pending_state_prune_resume_valid_ = true;
   } else {
-    tombstone_prune_resume_valid_ = false;
-    tombstone_prune_resume_key_.clear();
+    pending_state_prune_resume_valid_ = false;
+    pending_state_prune_resume_key_.clear();
   }
 
   for (const auto& key : expired_keys) {
-    pending_erased_keys_.erase(key);
-    MaybeCleanupKeySyncLocked(key);
+    pending_state_.erase(key);
   }
 }
 

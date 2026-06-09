@@ -168,6 +168,7 @@ class CacheusCache : public CacheWrapper {
   bool IsTombstonedLocked(const std::string& key);
   void OnBackingEraseAckLocked(const std::string& key);
   void MaybePruneTombstonesLocked();
+  void MaybePrunePendingInsertMetaLocked();
   double RandomUnitLocked();
   std::string SliceToKey(const Slice& key) const;
 
@@ -228,6 +229,8 @@ class CacheusCache : public CacheWrapper {
   uint64_t pending_max_age_ops_ = 65536;
   std::string tombstone_prune_resume_key_;
   bool tombstone_prune_resume_valid_ = false;
+  std::string pending_insert_prune_resume_key_;
+  bool pending_insert_prune_resume_valid_ = false;
   static constexpr uint64_t kTombstonePruneIntervalOps = 8192;
   static constexpr size_t kTombstonePruneScanBudget = 64;
 
