@@ -163,9 +163,11 @@ Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
                                const CacheItemHelper* helper, size_t charge,
                                Handle** handle, Priority priority,
                                const Slice& compressed, CompressionType type) {
-  const size_t level_index = RouteLevelByKey(key, RouteCaller::kInsert);
+  Slice base_key = key;
+  const size_t level_index =
+      RouteLevelByKey(key, RouteCaller::kInsert, &base_key);
   Cache* target_cache = SubCacheByLevel(level_index);
-  const uint64_t key_hash = HashCacheKey(key);
+  const uint64_t key_hash = HashCacheKey(base_key);
   bool route_to_shared = false;
   if (!force_route_all_to_l0_.load(std::memory_order_relaxed) &&
       shared_pool_ratio_ppm_.load(std::memory_order_relaxed) > 0 &&
@@ -175,7 +177,7 @@ Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
   }
   Cache::Handle* inner = nullptr;
   Cache::Handle** inner_handle = handle != nullptr ? &inner : nullptr;
-  Status s = target_cache->Insert(key, obj, helper, charge, inner_handle,
+  Status s = target_cache->Insert(base_key, obj, helper, charge, inner_handle,
                                   priority, compressed, type);
   if (!s.ok()) {
     return s;
@@ -193,10 +195,13 @@ Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
 Cache::Handle* MultiLevelCache::CreateStandalone(
     const Slice& key, ObjectPtr obj, const CacheItemHelper* helper,
     size_t charge, bool allow_uncharged) {
-  const size_t level_index = RouteLevelByKey(key, RouteCaller::kOther);
+  Slice base_key = key;
+  const size_t level_index =
+      RouteLevelByKey(key, RouteCaller::kOther, &base_key);
   Cache* target_cache = SubCacheByLevel(level_index);
   Cache::Handle* inner =
-      target_cache->CreateStandalone(key, obj, helper, charge, allow_uncharged);
+      target_cache->CreateStandalone(base_key, obj, helper, charge,
+                                     allow_uncharged);
   if (inner == nullptr) {
     return nullptr;
   }
@@ -207,12 +212,14 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
                                        const CacheItemHelper* helper,
                                        CreateContext* create_context,
                                        Priority priority, Statistics* stats) {
-  const size_t level_index = RouteLevelByKey(key, RouteCaller::kLookup);
-  MaybeRecordLookupSample(level_index, key);
+  Slice base_key = key;
+  const size_t level_index =
+      RouteLevelByKey(key, RouteCaller::kLookup, &base_key);
+  MaybeRecordLookupSample(level_index, base_key);
   lookups_[level_index].fetch_add(1, std::memory_order_relaxed);
   Cache* level_cache = SubCacheByLevel(level_index);
   Cache::Handle* inner =
-      level_cache->Lookup(key, helper, create_context, priority, stats);
+      level_cache->Lookup(base_key, helper, create_context, priority, stats);
   Cache* owner_cache = level_cache;
   if (inner == nullptr) {
     const bool shared_enabled =
@@ -222,9 +229,10 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
       return nullptr;
     }
     shared_pool_lookups_.fetch_add(1, std::memory_order_relaxed);
-    inner = SharedCache()->Lookup(key, helper, create_context, priority, stats);
+    inner =
+        SharedCache()->Lookup(base_key, helper, create_context, priority, stats);
     if (inner == nullptr) {
-      RecordSharedPoolCandidate(HashCacheKey(key));
+      RecordSharedPoolCandidate(HashCacheKey(base_key));
       return nullptr;
     }
     shared_pool_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -253,10 +261,12 @@ Cache::ObjectPtr MultiLevelCache::Value(Handle* handle) {
 }
 
 void MultiLevelCache::Erase(const Slice& key) {
-  SubCacheByLevel(RouteLevelByKey(key, RouteCaller::kOther))->Erase(key);
+  Slice base_key = key;
+  SubCacheByLevel(RouteLevelByKey(key, RouteCaller::kOther, &base_key))
+      ->Erase(base_key);
   if (!force_route_all_to_l0_.load(std::memory_order_relaxed) &&
       shared_pool_ratio_ppm_.load(std::memory_order_relaxed) > 0) {
-    SharedCache()->Erase(key);
+    SharedCache()->Erase(base_key);
   }
 }
 
@@ -658,8 +668,11 @@ void MultiLevelCache::ConfigureDynamicSRHCC(bool enabled,
   }
 }
 
-size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
-                                        RouteCaller caller) const {
+size_t MultiLevelCache::RouteLevelByKey(const Slice& key, RouteCaller caller,
+                                        Slice* base_key) const {
+  if (base_key != nullptr) {
+    *base_key = key;
+  }
   std::atomic<uint64_t>* route_queries = nullptr;
   std::atomic<uint64_t>* route_parse_failures = nullptr;
   std::atomic<uint64_t>* route_prefix_hits = nullptr;
@@ -686,6 +699,17 @@ size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
   if (force_route_all_to_l0_.load(std::memory_order_relaxed)) {
     return 0;
   }
+  size_t extended_level = 0;
+  Slice extended_base_key;
+  if (DecodeExtendedCacheRouting(key, &extended_level, &extended_base_key)) {
+    if (base_key != nullptr) {
+      *base_key = extended_base_key;
+    }
+    if (route_prefix_hits != nullptr) {
+      route_prefix_hits->fetch_add(1, std::memory_order_relaxed);
+    }
+    return extended_level;
+  }
   const std::optional<uint64_t> key_prefix = GetCacheKeyPrefix(key);
   if (!key_prefix.has_value()) {
     if (route_parse_failures != nullptr) {
@@ -695,24 +719,36 @@ size_t MultiLevelCache::RouteLevelByKey(const Slice& key,
                       "prefix_parse_failure");
     return 0;
   }
-  int encoded_level = 0;
-  if (DecodeLevelFromEncodedCacheKeyCommonPrefix(*key_prefix, &encoded_level)) {
-    if (route_prefix_hits != nullptr) {
-      route_prefix_hits->fetch_add(1, std::memory_order_relaxed);
-    }
-    if (encoded_level < 0 ||
-        static_cast<size_t>(encoded_level) >= sub_caches_.size()) {
-      route_normalize_fallbacks_.fetch_add(1, std::memory_order_relaxed);
-      return 0;
-    }
-    return static_cast<size_t>(encoded_level);
-  }
   if (route_prefix_misses != nullptr) {
     route_prefix_misses->fetch_add(1, std::memory_order_relaxed);
   }
   MaybeLogRouteMiss(caller, key, /*has_prefix=*/true, *key_prefix,
                     "prefix_marker_miss");
   return 0;
+}
+
+bool MultiLevelCache::DecodeExtendedCacheRouting(const Slice& key, size_t* level,
+                                                 Slice* base_key) const {
+  if (key.size() != kExtendedCacheKeySize) {
+    return false;
+  }
+  int decoded_level = 0;
+  const uint8_t level_tag = static_cast<uint8_t>(key.data()[kCacheKeySize]);
+  if (!DecodeLevelFromCacheKeyLevelTag(level_tag, &decoded_level)) {
+    return false;
+  }
+  if (decoded_level < 0 ||
+      static_cast<size_t>(decoded_level) >= sub_caches_.size()) {
+    route_normalize_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (level != nullptr) {
+    *level = static_cast<size_t>(decoded_level);
+  }
+  if (base_key != nullptr) {
+    *base_key = Slice(key.data(), kCacheKeySize);
+  }
+  return true;
 }
 
 std::optional<uint64_t> MultiLevelCache::GetCacheKeyPrefix(

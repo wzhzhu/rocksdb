@@ -21,7 +21,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 // A cache wrapper that maintains one sub-cache per LSM-tree level.
-// Routing decodes level directly from cache key prefix.
+// Routing prefers level metadata carried in an optional cache-key suffix.
 class MultiLevelCache : public Cache {
  public:
   using SubCacheFactory = std::function<std::shared_ptr<Cache>(size_t)>;
@@ -162,7 +162,10 @@ class MultiLevelCache : public Cache {
   Cache* SharedCache();
   const Cache* SharedCache() const;
 
-  size_t RouteLevelByKey(const Slice& key, RouteCaller caller) const;
+  size_t RouteLevelByKey(const Slice& key, RouteCaller caller,
+                         Slice* base_key) const;
+  bool DecodeExtendedCacheRouting(const Slice& key, size_t* level,
+                                  Slice* base_key) const;
   std::optional<uint64_t> GetCacheKeyPrefix(const Slice& key) const;
   void MaybeLogRouteMiss(RouteCaller caller, const Slice& key, bool has_prefix,
                          uint64_t key_prefix, const char* reason) const;

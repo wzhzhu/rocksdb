@@ -361,16 +361,4 @@ UniqueId64x2 OffsetableCacheKey::ToInternalUniqueId() {
   return rv;
 }
 
-OffsetableCacheKey OffsetableCacheKey::WithLevel(int level) const {
-  assert(!IsEmpty());
-  assert(IsCacheKeyLevelEncodable(level));
-  if (!IsCacheKeyLevelEncodable(level)) {
-    return *this;
-  }
-  OffsetableCacheKey rv = *this;
-  rv.file_num_etc64_ = EncodeCacheKeyCommonPrefixWithLevel(rv.file_num_etc64_,
-                                                           level);
-  return rv;
-}
-
 }  // namespace ROCKSDB_NAMESPACE

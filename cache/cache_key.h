@@ -67,6 +67,7 @@ class CacheKey {
 };
 
 constexpr uint8_t kCacheKeySize = static_cast<uint8_t>(sizeof(CacheKey));
+constexpr uint8_t kExtendedCacheKeySize = kCacheKeySize + 1;
 
 // A file-specific generator of cache keys, sometimes referred to as the
 // "base" cache key for a file because all the cache keys for various offsets
@@ -139,51 +140,35 @@ class OffsetableCacheKey : private CacheKey {
     return Slice(reinterpret_cast<const char*>(this), kCommonPrefixSize);
   }
 
-  // Returns a copy whose common prefix explicitly encodes LSM level.
-  OffsetableCacheKey WithLevel(int level) const;
 };
 
-// Common-prefix level encoding for transitional routing without external
-// key-prefix->level map lookup.
-//
-// Layout of encoded prefix (MSB -> LSB):
-// [8-bit marker][3-bit level][53-bit payload-from-raw-prefix]
-//
-// Marker makes false positives from old-format prefixes very unlikely.
-constexpr uint64_t kCacheKeyLevelMarker = 0xB6;
 constexpr int kCacheKeyLevelBits = 3;
 constexpr int kMaxEncodedCacheKeyLevel = (1 << kCacheKeyLevelBits) - 1;
-constexpr int kCacheKeyLevelShift = 53;
-constexpr uint64_t kCacheKeyLevelPayloadMask =
-    (static_cast<uint64_t>(1) << kCacheKeyLevelShift) - 1;
 
 inline bool IsCacheKeyLevelEncodable(int level) {
   return level >= 0 && level <= kMaxEncodedCacheKeyLevel;
 }
 
-inline uint64_t EncodeCacheKeyCommonPrefixWithLevel(uint64_t raw_prefix,
-                                                    int level) {
-  if (!IsCacheKeyLevelEncodable(level)) {
-    return raw_prefix;
-  }
-  const uint64_t level_bits =
-      static_cast<uint64_t>(level) & ((static_cast<uint64_t>(1)
-                                       << kCacheKeyLevelBits) -
-                                      1);
-  return (kCacheKeyLevelMarker << 56) |
-         (level_bits << kCacheKeyLevelShift) |
-         (raw_prefix & kCacheKeyLevelPayloadMask);
+// Optional one-byte suffix that carries routing-only level metadata.
+// Layout: [5-bit marker=0b10100][3-bit level]
+constexpr uint8_t kCacheKeyLevelTagMask = 0xF8;
+constexpr uint8_t kCacheKeyLevelTagMarker = 0xA0;
+
+inline uint8_t EncodeCacheKeyLevelTag(int level) {
+  assert(IsCacheKeyLevelEncodable(level));
+  const uint8_t level_bits = static_cast<uint8_t>(
+      static_cast<uint8_t>(level) &
+      ((static_cast<uint8_t>(1) << kCacheKeyLevelBits) - 1));
+  return static_cast<uint8_t>(kCacheKeyLevelTagMarker | level_bits);
 }
 
-inline bool DecodeLevelFromEncodedCacheKeyCommonPrefix(uint64_t encoded_prefix,
-                                                       int* level) {
-  if (((encoded_prefix >> 56) & 0xFF) != kCacheKeyLevelMarker) {
+inline bool DecodeLevelFromCacheKeyLevelTag(uint8_t tag, int* level) {
+  if ((tag & kCacheKeyLevelTagMask) != kCacheKeyLevelTagMarker) {
     return false;
   }
   if (level != nullptr) {
     *level = static_cast<int>(
-        (encoded_prefix >> kCacheKeyLevelShift) &
-        ((static_cast<uint64_t>(1) << kCacheKeyLevelBits) - 1));
+        tag & ((static_cast<uint8_t>(1) << kCacheKeyLevelBits) - 1));
   }
   return true;
 }

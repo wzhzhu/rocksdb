@@ -22,6 +22,7 @@
 #include "block_cache.h"
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
+#include "cache/multi_level_cache.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
 #include "db/pinned_iterators_manager.h"
@@ -722,9 +723,7 @@ void BlockBasedTable::SetupBaseCacheKey(const TableProperties* properties,
   // Minimum block size is 5 bytes; therefore we can trim off two lower bits
   // from offsets. See GetCacheKey.
   *out_base_cache_key = OffsetableCacheKey(db_id, db_session_id, file_num);
-  if (IsCacheKeyLevelEncodable(level)) {
-    *out_base_cache_key = out_base_cache_key->WithLevel(level);
-  }
+  (void)level;
 }
 
 CacheKey BlockBasedTable::GetCacheKey(const OffsetableCacheKey& base_cache_key,
@@ -732,6 +731,26 @@ CacheKey BlockBasedTable::GetCacheKey(const OffsetableCacheKey& base_cache_key,
   // Minimum block size is 5 bytes; therefore we can trim off two lower bits
   // from offet.
   return base_cache_key.WithOffset(handle.offset() >> 2);
+}
+
+Slice BuildExtendedCacheLookupKey(
+    const CacheKey& key_data, int level, bool enable_level_tag,
+    std::array<char, kExtendedCacheKeySize>* extended_key_buf) {
+  const Slice base_key = key_data.AsSlice();
+  if (!enable_level_tag || !IsCacheKeyLevelEncodable(level)) {
+    return base_key;
+  }
+  assert(extended_key_buf != nullptr);
+  std::copy_n(base_key.data(), kCacheKeySize, extended_key_buf->data());
+  (*extended_key_buf)[kCacheKeySize] =
+      static_cast<char>(EncodeCacheKeyLevelTag(level));
+  return Slice(extended_key_buf->data(), kExtendedCacheKeySize);
+}
+
+bool ShouldUseExtendedCacheKey(const BlockBasedTable::Rep* rep) {
+  Cache* block_cache = rep->table_options.block_cache.get();
+  return block_cache != nullptr &&
+         block_cache->CheckedCast<MultiLevelCache>() != nullptr;
 }
 
 Status BlockBasedTable::Open(
@@ -1737,7 +1756,10 @@ Status BlockBasedTable::LookupAndPinBlocksInCache(
 
   // Do the lookup.
   CacheKey key_data = GetCacheKey(rep_->base_cache_key, handle);
-  const Slice key = key_data.AsSlice();
+  const bool use_extended_key = ShouldUseExtendedCacheKey(rep_);
+  std::array<char, kExtendedCacheKeySize> extended_key_buf{};
+  const Slice key = BuildExtendedCacheLookupKey(
+      key_data, rep_->level, use_extended_key, &extended_key_buf);
 
   Statistics* statistics = rep_->ioptions.statistics.get();
 
@@ -1851,11 +1873,14 @@ BlockBasedTable::MaybeReadBlockAndLoadToCache(
   Status s;
   CacheKey key_data;
   Slice key;
+  const bool use_extended_key = ShouldUseExtendedCacheKey(rep_);
+  std::array<char, kExtendedCacheKeySize> extended_key_buf{};
   bool is_cache_hit = false;
   if (block_cache) {
     // create key for block cache
     key_data = GetCacheKey(rep_->base_cache_key, handle);
-    key = key_data.AsSlice();
+    key = BuildExtendedCacheLookupKey(key_data, rep_->level, use_extended_key,
+                                      &extended_key_buf);
 
     if (!contents) {
       if (use_block_cache_for_lookup) {
@@ -2940,8 +2965,11 @@ bool BlockBasedTable::EraseFromCache(const BlockHandle& handle) const {
   }
 
   CacheKey key = GetCacheKey(rep_->base_cache_key, handle);
-
-  Cache::Handle* const cache_handle = cache->Lookup(key.AsSlice());
+  const bool use_extended_key = ShouldUseExtendedCacheKey(rep_);
+  std::array<char, kExtendedCacheKeySize> extended_key_buf{};
+  const Slice routed_key = BuildExtendedCacheLookupKey(
+      key, rep_->level, use_extended_key, &extended_key_buf);
+  Cache::Handle* const cache_handle = cache->Lookup(routed_key);
   if (cache_handle == nullptr) {
     return false;
   }
@@ -2958,8 +2986,11 @@ bool BlockBasedTable::TEST_BlockInCache(const BlockHandle& handle) const {
   }
 
   CacheKey key = GetCacheKey(rep_->base_cache_key, handle);
-
-  Cache::Handle* const cache_handle = cache->Lookup(key.AsSlice());
+  const bool use_extended_key = ShouldUseExtendedCacheKey(rep_);
+  std::array<char, kExtendedCacheKeySize> extended_key_buf{};
+  const Slice routed_key = BuildExtendedCacheLookupKey(
+      key, rep_->level, use_extended_key, &extended_key_buf);
+  Cache::Handle* const cache_handle = cache->Lookup(routed_key);
   if (cache_handle == nullptr) {
     return false;
   }
