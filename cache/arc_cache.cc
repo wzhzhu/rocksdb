@@ -54,7 +54,7 @@ ARCCache::ARCCache(std::shared_ptr<Cache> target, size_t capacity,
                                       bool /*was_hit*/) {
     std::lock_guard<std::mutex> lock(mu_);
     const std::string key_str = SliceToKey(key);
-    pending_erased_keys_.erase(key_str);
+    OnBackingEraseAckLocked(key_str);
     auto it = entries_.find(key_str);
     if (it != entries_.end() && IsResident(it->second.list_type)) {
       RemoveLocked(it->first);
@@ -67,8 +67,44 @@ std::string ARCCache::SliceToKey(const Slice& key) const {
   return std::string(key.data(), key.size());
 }
 
+void ARCCache::AdvanceGenerationLocked(const std::string& key) {
+  KeySyncState& state = key_sync_states_[key];
+  ++state.generation;
+  state.last_touched_at_op = request_counter_;
+  pending_erased_keys_.erase(key);
+  MaybeCleanupKeySyncLocked(key);
+}
+
+void ARCCache::MaybeCleanupKeySyncLocked(const std::string& key) {
+  if (pending_erased_keys_.find(key) != pending_erased_keys_.end()) {
+    return;
+  }
+  if (entries_.find(key) != entries_.end()) {
+    return;
+  }
+  if (pending_state_.find(key) != pending_state_.end()) {
+    return;
+  }
+  auto sync_it = key_sync_states_.find(key);
+  if (sync_it == key_sync_states_.end()) {
+    return;
+  }
+  const KeySyncState& sync = sync_it->second;
+  const bool no_pending_erase = sync.erase_acked >= sync.erase_issued;
+  const bool stale =
+      request_counter_ > sync.last_touched_at_op &&
+      request_counter_ - sync.last_touched_at_op > pending_max_age_ops_;
+  if (no_pending_erase || stale) {
+    key_sync_states_.erase(sync_it);
+  }
+}
+
 void ARCCache::MarkTombstoneLocked(const std::string& key) {
-  pending_erased_keys_[key] = request_counter_;
+  KeySyncState& state = key_sync_states_[key];
+  ++state.erase_issued;
+  state.last_touched_at_op = request_counter_;
+  pending_erased_keys_[key] =
+      TombstoneMeta{request_counter_, state.generation, state.erase_issued};
 }
 
 bool ARCCache::IsTombstonedLocked(const std::string& key) {
@@ -76,25 +112,87 @@ bool ARCCache::IsTombstonedLocked(const std::string& key) {
   if (it == pending_erased_keys_.end()) {
     return false;
   }
-  if (request_counter_ > it->second &&
-      request_counter_ - it->second > pending_max_age_ops_) {
+  if (request_counter_ > it->second.created_at_op &&
+      request_counter_ - it->second.created_at_op > pending_max_age_ops_) {
     pending_erased_keys_.erase(it);
+    MaybeCleanupKeySyncLocked(key);
     return false;
   }
   return true;
+}
+
+void ARCCache::OnBackingEraseAckLocked(const std::string& key) {
+  auto sync_it = key_sync_states_.find(key);
+  if (sync_it == key_sync_states_.end()) {
+    return;
+  }
+  KeySyncState& state = sync_it->second;
+  ++state.erase_acked;
+  state.last_touched_at_op = request_counter_;
+  auto tomb_it = pending_erased_keys_.find(key);
+  if (tomb_it == pending_erased_keys_.end()) {
+    MaybeCleanupKeySyncLocked(key);
+    return;
+  }
+  const TombstoneMeta& tomb = tomb_it->second;
+  if (tomb.generation == state.generation &&
+      state.erase_acked >= tomb.erase_ticket) {
+    pending_erased_keys_.erase(tomb_it);
+    MaybeCleanupKeySyncLocked(key);
+  }
 }
 
 void ARCCache::MaybePruneTombstonesLocked() {
   if ((request_counter_ % kTombstonePruneIntervalOps) != 0) {
     return;
   }
-  for (auto it = pending_erased_keys_.begin(); it != pending_erased_keys_.end();) {
-    if (request_counter_ > it->second &&
-        request_counter_ - it->second > pending_max_age_ops_) {
-      it = pending_erased_keys_.erase(it);
-      continue;
+  if (pending_erased_keys_.empty()) {
+    tombstone_prune_resume_valid_ = false;
+    tombstone_prune_resume_key_.clear();
+    return;
+  }
+  size_t scan_budget =
+      std::min(kTombstonePruneScanBudget, pending_erased_keys_.size());
+  auto it = pending_erased_keys_.begin();
+  if (tombstone_prune_resume_valid_) {
+    auto resume_it = pending_erased_keys_.find(tombstone_prune_resume_key_);
+    if (resume_it != pending_erased_keys_.end()) {
+      it = std::next(resume_it);
+      if (it == pending_erased_keys_.end()) {
+        it = pending_erased_keys_.begin();
+      }
+    }
+  }
+
+  std::vector<std::string> expired_keys;
+  expired_keys.reserve(scan_budget);
+  std::string last_scanned_key;
+  for (size_t scanned = 0; scanned < scan_budget; ++scanned) {
+    if (it == pending_erased_keys_.end()) {
+      it = pending_erased_keys_.begin();
+      if (it == pending_erased_keys_.end()) {
+        break;
+      }
+    }
+    last_scanned_key = it->first;
+    if (request_counter_ > it->second.created_at_op &&
+        request_counter_ - it->second.created_at_op > pending_max_age_ops_) {
+      expired_keys.push_back(it->first);
     }
     ++it;
+  }
+
+  if (!last_scanned_key.empty()) {
+    tombstone_prune_resume_key_ = last_scanned_key;
+    tombstone_prune_resume_valid_ = true;
+  } else {
+    tombstone_prune_resume_valid_ = false;
+    tombstone_prune_resume_key_.clear();
+  }
+
+  for (const auto& key : expired_keys) {
+    pending_erased_keys_.erase(key);
+    MaybeCleanupKeySyncLocked(key);
   }
 }
 
@@ -283,7 +381,7 @@ Status ARCCache::Insert(const Slice& key, ObjectPtr value,
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
     MaybePruneTombstonesLocked();
-    pending_erased_keys_.erase(key_str);
+    AdvanceGenerationLocked(key_str);
     if (capacity_ == 0) {
       pending_state_.erase(key_str);
       MarkTombstoneLocked(key_str);
@@ -373,6 +471,7 @@ Cache::Handle* ARCCache::Lookup(const Slice& key, const CacheItemHelper* helper,
   {
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
+    ++wrapper_lookup_count_;
     MaybePruneTombstonesLocked();
     if (handle != nullptr) {
       tombstoned_hit = IsTombstonedLocked(key_str);
@@ -386,6 +485,7 @@ Cache::Handle* ARCCache::Lookup(const Slice& key, const CacheItemHelper* helper,
           MoveLocked(key_str, ListType::kT2, it->second.charge);
         }
         pending_state_.erase(key_str);
+        ++wrapper_hit_count_;
         return handle;
       }
       ++tombstone_lookup_dropped_count_;
@@ -453,6 +553,11 @@ size_t ARCCache::GetCapacity() const {
 std::string ARCCache::GetPrintableOptions() const {
   std::lock_guard<std::mutex> lock(mu_);
   std::ostringstream oss;
+  const double wrapper_hit_ratio =
+      wrapper_lookup_count_ > 0
+          ? static_cast<double>(wrapper_hit_count_) /
+                static_cast<double>(wrapper_lookup_count_)
+          : 0.0;
   oss << "arc.capacity=" << capacity_ << "\n";
   oss << "arc.target_t1=" << target_t1_ << "\n";
   oss << "arc.t1_usage=" << usage_t1_ << "\n";
@@ -465,7 +570,10 @@ std::string ARCCache::GetPrintableOptions() const {
       << desync_backing_miss_reconciled_count_ << "\n";
   oss << "arc.tombstone_lookup_dropped=" << tombstone_lookup_dropped_count_
       << "\n";
-  oss << "arc.tombstone_size=" << pending_erased_keys_.size();
+  oss << "arc.tombstone_size=" << pending_erased_keys_.size() << "\n";
+  oss << "arc.wrapper_lookups=" << wrapper_lookup_count_ << "\n";
+  oss << "arc.wrapper_hits=" << wrapper_hit_count_ << "\n";
+  oss << "arc.wrapper_hit_ratio=" << wrapper_hit_ratio;
   return oss.str();
 }
 

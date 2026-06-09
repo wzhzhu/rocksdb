@@ -161,7 +161,7 @@ CacheusCache::CacheusCache(std::shared_ptr<Cache> target, size_t capacity,
                                       bool /*was_hit*/) {
     std::lock_guard<std::mutex> lock(mu_);
     const std::string key_str = SliceToKey(key);
-    pending_erased_keys_.erase(key_str);
+    OnBackingEraseAckLocked(key_str);
     auto it = entries_.find(key_str);
     if (it == entries_.end()) {
       return false;
@@ -183,8 +183,44 @@ std::string CacheusCache::SliceToKey(const Slice& key) const {
   return std::string(key.data(), key.size());
 }
 
+void CacheusCache::AdvanceGenerationLocked(const std::string& key) {
+  KeySyncState& state = key_sync_states_[key];
+  ++state.generation;
+  state.last_touched_at_op = request_counter_;
+  pending_erased_keys_.erase(key);
+  MaybeCleanupKeySyncLocked(key);
+}
+
+void CacheusCache::MaybeCleanupKeySyncLocked(const std::string& key) {
+  if (pending_erased_keys_.find(key) != pending_erased_keys_.end()) {
+    return;
+  }
+  if (entries_.find(key) != entries_.end()) {
+    return;
+  }
+  if (pending_insert_meta_.find(key) != pending_insert_meta_.end()) {
+    return;
+  }
+  auto sync_it = key_sync_states_.find(key);
+  if (sync_it == key_sync_states_.end()) {
+    return;
+  }
+  const KeySyncState& sync = sync_it->second;
+  const bool no_pending_erase = sync.erase_acked >= sync.erase_issued;
+  const bool stale =
+      request_counter_ > sync.last_touched_at_op &&
+      request_counter_ - sync.last_touched_at_op > pending_max_age_ops_;
+  if (no_pending_erase || stale) {
+    key_sync_states_.erase(sync_it);
+  }
+}
+
 void CacheusCache::MarkTombstoneLocked(const std::string& key) {
-  pending_erased_keys_[key] = request_counter_;
+  KeySyncState& state = key_sync_states_[key];
+  ++state.erase_issued;
+  state.last_touched_at_op = request_counter_;
+  pending_erased_keys_[key] =
+      TombstoneMeta{request_counter_, state.generation, state.erase_issued};
 }
 
 bool CacheusCache::IsTombstonedLocked(const std::string& key) {
@@ -192,25 +228,87 @@ bool CacheusCache::IsTombstonedLocked(const std::string& key) {
   if (it == pending_erased_keys_.end()) {
     return false;
   }
-  if (request_counter_ > it->second &&
-      request_counter_ - it->second > pending_max_age_ops_) {
+  if (request_counter_ > it->second.created_at_op &&
+      request_counter_ - it->second.created_at_op > pending_max_age_ops_) {
     pending_erased_keys_.erase(it);
+    MaybeCleanupKeySyncLocked(key);
     return false;
   }
   return true;
+}
+
+void CacheusCache::OnBackingEraseAckLocked(const std::string& key) {
+  auto sync_it = key_sync_states_.find(key);
+  if (sync_it == key_sync_states_.end()) {
+    return;
+  }
+  KeySyncState& state = sync_it->second;
+  ++state.erase_acked;
+  state.last_touched_at_op = request_counter_;
+  auto tomb_it = pending_erased_keys_.find(key);
+  if (tomb_it == pending_erased_keys_.end()) {
+    MaybeCleanupKeySyncLocked(key);
+    return;
+  }
+  const TombstoneMeta& tomb = tomb_it->second;
+  if (tomb.generation == state.generation &&
+      state.erase_acked >= tomb.erase_ticket) {
+    pending_erased_keys_.erase(tomb_it);
+    MaybeCleanupKeySyncLocked(key);
+  }
 }
 
 void CacheusCache::MaybePruneTombstonesLocked() {
   if ((request_counter_ % kTombstonePruneIntervalOps) != 0) {
     return;
   }
-  for (auto it = pending_erased_keys_.begin(); it != pending_erased_keys_.end();) {
-    if (request_counter_ > it->second &&
-        request_counter_ - it->second > pending_max_age_ops_) {
-      it = pending_erased_keys_.erase(it);
-      continue;
+  if (pending_erased_keys_.empty()) {
+    tombstone_prune_resume_valid_ = false;
+    tombstone_prune_resume_key_.clear();
+    return;
+  }
+  size_t scan_budget =
+      std::min(kTombstonePruneScanBudget, pending_erased_keys_.size());
+  auto it = pending_erased_keys_.begin();
+  if (tombstone_prune_resume_valid_) {
+    auto resume_it = pending_erased_keys_.find(tombstone_prune_resume_key_);
+    if (resume_it != pending_erased_keys_.end()) {
+      it = std::next(resume_it);
+      if (it == pending_erased_keys_.end()) {
+        it = pending_erased_keys_.begin();
+      }
+    }
+  }
+
+  std::vector<std::string> expired_keys;
+  expired_keys.reserve(scan_budget);
+  std::string last_scanned_key;
+  for (size_t scanned = 0; scanned < scan_budget; ++scanned) {
+    if (it == pending_erased_keys_.end()) {
+      it = pending_erased_keys_.begin();
+      if (it == pending_erased_keys_.end()) {
+        break;
+      }
+    }
+    last_scanned_key = it->first;
+    if (request_counter_ > it->second.created_at_op &&
+        request_counter_ - it->second.created_at_op > pending_max_age_ops_) {
+      expired_keys.push_back(it->first);
     }
     ++it;
+  }
+
+  if (!last_scanned_key.empty()) {
+    tombstone_prune_resume_key_ = last_scanned_key;
+    tombstone_prune_resume_valid_ = true;
+  } else {
+    tombstone_prune_resume_valid_ = false;
+    tombstone_prune_resume_key_.clear();
+  }
+
+  for (const auto& key : expired_keys) {
+    pending_erased_keys_.erase(key);
+    MaybeCleanupKeySyncLocked(key);
   }
 }
 
@@ -657,7 +755,7 @@ Status CacheusCache::Insert(const Slice& key, ObjectPtr value,
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
     MaybePruneTombstonesLocked();
-    pending_erased_keys_.erase(key_str);
+    AdvanceGenerationLocked(key_str);
     ResetStepTraceLocked();
     ++time_;
     UpdateLearningRateLocked();
@@ -750,9 +848,11 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
   const std::string key_str = SliceToKey(key);
   Handle* handle = target_->Lookup(key, helper, create_context, priority, stats);
   bool tombstoned_hit = false;
+  bool request_counted = false;
   if (handle != nullptr) {
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
+    request_counted = true;
     MaybePruneTombstonesLocked();
     tombstoned_hit = IsTombstonedLocked(key_str);
     if (tombstoned_hit) {
@@ -766,7 +866,9 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
       handle = nullptr;
     }
     std::lock_guard<std::mutex> lock(mu_);
-    ++request_counter_;
+    if (!request_counted) {
+      ++request_counter_;
+    }
     MaybePruneTombstonesLocked();
     ++total_miss_count_;
     auto live_it = entries_.find(key_str);
@@ -821,7 +923,9 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
   std::vector<std::string> evicted_keys;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    ++request_counter_;
+    if (!request_counted) {
+      ++request_counter_;
+    }
     MaybePruneTombstonesLocked();
     ++total_hit_count_;
     ResetStepTraceLocked();
@@ -893,6 +997,12 @@ size_t CacheusCache::GetCapacity() const {
 std::string CacheusCache::GetPrintableOptions() const {
   std::lock_guard<std::mutex> lock(mu_);
   std::ostringstream oss;
+  const uint64_t wrapper_lookups = total_hit_count_ + total_miss_count_;
+  const double wrapper_hit_ratio =
+      wrapper_lookups > 0
+          ? static_cast<double>(total_hit_count_) /
+                static_cast<double>(wrapper_lookups)
+          : 0.0;
   oss << std::fixed << std::setprecision(6);
   oss << "cacheus.w_lru=" << weight_lru_ << "\n";
   oss << "cacheus.w_lfu=" << weight_lfu_ << "\n";
@@ -922,7 +1032,10 @@ std::string CacheusCache::GetPrintableOptions() const {
   oss << "cacheus.lfu_hist_hits=" << lfu_hist_hit_count_ << "\n";
   oss << "cacheus.evict_lru_count=" << evict_lru_count_ << "\n";
   oss << "cacheus.evict_lfu_count=" << evict_lfu_count_ << "\n";
-  oss << "cacheus.evict_tie_count=" << evict_tie_count_;
+  oss << "cacheus.evict_tie_count=" << evict_tie_count_ << "\n";
+  oss << "cacheus.wrapper_lookups=" << wrapper_lookups << "\n";
+  oss << "cacheus.wrapper_hits=" << total_hit_count_ << "\n";
+  oss << "cacheus.wrapper_hit_ratio=" << wrapper_hit_ratio;
   return oss.str();
 }
 

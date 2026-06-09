@@ -59,6 +59,19 @@ class ARCCache : public CacheWrapper {
     uint64_t observed_at_op = 0;
   };
 
+  struct TombstoneMeta {
+    uint64_t created_at_op = 0;
+    uint64_t generation = 0;
+    uint64_t erase_ticket = 0;
+  };
+
+  struct KeySyncState {
+    uint64_t generation = 0;
+    uint64_t erase_issued = 0;
+    uint64_t erase_acked = 0;
+    uint64_t last_touched_at_op = 0;
+  };
+
   std::string SliceToKey(const Slice& key) const;
   void ReplaceLocked(bool in_b2, std::vector<std::string>* evicted_keys);
   void MoveLocked(const std::string& key, ListType dst, size_t new_charge);
@@ -68,8 +81,11 @@ class ARCCache : public CacheWrapper {
                        size_t* usage, size_t target_limit);
   void AdjustTargetLocked(bool hit_b1);
   void EnsureResidentLimitLocked(std::vector<std::string>* evicted_keys);
+  void AdvanceGenerationLocked(const std::string& key);
+  void MaybeCleanupKeySyncLocked(const std::string& key);
   void MarkTombstoneLocked(const std::string& key);
   bool IsTombstonedLocked(const std::string& key);
+  void OnBackingEraseAckLocked(const std::string& key);
   void MaybePruneTombstonesLocked();
   bool IsResident(ListType type) const;
 
@@ -87,12 +103,18 @@ class ARCCache : public CacheWrapper {
   std::list<std::string> b2_;
   std::unordered_map<std::string, EntryMeta> entries_;
   std::unordered_map<std::string, PendingState> pending_state_;
-  std::unordered_map<std::string, uint64_t> pending_erased_keys_;
+  std::unordered_map<std::string, TombstoneMeta> pending_erased_keys_;
+  std::unordered_map<std::string, KeySyncState> key_sync_states_;
   uint64_t desync_backing_miss_reconciled_count_ = 0;
   uint64_t tombstone_lookup_dropped_count_ = 0;
+  uint64_t wrapper_lookup_count_ = 0;
+  uint64_t wrapper_hit_count_ = 0;
   uint64_t request_counter_ = 0;
   uint64_t pending_max_age_ops_ = 65536;
-  static constexpr uint64_t kTombstonePruneIntervalOps = 1024;
+  std::string tombstone_prune_resume_key_;
+  bool tombstone_prune_resume_valid_ = false;
+  static constexpr uint64_t kTombstonePruneIntervalOps = 8192;
+  static constexpr size_t kTombstonePruneScanBudget = 64;
 };
 
 std::shared_ptr<Cache> NewARCCache(const LRUCacheOptions& options);

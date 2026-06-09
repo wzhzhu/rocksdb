@@ -111,6 +111,19 @@ class CacheusCache : public CacheWrapper {
     uint64_t observed_at_op = 0;
   };
 
+  struct TombstoneMeta {
+    uint64_t created_at_op = 0;
+    uint64_t generation = 0;
+    uint64_t erase_ticket = 0;
+  };
+
+  struct KeySyncState {
+    uint64_t generation = 0;
+    uint64_t erase_issued = 0;
+    uint64_t erase_acked = 0;
+    uint64_t last_touched_at_op = 0;
+  };
+
   struct LfuNodeComp {
     bool operator()(const LfuNode& a, const LfuNode& b) const {
       if (a.freq != b.freq) {
@@ -149,8 +162,11 @@ class CacheusCache : public CacheWrapper {
   void RemoveFromQueuesLocked(const std::string& key, const EntryMeta& meta);
   void UpdateLfuLocked(const std::string& key, const EntryMeta& meta);
   PendingInsertMeta ConsumePendingInsertMetaLocked(const std::string& key);
+  void AdvanceGenerationLocked(const std::string& key);
+  void MaybeCleanupKeySyncLocked(const std::string& key);
   void MarkTombstoneLocked(const std::string& key);
   bool IsTombstonedLocked(const std::string& key);
+  void OnBackingEraseAckLocked(const std::string& key);
   void MaybePruneTombstonesLocked();
   double RandomUnitLocked();
   std::string SliceToKey(const Slice& key) const;
@@ -206,10 +222,14 @@ class CacheusCache : public CacheWrapper {
   std::unordered_map<std::string, HistListIt> lru_hist_pos_;
   std::unordered_map<std::string, HistListIt> lfu_hist_pos_;
   std::unordered_map<std::string, PendingInsertMeta> pending_insert_meta_;
-  std::unordered_map<std::string, uint64_t> pending_erased_keys_;
+  std::unordered_map<std::string, TombstoneMeta> pending_erased_keys_;
+  std::unordered_map<std::string, KeySyncState> key_sync_states_;
   uint64_t request_counter_ = 0;
   uint64_t pending_max_age_ops_ = 65536;
-  static constexpr uint64_t kTombstonePruneIntervalOps = 1024;
+  std::string tombstone_prune_resume_key_;
+  bool tombstone_prune_resume_valid_ = false;
+  static constexpr uint64_t kTombstonePruneIntervalOps = 8192;
+  static constexpr size_t kTombstonePruneScanBudget = 64;
 
   uint32_t mt_state_[624];
   int mt_index_ = 625;
