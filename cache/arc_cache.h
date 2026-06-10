@@ -73,13 +73,18 @@ class ARCCache : public CacheWrapper {
   };
 
   std::string SliceToKey(const Slice& key) const;
-  void ReplaceLocked(bool in_b2, std::vector<std::string>* evicted_keys);
+  // Evicts one resident entry (T1 -> B1 or T2 -> B2). Returns false when both
+  // resident lists are empty (no progress possible).
+  bool ReplaceLocked(bool in_b2, std::vector<std::string>* evicted_keys);
+  // Evicts resident entries only while the incoming charge does not fit.
+  void MakeRoomLocked(size_t incoming_charge, bool in_b2,
+                      std::vector<std::string>* evicted_keys);
   void MoveLocked(const std::string& key, ListType dst, size_t new_charge);
   void RemoveLocked(const std::string& key);
   void InsertToListFrontLocked(const std::string& key, ListType dst, size_t charge);
   void TrimGhostLocked(std::list<std::string>* list, ListType list_type,
                        size_t* usage, size_t target_limit);
-  void AdjustTargetLocked(bool hit_b1);
+  void AdjustTargetLocked(bool hit_b1, size_t charge);
   void EnsureResidentLimitLocked(std::vector<std::string>* evicted_keys);
   void AdvanceGenerationLocked(const std::string& key);
   void MaybeCleanupKeySyncLocked(const std::string& key);

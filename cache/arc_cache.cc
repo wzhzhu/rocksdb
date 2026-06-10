@@ -362,51 +362,79 @@ void ARCCache::TrimGhostLocked(std::list<std::string>* list, ListType list_type,
   }
 }
 
-void ARCCache::AdjustTargetLocked(bool hit_b1) {
+void ARCCache::AdjustTargetLocked(bool hit_b1, size_t charge) {
   if (capacity_ == 0) {
     target_t1_ = 0;
     return;
   }
+  // Classic ARC adapts by one *entry* per ghost hit. With byte-based charges
+  // the step must be scaled by the hit entry's charge, otherwise the target
+  // moves by single bytes and is effectively frozen.
+  const size_t step = std::max<size_t>(1, charge);
   if (hit_b1) {
+    const size_t ratio =
+        usage_b1_ == 0 ? 1 : std::max<size_t>(1, usage_b2_ / usage_b1_);
     const size_t delta =
-        std::max<size_t>(1, usage_b1_ == 0 ? 1 : (usage_b2_ / usage_b1_));
+        (ratio > 1 && step > capacity_ / ratio) ? capacity_ : step * ratio;
     target_t1_ = std::min(capacity_, target_t1_ + delta);
   } else {
+    const size_t ratio =
+        usage_b2_ == 0 ? 1 : std::max<size_t>(1, usage_b1_ / usage_b2_);
     const size_t delta =
-        std::max<size_t>(1, usage_b2_ == 0 ? 1 : (usage_b1_ / usage_b2_));
+        (ratio > 1 && step > capacity_ / ratio) ? capacity_ : step * ratio;
     target_t1_ = (target_t1_ > delta) ? (target_t1_ - delta) : 0;
   }
 }
 
-void ARCCache::ReplaceLocked(bool in_b2, std::vector<std::string>* evicted_keys) {
-  if (!t1_.empty() &&
-      (usage_t1_ > target_t1_ || (in_b2 && usage_t1_ == target_t1_))) {
+bool ARCCache::ReplaceLocked(bool in_b2, std::vector<std::string>* evicted_keys) {
+  const bool prefer_t1 =
+      !t1_.empty() && (t2_.empty() || usage_t1_ > target_t1_ ||
+                       (in_b2 && usage_t1_ == target_t1_));
+  if (prefer_t1) {
     const std::string victim = t1_.back();
     auto it = entries_.find(victim);
     if (it == entries_.end()) {
       t1_.pop_back();
-      return;
+      return true;
     }
     const size_t charge = it->second.charge;
     MoveLocked(victim, ListType::kB1, charge);
     evicted_keys->push_back(victim);
-  } else if (!t2_.empty()) {
+    return true;
+  }
+  if (!t2_.empty()) {
     const std::string victim = t2_.back();
     auto it = entries_.find(victim);
     if (it == entries_.end()) {
       t2_.pop_back();
-      return;
+      return true;
     }
     const size_t charge = it->second.charge;
     MoveLocked(victim, ListType::kB2, charge);
     evicted_keys->push_back(victim);
+    return true;
+  }
+  return false;
+}
+
+void ARCCache::MakeRoomLocked(size_t incoming_charge, bool in_b2,
+                              std::vector<std::string>* evicted_keys) {
+  // Demand-driven eviction: classic ARC calls REPLACE unconditionally because
+  // the (entry-based) cache is always full at steady state. With byte-based
+  // charges and a wrapper whose residents can shrink out-of-band (backing
+  // eviction callback, erases, desync reconciliation), unconditional REPLACE
+  // permanently under-utilizes capacity. Only evict while the incoming entry
+  // does not fit.
+  while (usage_t1_ + usage_t2_ + incoming_charge > capacity_) {
+    if (!ReplaceLocked(in_b2, evicted_keys)) {
+      break;
+    }
   }
 }
 
 void ARCCache::EnsureResidentLimitLocked(std::vector<std::string>* evicted_keys) {
   while (usage_t1_ + usage_t2_ > capacity_) {
-    ReplaceLocked(false, evicted_keys);
-    if (t1_.empty() && t2_.empty()) {
+    if (!ReplaceLocked(false, evicted_keys)) {
       break;
     }
   }
@@ -456,45 +484,42 @@ Status ARCCache::Insert(const Slice& key, ObjectPtr value,
       auto it = entries_.find(key_str);
       if (it != entries_.end()) {
         if (it->second.list_type == ListType::kB1) {
-          AdjustTargetLocked(true);
-          ReplaceLocked(false, &evicted_keys);
+          AdjustTargetLocked(true, charge);
+          MakeRoomLocked(charge, false, &evicted_keys);
           MoveLocked(key_str, ListType::kT2, charge);
         } else if (it->second.list_type == ListType::kB2) {
-          AdjustTargetLocked(false);
-          ReplaceLocked(true, &evicted_keys);
+          AdjustTargetLocked(false, charge);
+          MakeRoomLocked(charge, true, &evicted_keys);
           MoveLocked(key_str, ListType::kT2, charge);
         } else {
           MoveLocked(key_str, ListType::kT2, charge);
         }
       } else {
         if (pending.hit_b1) {
-          AdjustTargetLocked(true);
-          ReplaceLocked(false, &evicted_keys);
+          AdjustTargetLocked(true, charge);
+          MakeRoomLocked(charge, false, &evicted_keys);
           InsertToListFrontLocked(key_str, ListType::kT2, charge);
         } else if (pending.hit_b2) {
-          AdjustTargetLocked(false);
-          ReplaceLocked(true, &evicted_keys);
+          AdjustTargetLocked(false, charge);
+          MakeRoomLocked(charge, true, &evicted_keys);
           InsertToListFrontLocked(key_str, ListType::kT2, charge);
         } else {
-          if (usage_t1_ + usage_b1_ >= capacity_) {
-            if (usage_t1_ < capacity_) {
-              TrimGhostLocked(&b1_, ListType::kB1, &usage_b1_, capacity_ - 1);
-              ReplaceLocked(false, &evicted_keys);
-            } else if (!t1_.empty()) {
-              const std::string victim = t1_.back();
-              RemoveLocked(victim);
-              MarkTombstoneLocked(victim);
-              evicted_keys.push_back(victim);
-            }
-          } else if (usage_t1_ + usage_b1_ < capacity_) {
-            const size_t total = usage_t1_ + usage_t2_ + usage_b1_ + usage_b2_;
-            if (total >= capacity_) {
-              if (total >= 2 * capacity_) {
-                TrimGhostLocked(&b2_, ListType::kB2, &usage_b2_, capacity_ - 1);
-              }
-              ReplaceLocked(false, &evicted_keys);
-            }
+          // Brand-new key: maintain ARC history invariants in byte terms
+          // (|T1| + |B1| <= c and total <= 2c) before admitting into T1.
+          if (usage_t1_ + usage_b1_ + charge > capacity_ && usage_b1_ > 0) {
+            const size_t b1_budget =
+                capacity_ > usage_t1_ + charge ? capacity_ - usage_t1_ - charge
+                                               : 0;
+            TrimGhostLocked(&b1_, ListType::kB1, &usage_b1_, b1_budget);
           }
+          const size_t non_b2 = usage_t1_ + usage_t2_ + usage_b1_;
+          if (non_b2 + usage_b2_ + charge > 2 * capacity_ && usage_b2_ > 0) {
+            const size_t b2_budget = 2 * capacity_ > non_b2 + charge
+                                         ? 2 * capacity_ - non_b2 - charge
+                                         : 0;
+            TrimGhostLocked(&b2_, ListType::kB2, &usage_b2_, b2_budget);
+          }
+          MakeRoomLocked(charge, false, &evicted_keys);
           InsertToListFrontLocked(key_str, ListType::kT1, charge);
         }
       }
@@ -517,6 +542,8 @@ Cache::Handle* ARCCache::Lookup(const Slice& key, const CacheItemHelper* helper,
   const std::string key_str = SliceToKey(key);
   Handle* handle = target_->Lookup(key, helper, create_context, priority, stats);
   bool tombstoned_hit = false;
+  bool wrapper_hit = false;
+  std::vector<std::string> evicted_keys;
   {
     std::lock_guard<std::mutex> lock(mu_);
     ++request_counter_;
@@ -525,39 +552,58 @@ Cache::Handle* ARCCache::Lookup(const Slice& key, const CacheItemHelper* helper,
     if (handle != nullptr) {
       tombstoned_hit = IsTombstonedLocked(key_str);
       if (!tombstoned_hit) {
+        const size_t charge = target_->GetCharge(handle);
         auto it = entries_.find(key_str);
         if (it == entries_.end()) {
-          InsertToListFrontLocked(key_str, ListType::kT2,
-                                  target_->GetCharge(handle));
-        } else if (it->second.list_type == ListType::kT1 ||
-                   it->second.list_type == ListType::kT2) {
+          // Backing hit unknown to the wrapper (e.g. metadata pruned):
+          // re-admit as a frequency hit, respecting the resident limit.
+          MakeRoomLocked(charge, false, &evicted_keys);
+          InsertToListFrontLocked(key_str, ListType::kT2, charge);
+        } else if (IsResident(it->second.list_type)) {
           MoveLocked(key_str, ListType::kT2, it->second.charge);
+        } else {
+          // Ghost entry but still resident in backing (desync): treat as a
+          // ghost hit and promote back to T2.
+          const bool hit_b1 = (it->second.list_type == ListType::kB1);
+          AdjustTargetLocked(hit_b1, charge);
+          MakeRoomLocked(charge, !hit_b1, &evicted_keys);
+          MoveLocked(key_str, ListType::kT2, charge);
         }
         pending_state_.erase(key_str);
         ++wrapper_hit_count_;
-        return handle;
-      }
-      ++tombstone_lookup_dropped_count_;
-    }
-    PendingState pending;
-    auto it = entries_.find(key_str);
-    if (it != entries_.end()) {
-      if (IsResident(it->second.list_type)) {
-        RemoveLocked(key_str);
-        ++desync_backing_miss_reconciled_count_;
+        wrapper_hit = true;
       } else {
-        pending.hit_b1 = (it->second.list_type == ListType::kB1);
-        pending.hit_b2 = (it->second.list_type == ListType::kB2);
+        ++tombstone_lookup_dropped_count_;
       }
     }
-    pending.observed_at_op = request_counter_;
-    pending_state_[key_str] = pending;
+    if (!wrapper_hit) {
+      PendingState pending;
+      auto it = entries_.find(key_str);
+      if (it != entries_.end()) {
+        if (IsResident(it->second.list_type)) {
+          RemoveLocked(key_str);
+          ++desync_backing_miss_reconciled_count_;
+        } else {
+          pending.hit_b1 = (it->second.list_type == ListType::kB1);
+          pending.hit_b2 = (it->second.list_type == ListType::kB2);
+        }
+      }
+      pending.observed_at_op = request_counter_;
+      pending_state_[key_str] = pending;
+    }
+    for (const std::string& evicted : evicted_keys) {
+      MarkTombstoneLocked(evicted);
+    }
+  }
+  for (const std::string& evicted_key : evicted_keys) {
+    target_->Erase(Slice(evicted_key));
   }
   if (tombstoned_hit) {
     target_->Release(handle);
     target_->Erase(key);
+    return nullptr;
   }
-  return nullptr;
+  return wrapper_hit ? handle : nullptr;
 }
 
 void ARCCache::Erase(const Slice& key) {
