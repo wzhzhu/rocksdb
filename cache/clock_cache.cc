@@ -93,6 +93,11 @@ inline void FreeDataMarkEmpty(ClockHandle& h, MemoryAllocator* allocator) {
 // Called to undo the effect of referencing an entry for internal purposes,
 // so it should not be marked as having been used.
 inline void Unref(const ClockHandle& h, uint32_t count = 1) {
+  // Some insertion paths (e.g., probation-style countdown=0) may ask to
+  // "undo" zero temporary refs. This should be a no-op.
+  if (count == 0) {
+    return;
+  }
   // Pretend we never took the reference
   // WART: there's a tiny chance we release last ref to invisible
   // entry here. If that happens, we let eviction take care of it.
