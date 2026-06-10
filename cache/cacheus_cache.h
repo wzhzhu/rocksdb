@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/wrapper_cache_shard.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/cache.h"
 
@@ -27,7 +28,7 @@ struct CacheusTuningOptions {
 // Cacheus cache skeleton.
 // Current implementation wraps an internal cache instance so integration
 // points can be validated before replacing with full Cacheus logic.
-class CacheusCache : public CacheWrapper {
+class CacheusCache : public CacheWrapper, public WrapperCacheShard {
  public:
   struct DebugSnapshot {
     double w_lru = 0.0;
@@ -51,11 +52,20 @@ class CacheusCache : public CacheWrapper {
 
   static const char* kClassName() { return "CacheusCache"; }
 
+  // When `manage_backing` is true (standalone mode), this instance installs
+  // the backing eviction callback and propagates SetCapacity to the backing
+  // cache. Pass false when multiple Cacheus shards share one backing cache
+  // and an outer router (ShardedWrapperCache) owns both responsibilities.
   CacheusCache(std::shared_ptr<Cache> target, size_t capacity,
-               const CacheusTuningOptions& tuning_options);
+               const CacheusTuningOptions& tuning_options,
+               bool manage_backing = true);
 
   const char* Name() const override { return kClassName(); }
   std::string GetPrintableOptions() const override;
+
+  // WrapperCacheShard
+  void GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const override;
+  void HandleBackingEviction(const Slice& key) override;
 
   Status Insert(const Slice& key, ObjectPtr value, const CacheItemHelper* helper,
                 size_t charge, Handle** handle = nullptr,
@@ -227,6 +237,7 @@ class CacheusCache : public CacheWrapper {
   std::unordered_map<std::string, KeySyncState> key_sync_states_;
   uint64_t request_counter_ = 0;
   uint64_t pending_max_age_ops_ = 65536;
+  bool manage_backing_ = true;
   std::string tombstone_prune_resume_key_;
   bool tombstone_prune_resume_valid_ = false;
   std::string pending_insert_prune_resume_key_;

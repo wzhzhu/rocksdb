@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <limits>
 #include <sstream>
+#include <vector>
 
 #include "cache/clock_cache.h"
+#include "cache/sharded_wrapper_cache.h"
 namespace ROCKSDB_NAMESPACE {
 namespace {
 
@@ -47,20 +49,35 @@ std::shared_ptr<Cache> BuildBackingCache(const LRUCacheOptions& options) {
 }  // namespace
 
 ARCCache::ARCCache(std::shared_ptr<Cache> target, size_t capacity,
-                   const ARCTuningOptions& tuning_options)
-    : CacheWrapper(std::move(target)), capacity_(capacity), target_t1_(0) {
+                   const ARCTuningOptions& tuning_options, bool manage_backing)
+    : CacheWrapper(std::move(target)),
+      capacity_(capacity),
+      target_t1_(0),
+      manage_backing_(manage_backing) {
   pending_max_age_ops_ = std::max<uint64_t>(1, tuning_options.pending_max_age_ops);
-  target_->SetEvictionCallback([this](const Slice& key, Handle* /*h*/,
-                                      bool /*was_hit*/) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const std::string key_str = SliceToKey(key);
-    OnBackingEraseAckLocked(key_str);
-    auto it = entries_.find(key_str);
-    if (it != entries_.end() && IsResident(it->second.list_type)) {
-      RemoveLocked(it->first);
-    }
-    return false;
-  });
+  if (manage_backing_) {
+    target_->SetEvictionCallback([this](const Slice& key, Handle* /*h*/,
+                                        bool /*was_hit*/) {
+      HandleBackingEviction(key);
+      return false;
+    });
+  }
+}
+
+void ARCCache::HandleBackingEviction(const Slice& key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  const std::string key_str = SliceToKey(key);
+  OnBackingEraseAckLocked(key_str);
+  auto it = entries_.find(key_str);
+  if (it != entries_.end() && IsResident(it->second.list_type)) {
+    RemoveLocked(it->first);
+  }
+}
+
+void ARCCache::GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  *lookups = wrapper_lookup_count_;
+  *hits = wrapper_hit_count_;
 }
 
 std::string ARCCache::SliceToKey(const Slice& key) const {
@@ -637,7 +654,9 @@ void ARCCache::SetCapacity(size_t capacity) {
   for (const std::string& evicted_key : evicted_keys) {
     target_->Erase(Slice(evicted_key));
   }
-  target_->SetCapacity(ComputeBackingCapacity(capacity));
+  if (manage_backing_) {
+    target_->SetCapacity(ComputeBackingCapacity(capacity));
+  }
 }
 
 size_t ARCCache::GetCapacity() const {
@@ -678,8 +697,36 @@ std::shared_ptr<Cache> NewARCCache(const LRUCacheOptions& options) {
 
 std::shared_ptr<Cache> NewARCCache(const LRUCacheOptions& options,
                                    const ARCTuningOptions& tuning_options) {
-  return std::make_shared<ARCCache>(BuildBackingCache(options), options.capacity,
-                                    tuning_options);
+  if (options.num_shard_bits <= 0) {
+    // Single wrapper instance (historical behavior). num_shard_bits < 0 lets
+    // the backing cache auto-shard but keeps one ARC policy instance.
+    return std::make_shared<ARCCache>(BuildBackingCache(options),
+                                      options.capacity, tuning_options);
+  }
+  // Sharded wrapper mode: 2^k ARC policy shards routed by key hash, all
+  // sharing one natively sharded backing cache.
+  const int shard_bits = std::min(options.num_shard_bits, 20);
+  const size_t num_shards = size_t{1} << shard_bits;
+  std::shared_ptr<Cache> backing = BuildBackingCache(options);
+  const size_t per_shard_capacity =
+      (options.capacity + num_shards - 1) / num_shards;
+  std::vector<std::shared_ptr<Cache>> shards;
+  std::vector<WrapperCacheShard*> policies;
+  shards.reserve(num_shards);
+  policies.reserve(num_shards);
+  for (size_t i = 0; i < num_shards; ++i) {
+    auto shard = std::make_shared<ARCCache>(backing, per_shard_capacity,
+                                            tuning_options,
+                                            /*manage_backing=*/false);
+    policies.push_back(shard.get());
+    shards.push_back(std::move(shard));
+  }
+  const uint32_t routing_seed =
+      options.hash_seed >= 0 ? static_cast<uint32_t>(options.hash_seed) : 0u;
+  return std::make_shared<ShardedWrapperCache>(
+      std::move(backing), std::move(shards), std::move(policies), "arc",
+      routing_seed,
+      [](size_t logical) { return ComputeBackingCapacity(logical); });
 }
 
 std::shared_ptr<Cache> NewARCCache(size_t capacity, int num_shard_bits) {

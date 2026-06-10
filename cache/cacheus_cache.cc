@@ -5,9 +5,11 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <vector>
 
 #include "cache/clock_cache.h"
 #include "cache/lru_cache.h"
+#include "cache/sharded_wrapper_cache.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -128,9 +130,11 @@ std::shared_ptr<Cache> BuildBackingCache(const LRUCacheOptions& options) {
 }  // namespace
 
 CacheusCache::CacheusCache(std::shared_ptr<Cache> target, size_t capacity,
-                           const CacheusTuningOptions& tuning_options)
+                           const CacheusTuningOptions& tuning_options,
+                           bool manage_backing)
     : CacheWrapper(std::move(target)),
-      capacity_(capacity) {
+      capacity_(capacity),
+      manage_backing_(manage_backing) {
   entry_charge_equivalent_ = tuning_options.entry_charge_equivalent;
   const uint32_t seed = static_cast<uint32_t>(tuning_options.rng_seed);
   NumpyInitByArray(&seed, 1, mt_state_, &mt_index_);
@@ -157,26 +161,38 @@ CacheusCache::CacheusCache(std::shared_ptr<Cache> target, size_t capacity,
   learning_rate_curr_ = learning_rate_;
   pending_max_age_ops_ = std::max<uint64_t>(1, tuning_options.pending_max_age_ops);
 
-  target_->SetEvictionCallback([this](const Slice& key, Handle* /*h*/,
-                                      bool /*was_hit*/) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const std::string key_str = SliceToKey(key);
-    OnBackingEraseAckLocked(key_str);
-    auto it = entries_.find(key_str);
-    if (it == entries_.end()) {
+  if (manage_backing_) {
+    target_->SetEvictionCallback([this](const Slice& key, Handle* /*h*/,
+                                        bool /*was_hit*/) {
+      HandleBackingEviction(key);
       return false;
-    }
-    EntryMeta meta = it->second;
-    RemoveFromQueuesLocked(key_str, meta);
-    auto lfu_it = lfu_pos_.find(key_str);
-    if (lfu_it != lfu_pos_.end()) {
-      lfu_set_.erase(lfu_it->second);
-      lfu_pos_.erase(lfu_it);
-    }
-    usage_ = (usage_ >= meta.charge) ? (usage_ - meta.charge) : 0;
-    entries_.erase(it);
-    return false;
-  });
+    });
+  }
+}
+
+void CacheusCache::HandleBackingEviction(const Slice& key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  const std::string key_str = SliceToKey(key);
+  OnBackingEraseAckLocked(key_str);
+  auto it = entries_.find(key_str);
+  if (it == entries_.end()) {
+    return;
+  }
+  EntryMeta meta = it->second;
+  RemoveFromQueuesLocked(key_str, meta);
+  auto lfu_it = lfu_pos_.find(key_str);
+  if (lfu_it != lfu_pos_.end()) {
+    lfu_set_.erase(lfu_it->second);
+    lfu_pos_.erase(lfu_it);
+  }
+  usage_ = (usage_ >= meta.charge) ? (usage_ - meta.charge) : 0;
+  entries_.erase(it);
+}
+
+void CacheusCache::GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  *lookups = total_hit_count_ + total_miss_count_;
+  *hits = total_hit_count_;
 }
 
 std::string CacheusCache::SliceToKey(const Slice& key) const {
@@ -1036,7 +1052,9 @@ void CacheusCache::SetCapacity(size_t capacity) {
   }
   // Backing cache is intentionally over-provisioned to avoid introducing
   // a second independent eviction policy below Cacheus.
-  target_->SetCapacity(ComputeBackingCapacity(capacity));
+  if (manage_backing_) {
+    target_->SetCapacity(ComputeBackingCapacity(capacity));
+  }
 }
 
 size_t CacheusCache::GetCapacity() const {
@@ -1187,8 +1205,39 @@ std::shared_ptr<Cache> NewCacheusCache(const LRUCacheOptions& options) {
 
 std::shared_ptr<Cache> NewCacheusCache(
     const LRUCacheOptions& options, const CacheusTuningOptions& tuning_options) {
-  return std::make_shared<CacheusCache>(
-      BuildBackingCache(options), options.capacity, tuning_options);
+  if (options.num_shard_bits <= 0) {
+    // Single wrapper instance (historical behavior). num_shard_bits < 0 lets
+    // the backing cache auto-shard but keeps one Cacheus policy instance.
+    return std::make_shared<CacheusCache>(
+        BuildBackingCache(options), options.capacity, tuning_options);
+  }
+  // Sharded wrapper mode: 2^k Cacheus policy shards routed by key hash, all
+  // sharing one natively sharded backing cache.
+  const int shard_bits = std::min(options.num_shard_bits, 20);
+  const size_t num_shards = size_t{1} << shard_bits;
+  std::shared_ptr<Cache> backing = BuildBackingCache(options);
+  const size_t per_shard_capacity =
+      (options.capacity + num_shards - 1) / num_shards;
+  std::vector<std::shared_ptr<Cache>> shards;
+  std::vector<WrapperCacheShard*> policies;
+  shards.reserve(num_shards);
+  policies.reserve(num_shards);
+  for (size_t i = 0; i < num_shards; ++i) {
+    CacheusTuningOptions shard_tuning = tuning_options;
+    // Decorrelate per-shard RNG streams while keeping runs reproducible.
+    shard_tuning.rng_seed = tuning_options.rng_seed + i;
+    auto shard = std::make_shared<CacheusCache>(backing, per_shard_capacity,
+                                                shard_tuning,
+                                                /*manage_backing=*/false);
+    policies.push_back(shard.get());
+    shards.push_back(std::move(shard));
+  }
+  const uint32_t routing_seed =
+      options.hash_seed >= 0 ? static_cast<uint32_t>(options.hash_seed) : 0u;
+  return std::make_shared<ShardedWrapperCache>(
+      std::move(backing), std::move(shards), std::move(policies), "cacheus",
+      routing_seed,
+      [](size_t logical) { return ComputeBackingCapacity(logical); });
 }
 
 std::shared_ptr<Cache> NewCacheusCache(size_t capacity, int num_shard_bits) {

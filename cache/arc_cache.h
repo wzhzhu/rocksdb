@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/wrapper_cache_shard.h"
 #include "rocksdb/advanced_cache.h"
 #include "rocksdb/cache.h"
 
@@ -19,15 +20,23 @@ struct ARCTuningOptions {
 
 // ARC cache implementation wrapping an internal cache instance. ARC state is
 // maintained at key granularity while the underlying cache stores objects.
-class ARCCache : public CacheWrapper {
+class ARCCache : public CacheWrapper, public WrapperCacheShard {
  public:
   static const char* kClassName() { return "ARCCache"; }
 
+  // When `manage_backing` is true (standalone mode), this instance installs
+  // the backing eviction callback and propagates SetCapacity to the backing
+  // cache. Pass false when multiple ARC shards share one backing cache and an
+  // outer router (ShardedWrapperCache) owns both responsibilities.
   ARCCache(std::shared_ptr<Cache> target, size_t capacity,
-           const ARCTuningOptions& tuning_options);
+           const ARCTuningOptions& tuning_options, bool manage_backing = true);
 
   const char* Name() const override { return kClassName(); }
   std::string GetPrintableOptions() const override;
+
+  // WrapperCacheShard
+  void GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const override;
+  void HandleBackingEviction(const Slice& key) override;
 
   Status Insert(const Slice& key, ObjectPtr value, const CacheItemHelper* helper,
                 size_t charge, Handle** handle = nullptr,
@@ -117,6 +126,7 @@ class ARCCache : public CacheWrapper {
   uint64_t wrapper_hit_count_ = 0;
   uint64_t request_counter_ = 0;
   uint64_t pending_max_age_ops_ = 65536;
+  bool manage_backing_ = true;
   std::string tombstone_prune_resume_key_;
   bool tombstone_prune_resume_valid_ = false;
   std::string pending_state_prune_resume_key_;
