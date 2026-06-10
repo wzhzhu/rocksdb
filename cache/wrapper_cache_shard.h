@@ -17,6 +17,10 @@ class WrapperCacheShard {
   // Returns wrapper-policy lookup/hit counters (policy-level, not backing).
   virtual void GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const = 0;
 
+  // Zeroes the wrapper-policy lookup/hit counters (e.g. between benchmark
+  // phases) without touching any policy state.
+  virtual void ResetWrapperCounters() = 0;
+
   // Notification that the shared backing cache evicted `key`. Must be safe to
   // call from the backing cache's eviction callback.
   virtual void HandleBackingEviction(const Slice& key) = 0;

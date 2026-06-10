@@ -53,6 +53,9 @@ class ShardedWrapperCache : public CacheWrapper {
   void SetCapacity(size_t capacity) override;
   size_t GetCapacity() const override;
 
+  // Zeroes wrapper-policy statistics counters on all shards.
+  void ResetWrapperCounters();
+
  private:
   size_t ShardIndex(const Slice& key) const;
 

@@ -195,6 +195,18 @@ void CacheusCache::GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const {
   *hits = total_hit_count_;
 }
 
+void CacheusCache::ResetWrapperCounters() {
+  std::lock_guard<std::mutex> lock(mu_);
+  // Pure statistics counters; adaptive state (weights, period_hits_, etc.)
+  // is intentionally left untouched.
+  total_hit_count_ = 0;
+  total_miss_count_ = 0;
+  lru_hist_hit_count_ = 0;
+  lfu_hist_hit_count_ = 0;
+  desync_backing_miss_reconciled_count_ = 0;
+  tombstone_lookup_dropped_count_ = 0;
+}
+
 std::string CacheusCache::SliceToKey(const Slice& key) const {
   return std::string(key.data(), key.size());
 }

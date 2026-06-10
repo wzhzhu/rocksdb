@@ -65,6 +65,7 @@ class CacheusCache : public CacheWrapper, public WrapperCacheShard {
 
   // WrapperCacheShard
   void GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const override;
+  void ResetWrapperCounters() override;
   void HandleBackingEviction(const Slice& key) override;
 
   Status Insert(const Slice& key, ObjectPtr value, const CacheItemHelper* helper,

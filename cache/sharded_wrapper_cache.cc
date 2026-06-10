@@ -69,6 +69,12 @@ void ShardedWrapperCache::SetCapacity(size_t capacity) {
   target_->SetCapacity(backing_capacity_of_logical_(capacity));
 }
 
+void ShardedWrapperCache::ResetWrapperCounters() {
+  for (auto* policy : policies_) {
+    policy->ResetWrapperCounters();
+  }
+}
+
 size_t ShardedWrapperCache::GetCapacity() const {
   size_t total = 0;
   for (const auto& shard : shards_) {

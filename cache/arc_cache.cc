@@ -80,6 +80,14 @@ void ARCCache::GetWrapperCounters(uint64_t* lookups, uint64_t* hits) const {
   *hits = wrapper_hit_count_;
 }
 
+void ARCCache::ResetWrapperCounters() {
+  std::lock_guard<std::mutex> lock(mu_);
+  wrapper_lookup_count_ = 0;
+  wrapper_hit_count_ = 0;
+  desync_backing_miss_reconciled_count_ = 0;
+  tombstone_lookup_dropped_count_ = 0;
+}
+
 std::string ARCCache::SliceToKey(const Slice& key) const {
   return std::string(key.data(), key.size());
 }
