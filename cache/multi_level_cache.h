@@ -30,6 +30,7 @@ class MultiLevelCache : public Cache {
     std::vector<uint64_t> lookups;
     std::vector<uint64_t> hits;
     std::vector<size_t> capacities;
+    std::vector<size_t> usages;
     std::vector<uint64_t> data_sizes;
   };
 

@@ -512,6 +512,7 @@ std::string MultiLevelCache::PrintStats() const {
                            : static_cast<double>(level_hits) /
                                  static_cast<double>(level_lookups);
     oss << "L" << level << ": capacity=" << sub_caches_[level]->GetCapacity()
+        << ", usage=" << sub_caches_[level]->GetUsage()
         << ", lookups=" << level_lookups << ", hits=" << level_hits
         << ", hit_rate=" << level_hit_rate
         << ", data_size=" << level_data_size
@@ -545,11 +546,13 @@ MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
   snapshot.lookups.resize(sub_caches_.size());
   snapshot.hits.resize(sub_caches_.size());
   snapshot.capacities.resize(sub_caches_.size());
+  snapshot.usages.resize(sub_caches_.size());
   snapshot.data_sizes.resize(sub_caches_.size());
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
     snapshot.lookups[level] = lookups_[level].load(std::memory_order_relaxed);
     snapshot.hits[level] = hits_[level].load(std::memory_order_relaxed);
     snapshot.capacities[level] = sub_caches_[level]->GetCapacity();
+    snapshot.usages[level] = sub_caches_[level]->GetUsage();
     snapshot.data_sizes[level] =
         level_data_sizes_[level].load(std::memory_order_relaxed);
   }
