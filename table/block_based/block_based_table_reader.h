@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -216,6 +217,8 @@ class BlockBasedTable : public TableReader {
                         bool meta_blocks_only = false) override;
 
   void MarkObsolete(uint32_t uncache_aggressiveness) override;
+
+  void UpdateCacheKeyLevel(int level) override;
 
   ~BlockBasedTable();
 
@@ -620,6 +623,7 @@ struct BlockBasedTable::Rep {
         global_seqno(kDisableGlobalSequenceNumber),
         file_size(_file_size),
         level(_level),
+        cache_key_level(_level),
         immortal_table(_immortal_table),
         user_defined_timestamps_persisted(_user_defined_timestamps_persisted),
         fs_prefetch_support(CheckFSFeatureSupport(
@@ -677,6 +681,13 @@ struct BlockBasedTable::Rep {
   // the level when the table is opened, could potentially change when trivial
   // move is involved
   int level;
+
+  // The file's current LSM level, lazily refreshed by TableCache::FindTable
+  // on each access (trivial moves change the level without reopening the
+  // reader). Used for the block cache key level tag (MultiLevelCache
+  // routing); `level` above stays frozen at open time for open-time
+  // heuristics (filter pinning etc.).
+  std::atomic<int> cache_key_level;
 
   // the timestamp range of table
   // Points into memory owned by TableProperties. This would need to change if

@@ -214,12 +214,24 @@ Status TableCache::FindTable(
   assert(handle != nullptr && *handle == nullptr);
   PERF_TIMER_GUARD_WITH_CLOCK(find_table_nanos, ioptions_.clock);
 
+  // Table readers are cached by file number and survive trivial moves, so
+  // their open-time level can go stale. Refresh the level used for block
+  // cache key tagging (MultiLevelCache routing) with the caller-provided
+  // current level on every access. Cheap: load + compare, store only on
+  // change. level < 0 means "unknown" (e.g. property queries); keep previous.
+  const auto refresh_cache_key_level = [level](TableReader* reader) {
+    if (reader != nullptr && level >= 0) {
+      reader->UpdateCacheKeyLevel(level);
+    }
+  };
+
   // Fast path: if table reader is already pinned, return it directly without a
   // cache lookup.
   auto pinned_reader = file_meta.fd.pinned_reader.Get();
   if (pinned_reader != nullptr) {
     *handle = nullptr;
     *out_table_reader = pinned_reader;
+    refresh_cache_key_level(*out_table_reader);
     return Status::OK();
   }
 
@@ -243,6 +255,7 @@ Status TableCache::FindTable(
     if (pinned_reader != nullptr) {
       *handle = nullptr;
       *out_table_reader = pinned_reader;
+      refresh_cache_key_level(*out_table_reader);
       return s;
     }
 
@@ -295,6 +308,7 @@ Status TableCache::FindTable(
     }
   }
 
+  refresh_cache_key_level(*out_table_reader);
   return s;
 }
 

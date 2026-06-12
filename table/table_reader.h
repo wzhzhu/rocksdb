@@ -199,6 +199,15 @@ class TableReader {
   virtual void MarkObsolete(uint32_t /*uncache_aggressiveness*/) {
     // no-op as default
   }
+
+  // Notify the reader of the file's current LSM level, which can differ from
+  // the level at open time after trivial moves (table readers are cached by
+  // file number and not reopened on moves). Implementations that encode the
+  // level into block cache keys (e.g. for MultiLevelCache routing) should
+  // refresh their notion of the level. Must be thread safe. Default: no-op.
+  virtual void UpdateCacheKeyLevel(int /*level*/) {
+    // no-op as default
+  }
 };
 
 }  // namespace ROCKSDB_NAMESPACE

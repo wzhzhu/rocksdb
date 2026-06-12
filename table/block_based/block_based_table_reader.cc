@@ -1759,7 +1759,8 @@ Status BlockBasedTable::LookupAndPinBlocksInCache(
   const bool use_extended_key = ShouldUseExtendedCacheKey(rep_);
   std::array<char, kExtendedCacheKeySize> extended_key_buf{};
   const Slice key = BuildExtendedCacheLookupKey(
-      key_data, rep_->level, use_extended_key, &extended_key_buf);
+      key_data, rep_->cache_key_level.load(std::memory_order_relaxed),
+      use_extended_key, &extended_key_buf);
 
   Statistics* statistics = rep_->ioptions.statistics.get();
 
@@ -1879,8 +1880,9 @@ BlockBasedTable::MaybeReadBlockAndLoadToCache(
   if (block_cache) {
     // create key for block cache
     key_data = GetCacheKey(rep_->base_cache_key, handle);
-    key = BuildExtendedCacheLookupKey(key_data, rep_->level, use_extended_key,
-                                      &extended_key_buf);
+    key = BuildExtendedCacheLookupKey(
+        key_data, rep_->cache_key_level.load(std::memory_order_relaxed),
+        use_extended_key, &extended_key_buf);
 
     if (!contents) {
       if (use_block_cache_for_lookup) {
@@ -2968,7 +2970,8 @@ bool BlockBasedTable::EraseFromCache(const BlockHandle& handle) const {
   const bool use_extended_key = ShouldUseExtendedCacheKey(rep_);
   std::array<char, kExtendedCacheKeySize> extended_key_buf{};
   const Slice routed_key = BuildExtendedCacheLookupKey(
-      key, rep_->level, use_extended_key, &extended_key_buf);
+      key, rep_->cache_key_level.load(std::memory_order_relaxed),
+      use_extended_key, &extended_key_buf);
   Cache::Handle* const cache_handle = cache->Lookup(routed_key);
   if (cache_handle == nullptr) {
     return false;
@@ -2989,7 +2992,8 @@ bool BlockBasedTable::TEST_BlockInCache(const BlockHandle& handle) const {
   const bool use_extended_key = ShouldUseExtendedCacheKey(rep_);
   std::array<char, kExtendedCacheKeySize> extended_key_buf{};
   const Slice routed_key = BuildExtendedCacheLookupKey(
-      key, rep_->level, use_extended_key, &extended_key_buf);
+      key, rep_->cache_key_level.load(std::memory_order_relaxed),
+      use_extended_key, &extended_key_buf);
   Cache::Handle* const cache_handle = cache->Lookup(routed_key);
   if (cache_handle == nullptr) {
     return false;
@@ -3640,6 +3644,13 @@ void BlockBasedTable::DumpKeyValue(const Slice& key, const Slice& value,
 
 void BlockBasedTable::MarkObsolete(uint32_t uncache_aggressiveness) {
   rep_->uncache_aggressiveness.StoreRelaxed(uncache_aggressiveness);
+}
+
+void BlockBasedTable::UpdateCacheKeyLevel(int level) {
+  // Avoid dirtying the cache line on the common (unchanged) path.
+  if (rep_->cache_key_level.load(std::memory_order_relaxed) != level) {
+    rep_->cache_key_level.store(level, std::memory_order_relaxed);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
