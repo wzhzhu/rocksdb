@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <string_view>
@@ -1049,14 +1050,20 @@ void MultiLevelCache::MaybeAdaptLevelMode(size_t level_index) {
 bool MultiLevelCache::MaybeSetLevelProbationInsert(size_t level_index,
                                                    bool probation_insert) {
   Cache* cache = SubCacheByLevel(level_index);
-  if (auto* fixed =
-          dynamic_cast<clock_cache::FixedHyperClockCache*>(cache)) {
-    fixed->SetProbationInsert(probation_insert);
+  if (cache == nullptr) {
+    return false;
+  }
+  // Name()-based dispatch instead of dynamic_cast so this also works in
+  // builds with RTTI disabled (release default).
+  const char* name = cache->Name();
+  if (std::strcmp(name, "FixedHyperClockCache") == 0) {
+    static_cast<clock_cache::FixedHyperClockCache*>(cache)->SetProbationInsert(
+        probation_insert);
     return true;
   }
-  if (auto* auto_hcc =
-          dynamic_cast<clock_cache::AutoHyperClockCache*>(cache)) {
-    auto_hcc->SetProbationInsert(probation_insert);
+  if (std::strcmp(name, "AutoHyperClockCache") == 0) {
+    static_cast<clock_cache::AutoHyperClockCache*>(cache)->SetProbationInsert(
+        probation_insert);
     return true;
   }
   return false;
