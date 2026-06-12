@@ -44,6 +44,24 @@ constexpr uint32_t kRatioScalePpm = 1000000U;
 constexpr uint32_t kMaxSharedPoolRatioPpm = 900000U;
 constexpr size_t kMaxAdmissionCandidatesPerShard = 4096;
 
+// HCC's SetCapacity only stores the new value; eviction is realized lazily on
+// the insert path. A sub-cache whose level drained (no more inserts routed to
+// it) would hold stale blocks indefinitely, silently exceeding the total
+// budget (observed: a 9.7KB-capacity L0 sub-cache squatting on 934MB). After
+// shrinking, synchronously purge down to the new capacity. Name()-based
+// dispatch keeps this working in no-RTTI builds.
+void PurgeSubCacheToCapacity(Cache* cache) {
+  if (cache == nullptr) {
+    return;
+  }
+  const char* name = cache->Name();
+  if (std::strcmp(name, "FixedHyperClockCache") == 0) {
+    static_cast<clock_cache::FixedHyperClockCache*>(cache)->PurgeToCapacity();
+  } else if (std::strcmp(name, "AutoHyperClockCache") == 0) {
+    static_cast<clock_cache::AutoHyperClockCache*>(cache)->PurgeToCapacity();
+  }
+}
+
 }  // namespace
 
 MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity)
@@ -822,6 +840,10 @@ void MultiLevelCache::ApplyCapacities(const std::vector<size_t>& capacities) {
     if (shared_cache_ != nullptr) {
       shared_cache_->SetCapacity(0);
     }
+    for (const auto& sub_cache : sub_caches_) {
+      PurgeSubCacheToCapacity(sub_cache.get());
+    }
+    PurgeSubCacheToCapacity(shared_cache_.get());
     return;
   }
 
@@ -860,6 +882,12 @@ void MultiLevelCache::ApplyCapacities(const std::vector<size_t>& capacities) {
   if (shared_cache_ != nullptr) {
     shared_cache_->SetCapacity(shared_capacity);
   }
+  // Apply all new capacities first, then reclaim, so that purges run against
+  // the final targets (a level being grown is never purged spuriously).
+  for (const auto& sub_cache : sub_caches_) {
+    PurgeSubCacheToCapacity(sub_cache.get());
+  }
+  PurgeSubCacheToCapacity(shared_cache_.get());
 }
 
 Cache* MultiLevelCache::SubCacheByLevel(size_t level_index) {

@@ -488,6 +488,15 @@ class BaseClockTable {
 
   void TrackAndReleaseEvictedEntry(ClockHandle* h);
 
+  // Actively evict entries until usage <= capacity (or nothing more is
+  // evictable). SetCapacity() only stores the new value and relies on
+  // subsequent Inserts to realize shrinks; a shard that no longer receives
+  // inserts (e.g. a MultiLevelCache sub-cache for a drained LSM level) would
+  // otherwise hold its stale contents indefinitely, exceeding the configured
+  // budget. Safe to call concurrently with other operations.
+  template <class Table>
+  void PurgeToCapacity();
+
   bool IsEvictionEffortExceeded(const BaseClockTable::EvictionData& data) const;
 #ifndef NDEBUG
   // Acquire N references
@@ -1134,6 +1143,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
 
   void SetStrictCapacityLimit(bool strict_capacity_limit);
 
+  // Synchronously evict until usage <= capacity (see BaseClockTable).
+  void PurgeToCapacity();
+
   void SetProbationInsert(bool probation_insert);
   bool GetProbationInsert() const;
 
@@ -1231,6 +1243,13 @@ class BaseHyperClockCache : public ShardedCache<ClockCacheShard<Table>> {
     this->ForEachShard([probation_insert](Shard* shard) {
       shard->SetProbationInsert(probation_insert);
     });
+  }
+
+  // Synchronously evict from each shard until usage <= capacity. Needed
+  // after shrinking capacity on a cache that may stop receiving inserts
+  // (eviction is otherwise only realized on the insert path).
+  void PurgeToCapacity() {
+    this->ForEachShard([](Shard* shard) { shard->PurgeToCapacity(); });
   }
 
   bool GetProbationInsert() const {

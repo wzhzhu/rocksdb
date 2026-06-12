@@ -576,6 +576,35 @@ inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
   return true;
 }
 
+template <class Table>
+void BaseClockTable::PurgeToCapacity() {
+  // Each round requests the full current excess; Evict() internally caps the
+  // per-call effort, so loop while progress is made. Bound the rounds for
+  // safety against pathological alternation with concurrent inserts.
+  constexpr int kMaxPurgeRounds = 64;
+  for (int round = 0; round < kMaxPurgeRounds; ++round) {
+    const size_t capacity = capacity_.LoadRelaxed();
+    const size_t usage = usage_.LoadRelaxed();
+    if (usage <= capacity) {
+      return;
+    }
+    const size_t need_evict_charge = usage - capacity;
+    typename Table::InsertState state;
+    static_cast<Table*>(this)->StartInsert(state);
+    EvictionData data;
+    static_cast<Table*>(this)->Evict(need_evict_charge, state, &data);
+    if (data.freed_count == 0) {
+      // Nothing evictable (all remaining entries referenced); give up.
+      return;
+    }
+    occupancy_.FetchSub(data.freed_count);
+    usage_.FetchSubRelaxed(data.freed_charge);
+  }
+}
+
+template void BaseClockTable::PurgeToCapacity<FixedHyperClockTable>();
+template void BaseClockTable::PurgeToCapacity<AutoHyperClockTable>();
+
 void BaseClockTable::TrackAndReleaseEvictedEntry(ClockHandle* h) {
   bool took_value_ownership = false;
   if (eviction_callback_) {
@@ -1255,6 +1284,11 @@ template <class Table>
 void ClockCacheShard<Table>::SetCapacity(size_t capacity) {
   table_.SetCapacity(capacity);
   // next Insert will take care of any necessary evictions
+}
+
+template <class Table>
+void ClockCacheShard<Table>::PurgeToCapacity() {
+  table_.template PurgeToCapacity<Table>();
 }
 
 template <class Table>
