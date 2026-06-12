@@ -41,8 +41,23 @@ std::shared_ptr<Cache> MakeSubCacheWithCapacity(
 }
 
 constexpr uint32_t kRatioScalePpm = 1000000U;
+
+// Low-bit tag marking a MultiLevelCache handle as a heap-allocated
+// WrappedHandle (rare path); untagged handles are passed through from the
+// sub-caches and their owner is recovered by address range.
+constexpr uintptr_t kWrappedHandleTagBit = uintptr_t{1};
 constexpr uint32_t kMaxSharedPoolRatioPpm = 900000U;
 constexpr size_t kMaxAdmissionCandidatesPerShard = 4096;
+
+// Distributes client threads round-robin over counter stripes. The stripe is
+// per-thread (not per-cache-instance), which is fine: the goal is only to
+// spread concurrent increments across cache lines.
+size_t CounterStripeIndex(size_t num_stripes) {
+  static std::atomic<uint32_t> next_stripe{0};
+  thread_local uint32_t stripe =
+      next_stripe.fetch_add(1, std::memory_order_relaxed);
+  return stripe % num_stripes;
+}
 
 // HCC's SetCapacity only stores the new value; eviction is realized lazily on
 // the insert path. A sub-cache whose level drained (no more inserts routed to
@@ -206,7 +221,7 @@ Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
     shared_pool_admissions_.fetch_add(1, std::memory_order_relaxed);
   }
   if (handle != nullptr && inner != nullptr) {
-    *handle = NewWrappedHandle(target_cache, inner);
+    *handle = WrapOrPassHandle(target_cache, inner);
   }
   return s;
 }
@@ -224,7 +239,7 @@ Cache::Handle* MultiLevelCache::CreateStandalone(
   if (inner == nullptr) {
     return nullptr;
   }
-  return NewWrappedHandle(target_cache, inner);
+  return WrapOrPassHandle(target_cache, inner);
 }
 
 Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
@@ -235,7 +250,7 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
   const size_t level_index =
       RouteLevelByKey(key, RouteCaller::kLookup, &base_key);
   MaybeRecordLookupSample(level_index, base_key);
-  lookups_[level_index].fetch_add(1, std::memory_order_relaxed);
+  IncLookupCounter(level_index);
   Cache* level_cache = SubCacheByLevel(level_index);
   Cache::Handle* inner =
       level_cache->Lookup(base_key, helper, create_context, priority, stats);
@@ -257,26 +272,38 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
     shared_pool_hits_.fetch_add(1, std::memory_order_relaxed);
     owner_cache = SharedCache();
   }
-  hits_[level_index].fetch_add(1, std::memory_order_relaxed);
-  return NewWrappedHandle(owner_cache, inner);
+  IncHitCounter(level_index);
+  return WrapOrPassHandle(owner_cache, inner);
 }
 
 bool MultiLevelCache::Ref(Handle* handle) {
-  WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return wrapped->owner_cache->Ref(wrapped->inner);
+  Cache* owner = nullptr;
+  Cache::Handle* inner = nullptr;
+  ResolveHandle(handle, &owner, &inner);
+  return owner->Ref(inner);
 }
 
 bool MultiLevelCache::Release(Handle* handle, bool erase_if_last_ref) {
-  WrappedHandle* wrapped = ToWrappedHandle(handle);
-  const bool erased =
-      wrapped->owner_cache->Release(wrapped->inner, erase_if_last_ref);
-  delete wrapped;
-  return erased;
+  const uintptr_t bits = reinterpret_cast<uintptr_t>(handle);
+  if (bits & kWrappedHandleTagBit) {
+    auto* wrapped =
+        reinterpret_cast<WrappedHandle*>(bits & ~kWrappedHandleTagBit);
+    const bool erased =
+        wrapped->owner_cache->Release(wrapped->inner, erase_if_last_ref);
+    delete wrapped;
+    return erased;
+  }
+  Cache* owner = nullptr;
+  Cache::Handle* inner = nullptr;
+  ResolveHandle(handle, &owner, &inner);
+  return owner->Release(inner, erase_if_last_ref);
 }
 
 Cache::ObjectPtr MultiLevelCache::Value(Handle* handle) {
-  WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return wrapped->owner_cache->Value(wrapped->inner);
+  Cache* owner = nullptr;
+  Cache::Handle* inner = nullptr;
+  ResolveHandle(handle, &owner, &inner);
+  return owner->Value(inner);
 }
 
 void MultiLevelCache::Erase(const Slice& key) {
@@ -287,6 +314,35 @@ void MultiLevelCache::Erase(const Slice& key) {
       shared_pool_ratio_ppm_.load(std::memory_order_relaxed) > 0) {
     SharedCache()->Erase(base_key);
   }
+}
+
+void MultiLevelCache::IncLookupCounter(size_t level_index) {
+  lookups_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() +
+           level_index]
+      .v.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MultiLevelCache::IncHitCounter(size_t level_index) {
+  hits_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() + level_index]
+      .v.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t MultiLevelCache::SumLookupCounter(size_t level_index) const {
+  uint64_t sum = 0;
+  for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
+    sum += lookups_[stripe * sub_caches_.size() + level_index].v.load(
+        std::memory_order_relaxed);
+  }
+  return sum;
+}
+
+uint64_t MultiLevelCache::SumHitCounter(size_t level_index) const {
+  uint64_t sum = 0;
+  for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
+    sum += hits_[stripe * sub_caches_.size() + level_index].v.load(
+        std::memory_order_relaxed);
+  }
+  return sum;
 }
 
 uint64_t MultiLevelCache::NewId() { return PrimarySubCache()->NewId(); }
@@ -347,8 +403,10 @@ size_t MultiLevelCache::GetUsage() const {
 }
 
 size_t MultiLevelCache::GetUsage(Handle* handle) const {
-  const WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return wrapped->owner_cache->GetUsage(wrapped->inner);
+  Cache* owner = nullptr;
+  Cache::Handle* inner = nullptr;
+  ResolveHandle(handle, &owner, &inner);
+  return owner->GetUsage(inner);
 }
 
 size_t MultiLevelCache::GetPinnedUsage() const {
@@ -363,14 +421,18 @@ size_t MultiLevelCache::GetPinnedUsage() const {
 }
 
 size_t MultiLevelCache::GetCharge(Handle* handle) const {
-  const WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return wrapped->owner_cache->GetCharge(wrapped->inner);
+  Cache* owner = nullptr;
+  Cache::Handle* inner = nullptr;
+  ResolveHandle(handle, &owner, &inner);
+  return owner->GetCharge(inner);
 }
 
 const Cache::CacheItemHelper* MultiLevelCache::GetCacheItemHelper(
     Handle* handle) const {
-  const WrappedHandle* wrapped = ToWrappedHandle(handle);
-  return wrapped->owner_cache->GetCacheItemHelper(wrapped->inner);
+  Cache* owner = nullptr;
+  Cache::Handle* inner = nullptr;
+  ResolveHandle(handle, &owner, &inner);
+  return owner->GetCacheItemHelper(inner);
 }
 
 void MultiLevelCache::ApplyToAllEntries(
@@ -389,9 +451,10 @@ void MultiLevelCache::ApplyToHandle(
     Cache* /*cache*/, Handle* handle,
     const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
                              const CacheItemHelper* helper)>& callback) {
-  WrappedHandle* wrapped = ToWrappedHandle(handle);
-  wrapped->owner_cache->ApplyToHandle(wrapped->owner_cache, wrapped->inner,
-                                      callback);
+  Cache* owner = nullptr;
+  Cache::Handle* inner = nullptr;
+  ResolveHandle(handle, &owner, &inner);
+  owner->ApplyToHandle(owner, inner, callback);
 }
 
 void MultiLevelCache::EraseUnRefEntries() {
@@ -447,8 +510,8 @@ std::string MultiLevelCache::PrintStats() const {
   uint64_t total_lookups = 0;
   uint64_t total_hits = 0;
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
-    total_lookups += lookups_[level].load(std::memory_order_relaxed);
-    total_hits += hits_[level].load(std::memory_order_relaxed);
+    total_lookups += SumLookupCounter(level);
+    total_hits += SumHitCounter(level);
   }
 
   const double total_hit_rate =
@@ -519,9 +582,8 @@ std::string MultiLevelCache::PrintStats() const {
   oss << "total_hit_rate=" << total_hit_rate << " (" << total_hits << "/"
       << total_lookups << ")\n";
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
-    const uint64_t level_lookups =
-        lookups_[level].load(std::memory_order_relaxed);
-    const uint64_t level_hits = hits_[level].load(std::memory_order_relaxed);
+    const uint64_t level_lookups = SumLookupCounter(level);
+    const uint64_t level_hits = SumHitCounter(level);
     const uint64_t level_data_size =
         level_data_sizes_[level].load(std::memory_order_relaxed);
     const bool probation_insert =
@@ -541,9 +603,10 @@ std::string MultiLevelCache::PrintStats() const {
 }
 
 void MultiLevelCache::ResetStats() {
-  for (size_t level = 0; level < sub_caches_.size(); ++level) {
-    lookups_[level].store(0, std::memory_order_relaxed);
-    hits_[level].store(0, std::memory_order_relaxed);
+  const size_t counter_count = kCounterStripes * sub_caches_.size();
+  for (size_t i = 0; i < counter_count; ++i) {
+    lookups_[i].v.store(0, std::memory_order_relaxed);
+    hits_[i].v.store(0, std::memory_order_relaxed);
   }
   insert_route_queries_.store(0, std::memory_order_relaxed);
   insert_route_parse_failures_.store(0, std::memory_order_relaxed);
@@ -568,8 +631,8 @@ MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
   snapshot.usages.resize(sub_caches_.size());
   snapshot.data_sizes.resize(sub_caches_.size());
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
-    snapshot.lookups[level] = lookups_[level].load(std::memory_order_relaxed);
-    snapshot.hits[level] = hits_[level].load(std::memory_order_relaxed);
+    snapshot.lookups[level] = SumLookupCounter(level);
+    snapshot.hits[level] = SumHitCounter(level);
     snapshot.capacities[level] = sub_caches_[level]->GetCapacity();
     snapshot.usages[level] = sub_caches_[level]->GetUsage();
     snapshot.data_sizes[level] =
@@ -610,6 +673,9 @@ void MultiLevelCache::SetLookupSampleRateLog2(uint32_t sample_rate_log2) {
   // Guard overly sparse sampling and shift overflow.
   const uint32_t clamped = std::min<uint32_t>(sample_rate_log2, 20);
   lookup_sample_rate_log2_.store(clamped, std::memory_order_relaxed);
+  // Caller expressed interest in samples (external driver e.g. db_bench);
+  // ConfigureDynamicSRHCC overrides this right after for the dynamic path.
+  lookup_sampling_enabled_.store(true, std::memory_order_relaxed);
 }
 
 void MultiLevelCache::UpdateLevelDataSizes(
@@ -682,6 +748,7 @@ void MultiLevelCache::ConfigureDynamicSRHCC(bool enabled,
       static_cast<uint32_t>(clamped_disable * kRatioScalePpm),
       std::memory_order_relaxed);
   SetLookupSampleRateLog2(dynamic_srhcc_sample_rate_log2_.load(std::memory_order_relaxed));
+  lookup_sampling_enabled_.store(enabled, std::memory_order_relaxed);
   dynamic_srhcc_enabled_.store(enabled, std::memory_order_relaxed);
   if (enabled) {
     StartDynamicSRHCCWorker();
@@ -783,32 +850,103 @@ std::optional<uint64_t> MultiLevelCache::GetCacheKeyPrefix(
   return DecodeFixed64(key.data());
 }
 
-MultiLevelCache::WrappedHandle* MultiLevelCache::NewWrappedHandle(
-    Cache* owner_cache, Cache::Handle* inner) {
+void MultiLevelCache::BuildHandleOwnerRanges() {
+  handle_owner_ranges_.clear();
+  auto append_ranges = [this](Cache* cache) {
+    if (cache == nullptr) {
+      return;
+    }
+    std::vector<std::pair<const void*, const void*>> ranges;
+    // Name()-based dispatch keeps this working in no-RTTI builds.
+    const char* name = cache->Name();
+    if (std::strcmp(name, "FixedHyperClockCache") == 0) {
+      static_cast<clock_cache::FixedHyperClockCache*>(cache)
+          ->AppendHandleAddressRanges(&ranges);
+    } else if (std::strcmp(name, "AutoHyperClockCache") == 0) {
+      static_cast<clock_cache::AutoHyperClockCache*>(cache)
+          ->AppendHandleAddressRanges(&ranges);
+    } else {
+      // No stable handle array (e.g. LRU sub-caches): handles from this
+      // cache always go through the WrappedHandle path.
+      return;
+    }
+    for (const auto& range : ranges) {
+      handle_owner_ranges_.push_back(
+          {reinterpret_cast<uintptr_t>(range.first),
+           reinterpret_cast<uintptr_t>(range.second), cache});
+    }
+  };
+  for (const auto& sub_cache : sub_caches_) {
+    append_ranges(sub_cache.get());
+  }
+  append_ranges(shared_cache_.get());
+  std::sort(handle_owner_ranges_.begin(), handle_owner_ranges_.end(),
+            [](const HandleOwnerRange& a, const HandleOwnerRange& b) {
+              return a.begin < b.begin;
+            });
+}
+
+Cache* MultiLevelCache::FindHandleOwner(const void* handle_addr) const {
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(handle_addr);
+  // Binary search over at most (levels + 1) * shards ranges.
+  size_t lo = 0;
+  size_t hi = handle_owner_ranges_.size();
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (handle_owner_ranges_[mid].begin <= addr) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo == 0) {
+    return nullptr;
+  }
+  const HandleOwnerRange& range = handle_owner_ranges_[lo - 1];
+  return addr < range.end ? range.owner : nullptr;
+}
+
+Cache::Handle* MultiLevelCache::WrapOrPassHandle(Cache* owner_cache,
+                                                 Cache::Handle* inner) {
   assert(inner != nullptr);
   assert(owner_cache != nullptr);
+  if (FindHandleOwner(inner) == owner_cache) {
+    // Common path (slot-array handle from an HCC sub-cache): the owner is
+    // recoverable by address, so pass the handle through with no allocation.
+    return inner;
+  }
+  // Standalone (heap-allocated) handle or non-HCC sub-cache: fall back to a
+  // wrapper, marked by tagging the pointer's low bit (handles are at least
+  // 8-byte aligned).
   auto* wrapped = new WrappedHandle();
   wrapped->owner_cache = owner_cache;
   wrapped->inner = inner;
-  return wrapped;
+  return reinterpret_cast<Handle*>(reinterpret_cast<uintptr_t>(wrapped) |
+                                   kWrappedHandleTagBit);
 }
 
-MultiLevelCache::WrappedHandle* MultiLevelCache::ToWrappedHandle(
-    Handle* handle) {
+void MultiLevelCache::ResolveHandle(const Handle* handle, Cache** owner,
+                                    Cache::Handle** inner) const {
   assert(handle != nullptr);
-  auto* wrapped = static_cast<WrappedHandle*>(handle);
-  assert(wrapped->owner_cache != nullptr);
-  assert(wrapped->inner != nullptr);
-  return wrapped;
-}
-
-const MultiLevelCache::WrappedHandle* MultiLevelCache::ToWrappedHandle(
-    const Handle* handle) {
-  assert(handle != nullptr);
-  const auto* wrapped = static_cast<const WrappedHandle*>(handle);
-  assert(wrapped->owner_cache != nullptr);
-  assert(wrapped->inner != nullptr);
-  return wrapped;
+  const uintptr_t bits = reinterpret_cast<uintptr_t>(handle);
+  if (bits & kWrappedHandleTagBit) {
+    const auto* wrapped =
+        reinterpret_cast<const WrappedHandle*>(bits & ~kWrappedHandleTagBit);
+    assert(wrapped->owner_cache != nullptr);
+    assert(wrapped->inner != nullptr);
+    *owner = wrapped->owner_cache;
+    *inner = wrapped->inner;
+    return;
+  }
+  *inner = const_cast<Cache::Handle*>(handle);
+  *owner = FindHandleOwner(handle);
+  // An untagged handle is only ever issued when its owner is resolvable.
+  assert(*owner != nullptr);
+  if (*owner == nullptr) {
+    // Defensive (release builds): HCC handle accessors do not depend on the
+    // particular instance.
+    *owner = const_cast<MultiLevelCache*>(this)->PrimarySubCache();
+  }
 }
 
 Status MultiLevelCache::ValidateCapacities(
@@ -970,12 +1108,20 @@ int64_t MultiLevelCache::ParseDebugMissLimit() {
 
 void MultiLevelCache::MaybeRecordLookupSample(size_t level_index,
                                               const Slice& key) {
+  // Nobody consumes samples in non-dynamic configurations; skip all
+  // bookkeeping (this runs on every Lookup).
+  if (!lookup_sampling_enabled_.load(std::memory_order_relaxed)) {
+    return;
+  }
   const uint32_t log2_rate =
       lookup_sample_rate_log2_.load(std::memory_order_relaxed);
   const uint64_t sample_mask =
       log2_rate == 0 ? 0 : ((1ULL << log2_rate) - 1ULL);
-  if ((lookup_sample_seq_.fetch_add(1, std::memory_order_relaxed) &
-       sample_mask) != 0) {
+  // The sample rate only needs to hold statistically, so a thread-local
+  // counter suffices; no reason to serialize all threads on one global
+  // sequence atomic.
+  thread_local uint64_t tls_sample_seq = 0;
+  if ((tls_sample_seq++ & sample_mask) != 0) {
     return;
   }
   if (level_index >= lookup_sample_rings_.size()) {
@@ -999,7 +1145,7 @@ void MultiLevelCache::MaybeAdaptLevelMode(size_t level_index) {
       level_index >= sub_caches_.size()) {
     return;
   }
-  const uint64_t curr_lookups = lookups_[level_index].load(std::memory_order_relaxed);
+  const uint64_t curr_lookups = SumLookupCounter(level_index);
   const uint64_t prev_lookups =
       adapt_last_lookups_[level_index].load(std::memory_order_relaxed);
   const uint32_t interval =
@@ -1008,7 +1154,7 @@ void MultiLevelCache::MaybeAdaptLevelMode(size_t level_index) {
     return;
   }
 
-  const uint64_t curr_hits = hits_[level_index].load(std::memory_order_relaxed);
+  const uint64_t curr_hits = SumHitCounter(level_index);
 
   std::vector<uint64_t> samples;
   LevelSampleRing* ring = lookup_sample_rings_[level_index].get();
@@ -1242,16 +1388,15 @@ size_t MultiLevelCache::GetSharedPoolCapacity(size_t total_capacity) const {
 }
 
 void MultiLevelCache::InitializePerLevelState(size_t level_count) {
-  lookups_.resize(level_count);
-  hits_.resize(level_count);
+  // Value-initialized: all stripes start at zero.
+  lookups_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
+  hits_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
   level_data_sizes_.resize(level_count);
   lookup_sample_rings_.resize(level_count);
   adapt_last_lookups_.resize(level_count);
   adapt_last_hits_.resize(level_count);
   level_probation_insert_enabled_.resize(level_count);
   for (size_t level = 0; level < level_count; ++level) {
-    lookups_[level].store(0, std::memory_order_relaxed);
-    hits_[level].store(0, std::memory_order_relaxed);
     level_data_sizes_[level].store(0, std::memory_order_relaxed);
     lookup_sample_rings_[level] = std::make_unique<LevelSampleRing>();
     lookup_sample_rings_[level]->seq =
@@ -1278,6 +1423,7 @@ void MultiLevelCache::InitializePerLevelState(size_t level_count) {
                                                    std::memory_order_relaxed);
     }
   }
+  BuildHandleOwnerRanges();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

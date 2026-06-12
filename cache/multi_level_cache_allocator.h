@@ -51,6 +51,25 @@ struct MultiLevelAllocationOptions {
   double compaction_shift_max_total_ratio = 0.1;
   // Enable per-round debug logging for compaction-aware transfer.
   bool compaction_shift_debug = false;
+
+  // --- Anti-oscillation (capacity jitter wastes warm blocks, and with
+  // purge-on-shrink every spurious shrink is destructive) ---
+  // Total-change deadband as a fraction of total capacity; the effective
+  // skip threshold is max(min_total_change_bytes, total * this).
+  double total_deadband_ratio = 0.005;
+  // Per-level deadband: a proposal moving a level by less than
+  // max(per_level_deadband_min_bytes, current * per_level_deadband_ratio)
+  // is dropped (the level keeps its current capacity).
+  double per_level_deadband_ratio = 0.05;
+  size_t per_level_deadband_min_bytes = 64 << 10;  // 64 KiB
+  // A level's shrink is only applied after this many consecutive rounds
+  // proposing a shrink for it, and then only half the gap per round.
+  // Grows apply immediately. <= 1 disables the hysteresis.
+  uint32_t shrink_confirm_rounds = 3;
+  // After rounds that apply no change, the background loop backs off
+  // exponentially up to interval_ms * max_interval_backoff; any applied
+  // change resets the interval. 1 disables the backoff.
+  uint32_t max_interval_backoff = 8;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -105,6 +124,9 @@ class MultiLevelCacheAllocator {
 
   void BackgroundLoop();
   Status RunOnceLocked();
+  // Applies per-level deadband and shrink hysteresis against
+  // last_capacities_, then rebalances the proposal back to `budget`.
+  void ApplyAntiOscillation(std::vector<size_t>* proposed, size_t budget);
 
   std::shared_ptr<MultiLevelCache> cache_;
   MetricsProvider provider_;
@@ -117,6 +139,11 @@ class MultiLevelCacheAllocator {
   std::vector<uint64_t> prev_data_sizes_;
   std::vector<uint64_t> prev_lookups_;
   std::vector<uint64_t> prev_hits_;
+  // Consecutive rounds each level has been proposed to shrink.
+  std::vector<uint32_t> shrink_streak_;
+  // Whether the last RunOnceLocked applied a capacity change (drives the
+  // adaptive interval backoff).
+  bool last_round_applied_ = false;
   uint64_t round_id_ = 0;
 };
 

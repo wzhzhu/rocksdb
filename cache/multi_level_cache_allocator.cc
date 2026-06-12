@@ -156,6 +156,12 @@ MultiLevelCacheAllocator::MultiLevelCacheAllocator(
   options_.compaction_shift_ratio = ClampRatio(options_.compaction_shift_ratio);
   options_.compaction_shift_max_total_ratio =
       ClampRatio(options_.compaction_shift_max_total_ratio);
+  options_.total_deadband_ratio = ClampRatio(options_.total_deadband_ratio);
+  options_.per_level_deadband_ratio =
+      ClampRatio(options_.per_level_deadband_ratio);
+  if (options_.max_interval_backoff == 0) {
+    options_.max_interval_backoff = 1;
+  }
 }
 
 MultiLevelCacheAllocator::~MultiLevelCacheAllocator() { Stop(); }
@@ -465,17 +471,123 @@ void MultiLevelCacheAllocator::EnforceMinActiveLevelFloor(
 }
 
 void MultiLevelCacheAllocator::BackgroundLoop() {
+  uint64_t backoff = 1;
   while (running_.load(std::memory_order_acquire)) {
+    bool applied = false;
     {
       std::lock_guard<std::mutex> lock(mu_);
       Status s = RunOnceLocked();
       s.PermitUncheckedError();
+      applied = last_round_applied_;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(options_.interval_ms));
+    // Adaptive interval: in steady state (rounds that change nothing) back
+    // off exponentially so the allocator stops perturbing a converged
+    // configuration; any applied change snaps back to the base interval.
+    if (applied) {
+      backoff = 1;
+    } else {
+      backoff = std::min<uint64_t>(backoff * 2, options_.max_interval_backoff);
+    }
+    const uint64_t sleep_total_ms = options_.interval_ms * backoff;
+    // Sleep in small chunks so Stop() stays responsive under long backoffs.
+    uint64_t slept = 0;
+    while (slept < sleep_total_ms && running_.load(std::memory_order_acquire)) {
+      const uint64_t chunk = std::min<uint64_t>(100, sleep_total_ms - slept);
+      std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
+      slept += chunk;
+    }
+  }
+}
+
+void MultiLevelCacheAllocator::ApplyAntiOscillation(
+    std::vector<size_t>* proposed, size_t budget) {
+  const size_t levels = proposed->size();
+  if (last_capacities_.size() != levels) {
+    return;
+  }
+  if (shrink_streak_.size() != levels) {
+    shrink_streak_.assign(levels, 0);
+  }
+  // Per-level deadband: ignore small wiggles so noise does not move (and,
+  // with purge-on-shrink, destroy) a level's working set.
+  for (size_t i = 0; i < levels; ++i) {
+    const size_t last = last_capacities_[i];
+    size_t& prop = (*proposed)[i];
+    const uint64_t delta = prop > last ? prop - last : last - prop;
+    const uint64_t deadband = std::max<uint64_t>(
+        options_.per_level_deadband_min_bytes,
+        static_cast<uint64_t>(static_cast<double>(last) *
+                              options_.per_level_deadband_ratio));
+    if (delta < deadband) {
+      prop = last;
+    }
+  }
+  // Shrink hysteresis: a shrink must be proposed for shrink_confirm_rounds
+  // consecutive rounds before taking effect, and then closes only half the
+  // gap per round. Grows are applied immediately.
+  if (options_.shrink_confirm_rounds > 1) {
+    for (size_t i = 0; i < levels; ++i) {
+      const size_t last = last_capacities_[i];
+      size_t& prop = (*proposed)[i];
+      if (prop < last) {
+        ++shrink_streak_[i];
+        if (shrink_streak_[i] < options_.shrink_confirm_rounds) {
+          prop = last;
+        } else {
+          prop = last - (last - prop) / 2;
+        }
+      } else {
+        shrink_streak_[i] = 0;
+      }
+    }
+  }
+  // Rebalance to the budget: deferred/halved shrinks may leave the sum above
+  // it (the grows they funded no longer fit), spare slack goes back to the
+  // largest level.
+  uint64_t sum = std::accumulate(proposed->begin(), proposed->end(),
+                                 static_cast<uint64_t>(0));
+  if (sum > budget) {
+    uint64_t over = sum - budget;
+    // Trim the speculative side first: levels currently growing, largest
+    // grow first, never below their previous capacity.
+    std::vector<size_t> grow_order;
+    for (size_t i = 0; i < levels; ++i) {
+      if ((*proposed)[i] > last_capacities_[i]) {
+        grow_order.push_back(i);
+      }
+    }
+    std::sort(grow_order.begin(), grow_order.end(), [&](size_t a, size_t b) {
+      return (*proposed)[a] - last_capacities_[a] >
+             (*proposed)[b] - last_capacities_[b];
+    });
+    for (size_t i : grow_order) {
+      if (over == 0) {
+        break;
+      }
+      const uint64_t grow = (*proposed)[i] - last_capacities_[i];
+      const uint64_t take = std::min<uint64_t>(grow, over);
+      (*proposed)[i] -= static_cast<size_t>(take);
+      over -= take;
+    }
+    // Defensive: trim anything left from the largest levels.
+    for (size_t i = 0; i < levels && over > 0; ++i) {
+      const uint64_t take = std::min<uint64_t>((*proposed)[i], over);
+      (*proposed)[i] -= static_cast<size_t>(take);
+      over -= take;
+    }
+  } else if (sum < budget) {
+    size_t max_index = 0;
+    for (size_t i = 1; i < levels; ++i) {
+      if ((*proposed)[i] > (*proposed)[max_index]) {
+        max_index = i;
+      }
+    }
+    (*proposed)[max_index] += static_cast<size_t>(budget - sum);
   }
 }
 
 Status MultiLevelCacheAllocator::RunOnceLocked() {
+  last_round_applied_ = false;
   if (cache_ == nullptr) {
     return Status::InvalidArgument("cache cannot be null");
   }
@@ -541,13 +653,20 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
 
   if (!last_capacities_.empty() &&
       last_capacities_.size() == capacities_to_apply.size()) {
+    ApplyAntiOscillation(&capacities_to_apply, total_capacity);
     uint64_t total_change = 0;
     for (size_t i = 0; i < capacities_to_apply.size(); ++i) {
       const size_t lhs = capacities_to_apply[i];
       const size_t rhs = last_capacities_[i];
       total_change += static_cast<uint64_t>(lhs > rhs ? lhs - rhs : rhs - lhs);
     }
-    if (total_change < options_.min_total_change_bytes) {
+    // Percentage-based deadband: 1 MiB on an 8 GiB budget (0.012%) lets the
+    // allocator chase noise; scale the threshold with the budget.
+    const uint64_t effective_min_change = std::max<uint64_t>(
+        options_.min_total_change_bytes,
+        static_cast<uint64_t>(static_cast<double>(total_capacity) *
+                              options_.total_deadband_ratio));
+    if (total_change < effective_min_change) {
       prev_data_sizes_ = snapshot.data_sizes;
       prev_lookups_ = snapshot.lookups;
       prev_hits_ = snapshot.hits;
@@ -563,6 +682,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
   ++round_id_;
   if (adjust.ok()) {
     last_capacities_ = std::move(capacities_to_apply);
+    last_round_applied_ = true;
   }
   return adjust;
 }

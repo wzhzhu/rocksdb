@@ -679,6 +679,14 @@ class FixedHyperClockTable : public BaseClockTable {
 
   const HandleImpl* HandlePtr(size_t idx) const { return &array_[idx]; }
 
+  // [begin, end) address range of the slot array. Stable for the lifetime of
+  // the table; lets an external wrapper (MultiLevelCache) resolve a handle's
+  // owning cache by address. Standalone handles are heap-allocated and fall
+  // outside this range.
+  std::pair<const void*, const void*> HandleAddressRange() const {
+    return {array_.get(), array_.get() + GetTableSize()};
+  }
+
 #ifndef NDEBUG
   size_t& TEST_MutableOccupancyLimit() {
     return const_cast<size_t&>(occupancy_limit_);
@@ -990,6 +998,13 @@ class AutoHyperClockTable : public BaseClockTable {
 
   const HandleImpl* HandlePtr(size_t idx) const { return &array_[idx]; }
 
+  // [begin, end) of the full reserved mapping (growth stays within it), so
+  // the range is stable for the lifetime of the table. See the
+  // FixedHyperClockTable counterpart for usage.
+  std::pair<const void*, const void*> HandleAddressRange() const {
+    return {array_.Get(), array_.Get() + array_.Count()};
+  }
+
 #ifndef NDEBUG
   size_t& TEST_MutableOccupancyLimit() {
     return *reinterpret_cast<size_t*>(&occupancy_limit_);
@@ -1146,6 +1161,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
   // Synchronously evict until usage <= capacity (see BaseClockTable).
   void PurgeToCapacity();
 
+  std::pair<const void*, const void*> HandleAddressRange() const {
+    return table_.HandleAddressRange();
+  }
+
   void SetProbationInsert(bool probation_insert);
   bool GetProbationInsert() const;
 
@@ -1250,6 +1269,16 @@ class BaseHyperClockCache : public ShardedCache<ClockCacheShard<Table>> {
   // (eviction is otherwise only realized on the insert path).
   void PurgeToCapacity() {
     this->ForEachShard([](Shard* shard) { shard->PurgeToCapacity(); });
+  }
+
+  // Appends each shard's handle-array address range. Any handle returned by
+  // this cache, except heap-allocated standalone ones, points into one of
+  // these ranges, which are stable for the cache's lifetime.
+  void AppendHandleAddressRanges(
+      std::vector<std::pair<const void*, const void*>>* out) const {
+    this->ForEachShard([out](const Shard* shard) {
+      out->push_back(shard->HandleAddressRange());
+    });
   }
 
   bool GetProbationInsert() const {

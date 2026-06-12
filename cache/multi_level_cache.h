@@ -142,6 +142,18 @@ class MultiLevelCache : public Cache {
     Cache::Handle* inner = nullptr;
   };
 
+  // Maps a handle address to the sub-cache that issued it. HCC sub-caches
+  // hand out pointers into their (lifetime-stable) slot arrays, so the owner
+  // can be recovered by address and handles can be passed through unwrapped,
+  // avoiding a heap-allocated WrappedHandle per hit. Handles that fall
+  // outside all ranges (standalone entries, non-HCC sub-caches) still use a
+  // WrappedHandle, distinguished by tagging the returned pointer's low bit.
+  struct HandleOwnerRange {
+    uintptr_t begin;
+    uintptr_t end;
+    Cache* owner;
+  };
+
   struct SharedAdmissionShard {
     std::mutex mutex;
     std::unordered_map<uint64_t, uint32_t> miss_scores;
@@ -187,20 +199,44 @@ class MultiLevelCache : public Cache {
   void TrimSharedAdmissionShardIfNeeded(SharedAdmissionShard* shard);
   size_t GetSharedPoolCapacity(size_t total_capacity) const;
 
-  WrappedHandle* NewWrappedHandle(Cache* owner_cache, Cache::Handle* inner);
-  static WrappedHandle* ToWrappedHandle(Handle* handle);
-  static const WrappedHandle* ToWrappedHandle(const Handle* handle);
+  void BuildHandleOwnerRanges();
+  Cache* FindHandleOwner(const void* handle_addr) const;
+  Handle* WrapOrPassHandle(Cache* owner_cache, Cache::Handle* inner);
+  // Recovers (owner, inner) for any handle previously returned by this cache.
+  void ResolveHandle(const Handle* handle, Cache** owner,
+                     Cache::Handle** inner) const;
 
   Status ValidateCapacities(const std::vector<size_t>& capacities) const;
   void ApplyCapacities(const std::vector<size_t>& capacities);
   void InitializePerLevelState(size_t level_count);
 
+  // Per-level lookup/hit counters, striped to avoid a single hot cache line:
+  // one level typically receives ~90% of traffic (L6 after full compaction),
+  // and a single atomic pair would be contended by all client threads.
+  // Indexed [stripe * level_count + level]; readers sum across stripes.
+  static constexpr size_t kCounterStripes = 16;
+  struct alignas(64) StripedCounter {
+    std::atomic<uint64_t> v{0};
+  };
+
+  void IncLookupCounter(size_t level_index);
+  void IncHitCounter(size_t level_index);
+  uint64_t SumLookupCounter(size_t level_index) const;
+  uint64_t SumHitCounter(size_t level_index) const;
+
   std::vector<std::shared_ptr<Cache>> sub_caches_;
   std::shared_ptr<Cache> shared_cache_;
-  std::deque<std::atomic<uint64_t>> lookups_;
-  std::deque<std::atomic<uint64_t>> hits_;
+  // Sorted by begin; built once after sub-caches are created, immutable
+  // afterwards (HCC slot arrays are never reallocated).
+  std::vector<HandleOwnerRange> handle_owner_ranges_;
+  std::unique_ptr<StripedCounter[]> lookups_;
+  std::unique_ptr<StripedCounter[]> hits_;
   std::deque<std::atomic<uint64_t>> level_data_sizes_;
-  std::atomic<uint64_t> lookup_sample_seq_{0};
+  // False until someone actually consumes lookup samples (dynamic SR-HCC
+  // worker or an external driver via SetLookupSampleRateLog2). Lets the
+  // lookup hot path skip the globally contended sample sequence atomic
+  // when nobody is listening.
+  std::atomic<bool> lookup_sampling_enabled_{false};
   std::atomic<uint32_t> lookup_sample_rate_log2_{10};
   // Large enough to absorb full-sampling bursts under high concurrency.
   static constexpr size_t kLookupSampleRingSize = 65536;
