@@ -194,7 +194,8 @@ Status MultiLevelCacheAllocator::RunOnce() {
 Status MultiLevelCacheAllocator::SolveCapacities(
     const std::vector<double>& lambda, const std::vector<double>& data,
     const std::vector<double>& alpha, size_t total_capacity,
-    std::vector<size_t>* capacities, double epsilon, int max_iterations) {
+    std::vector<size_t>* capacities, double epsilon, int max_iterations,
+    const std::vector<double>& upper_bounds) {
   if (capacities == nullptr) {
     return Status::InvalidArgument("capacities output cannot be null");
   }
@@ -207,6 +208,26 @@ Status MultiLevelCacheAllocator::SolveCapacities(
     return Status::InvalidArgument("invalid solver configuration");
   }
   if (total_capacity == 0) {
+    capacities->assign(levels, 0);
+    return Status::OK();
+  }
+
+  // Optional per-level upper bound: a level cannot usefully cache more bytes
+  // than it stores. When supplied, the water-filling caps each level and the
+  // surplus flows to higher-marginal levels; the realizable budget is also
+  // bounded by the total usable bytes.
+  const bool use_caps = upper_bounds.size() == levels;
+  size_t effective_budget = total_capacity;
+  if (use_caps) {
+    double sum_ub = 0.0;
+    for (size_t i = 0; i < levels; ++i) {
+      sum_ub += std::max(0.0, upper_bounds[i]);
+    }
+    if (sum_ub < static_cast<double>(total_capacity)) {
+      effective_budget = static_cast<size_t>(std::floor(sum_ub));
+    }
+  }
+  if (effective_budget == 0) {
     capacities->assign(levels, 0);
     return Status::OK();
   }
@@ -238,6 +259,12 @@ Status MultiLevelCacheAllocator::SolveCapacities(
           capacity = 0.0;
         }
       }
+      if (use_caps) {
+        const double ub = std::max(0.0, upper_bounds[i]);
+        if (capacity > ub) {
+          capacity = ub;
+        }
+      }
       if (out != nullptr) {
         (*out)[i] = capacity;
       }
@@ -255,7 +282,7 @@ Status MultiLevelCacheAllocator::SolveCapacities(
       continue;
     }
     const double total = sum_capacities_for_mu(mid, nullptr);
-    if (total > static_cast<double>(total_capacity)) {
+    if (total > static_cast<double>(effective_budget)) {
       low = mid;
     } else {
       high = mid;
@@ -267,7 +294,17 @@ Status MultiLevelCacheAllocator::SolveCapacities(
 
   std::vector<double> continuous(levels, 0.0);
   sum_capacities_for_mu(high, &continuous);
-  *capacities = QuantizeToBudget(continuous, total_capacity);
+  *capacities = QuantizeToBudget(continuous, effective_budget);
+  if (use_caps) {
+    // Guard against quantization rounding pushing a level past its cap.
+    for (size_t i = 0; i < levels; ++i) {
+      const size_t ub =
+          static_cast<size_t>(std::floor(std::max(0.0, upper_bounds[i])));
+      if ((*capacities)[i] > ub) {
+        (*capacities)[i] = ub;
+      }
+    }
+  }
   return Status::OK();
 }
 
@@ -620,9 +657,21 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       prev_hits_ = snapshot.hits;
       return Status::OK();
     }
+    std::vector<double> upper_bounds;
+    if (options_.cap_at_data_size &&
+        snapshot.data_sizes.size() == level_count) {
+      upper_bounds.resize(level_count);
+      for (size_t i = 0; i < level_count; ++i) {
+        const double ds = static_cast<double>(snapshot.data_sizes[i]);
+        upper_bounds[i] =
+            ds > 0.0 ? ds * options_.data_cap_margin_ratio
+                     : static_cast<double>(options_.empty_level_cap_bytes);
+      }
+    }
     Status solve_status =
         SolveCapacities(lambda, data, alpha, total_capacity, &target_capacities,
-                        options_.solver_epsilon, options_.solver_max_iterations);
+                        options_.solver_epsilon, options_.solver_max_iterations,
+                        upper_bounds);
     if (!solve_status.ok()) {
       return solve_status;
     }

@@ -70,6 +70,20 @@ struct MultiLevelAllocationOptions {
   // exponentially up to interval_ms * max_interval_backoff; any applied
   // change resets the interval. 1 disables the backoff.
   uint32_t max_interval_backoff = 8;
+
+  // --- Data-size cap (don't allocate a level more than it can cache) ---
+  // The exponential MRC model can hand a hot-but-small level far more capacity
+  // than its data occupies; the surplus sits idle while deeper, undersaturated
+  // levels starve. When enabled, each level's capacity is upper-bounded by
+  // data_size * data_cap_margin_ratio and the (capped) water-filling solver
+  // redistributes the surplus to higher-marginal levels.
+  bool cap_at_data_size = true;
+  // Headroom over physical data size to absorb block/cache accounting overhead
+  // so a fully-hot level still caches all of its blocks.
+  double data_cap_margin_ratio = 1.10;
+  // Capacity granted to levels with zero data (keeps the sub-cache functional
+  // without squandering budget on empty levels).
+  size_t empty_level_cap_bytes = 1 << 16;  // 64 KiB
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -107,7 +121,9 @@ class MultiLevelCacheAllocator {
                                 size_t total_capacity,
                                 std::vector<size_t>* capacities,
                                 double epsilon = 1e-9,
-                                int max_iterations = 80);
+                                int max_iterations = 80,
+                                const std::vector<double>& upper_bounds =
+                                    std::vector<double>());
 
  private:
   static void EqualSplit(size_t total_capacity, size_t levels,
