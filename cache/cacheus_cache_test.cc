@@ -7,8 +7,15 @@
 
 #include <atomic>
 #include <array>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <list>
+#include <random>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "rocksdb/cache.h"
@@ -44,6 +51,67 @@ int DecodeTrackedKey(const std::string& key) {
 const Cache::CacheItemHelper kHelper{
     CacheEntryRole::kMisc,
     [](Cache::ObjectPtr /*value*/, MemoryAllocator* /*alloc*/) {}};
+
+// Exact LRU over uint32 keys, capacity in entries. Returns true on hit.
+class RefLRU {
+ public:
+  explicit RefLRU(size_t cap) : cap_(cap) {}
+  bool Access(uint32_t k) {
+    auto it = pos_.find(k);
+    if (it != pos_.end()) {
+      lru_.splice(lru_.begin(), lru_, it->second);
+      return true;
+    }
+    if (lru_.size() >= cap_) {
+      pos_.erase(lru_.back());
+      lru_.pop_back();
+    }
+    lru_.push_front(k);
+    pos_[k] = lru_.begin();
+    return false;
+  }
+
+ private:
+  size_t cap_;
+  std::list<uint32_t> lru_;
+  std::unordered_map<uint32_t, std::list<uint32_t>::iterator> pos_;
+};
+
+// Zipfian sampler over [0, n) with precomputed CDF. Fixed seed -> fixed
+// sequence, so two instances with the same seed yield identical traces.
+class Zipf {
+ public:
+  Zipf(uint32_t n, double alpha, uint64_t seed) : rng_(seed), u_(0.0, 1.0) {
+    cdf_.resize(n);
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n; ++i) {
+      sum += 1.0 / std::pow(static_cast<double>(i) + 1.0, alpha);
+      cdf_[i] = sum;
+    }
+    norm_ = sum;
+  }
+  uint32_t Next() {
+    const double r = u_(rng_) * norm_;
+    return static_cast<uint32_t>(
+        std::lower_bound(cdf_.begin(), cdf_.end(), r) - cdf_.begin());
+  }
+
+ private:
+  std::vector<double> cdf_;
+  double norm_ = 0.0;
+  std::mt19937_64 rng_;
+  std::uniform_real_distribution<double> u_;
+};
+
+double ParsePrintableField(const std::string& s, const std::string& key) {
+  const std::string needle = key + "=";
+  size_t pos = s.find(needle);
+  if (pos == std::string::npos) {
+    return -1.0;
+  }
+  pos += needle.size();
+  return std::strtod(s.c_str() + pos, nullptr);
+}
 
 }  // namespace
 
@@ -261,6 +329,269 @@ TEST(CacheusCacheTest, ConcurrentAccessSmoke) {
   ASSERT_NE(typed, nullptr);
   auto snap = typed->TEST_GetSnapshot();
   ASSERT_LE(snap.logical_usage, cache->GetCapacity());
+}
+
+// Diagnostic micro-benchmark (disabled by default). Run with:
+//   ./cacheus_cache_test --gtest_filter='*ZipfianHitRatioDiagnostic*'
+//       --gtest_also_run_disabled_tests
+// Compares pure Cacheus policy hit ratio vs exact LRU on a zipfian trace
+// across cache/keyspace ratios, and dumps internal utilization/S-Q/weights.
+TEST(CacheusCacheTest, DISABLED_ZipfianHitRatioDiagnostic) {
+  const uint32_t N = 50000;
+  const double alpha = 0.99;
+  const size_t warmup = static_cast<size_t>(N) * 8;
+  const size_t measure = static_cast<size_t>(N) * 16;
+  const uint64_t trace_seed = 20260613;
+
+  printf(
+      "\n%-6s %9s %9s %7s %9s %9s %7s %7s %7s %7s %9s %9s\n", "ratio",
+      "cacheus", "lru", "delta", "usage", "cap", "s_len", "q_len", "s_lim",
+      "q_lim", "evictLRU", "evictLFU");
+
+  for (double ratio : {0.01, 0.02, 0.05, 0.10, 0.20, 0.40}) {
+    const size_t cap = std::max<size_t>(1, static_cast<size_t>(N * ratio));
+
+    // --- Cacheus (pure policy via TEST_RequestStep) ---
+    auto cache = NewCacheusCache(cap, 0);
+    auto* typed = dynamic_cast<CacheusCache*>(cache.get());
+    ASSERT_NE(typed, nullptr);
+    Zipf zc(N, alpha, trace_seed);
+    for (size_t i = 0; i < warmup; ++i) {
+      typed->TEST_RequestStep(EncodeKey(zc.Next()), 1);
+    }
+    const std::string before = cache->GetPrintableOptions();
+    const double h0 = ParsePrintableField(before, "cacheus.total_hits");
+    const double m0 = ParsePrintableField(before, "cacheus.total_misses");
+    for (size_t i = 0; i < measure; ++i) {
+      typed->TEST_RequestStep(EncodeKey(zc.Next()), 1);
+    }
+    const std::string after = cache->GetPrintableOptions();
+    const double h1 = ParsePrintableField(after, "cacheus.total_hits");
+    const double m1 = ParsePrintableField(after, "cacheus.total_misses");
+    const double cacheus_hr = (h1 - h0) / std::max(1.0, (h1 - h0) + (m1 - m0));
+    auto snap = typed->TEST_GetSnapshot();
+
+    // --- Exact LRU on identical trace ---
+    RefLRU ref(cap);
+    Zipf zl(N, alpha, trace_seed);
+    for (size_t i = 0; i < warmup; ++i) {
+      ref.Access(zl.Next());
+    }
+    size_t lru_hits = 0;
+    for (size_t i = 0; i < measure; ++i) {
+      if (ref.Access(zl.Next())) {
+        ++lru_hits;
+      }
+    }
+    const double lru_hr = static_cast<double>(lru_hits) / measure;
+
+    printf(
+        "%-6.2f %9.4f %9.4f %+7.4f %9zu %9zu %7zu %7zu %7zu %7zu %9llu %9llu\n",
+        ratio, cacheus_hr, lru_hr, cacheus_hr - lru_hr, snap.logical_usage, cap,
+        snap.s_len, snap.q_len, snap.s_limit, snap.q_limit,
+        (unsigned long long)snap.evict_lru_count,
+        (unsigned long long)snap.evict_lfu_count);
+  }
+}
+
+namespace {
+bool g_variable_block_size = false;
+
+// Real Lookup/Insert path, configurable sharding. charge=1 with metadata not
+// charged so capacity == entry count. Returns measured hit ratio.
+double RunRealPath(bool cacheus, int shard_bits, uint32_t N, double alpha,
+                   size_t cap_entries, size_t warmup, size_t measure,
+                   uint64_t seed, size_t block_bytes = 16384) {
+  // Use a realistic per-entry charge so HCC's ~445B/entry metadata overhead is
+  // negligible (<3%); charge=1 makes overhead dominate and is unrepresentative.
+  const size_t cap = cap_entries * block_bytes;
+  LRUCacheOptions opts;
+  opts.capacity = cap;
+  opts.num_shard_bits = shard_bits;
+  opts.metadata_charge_policy = kDontChargeCacheMetadata;
+  std::shared_ptr<Cache> cache =
+      cacheus ? NewCacheusCache(opts) : NewLRUCache(opts);
+  Zipf z(N, alpha, seed);
+  // Per-key block size: 0 => uniform block_bytes; otherwise deterministic
+  // 4KB..32KB derived from the key so cacheus/LRU see identical traces.
+  auto charge_of = [&](uint32_t k) -> size_t {
+    if (g_variable_block_size) {
+      uint64_t h = k * 0x9E3779B97F4A7C15ULL;
+      return 4096 + static_cast<size_t>((h >> 33) % 28673);
+    }
+    return block_bytes;
+  };
+  auto step = [&](bool count, size_t* hits) {
+    const uint32_t k = z.Next();
+    std::string key;
+    PutFixed64(&key, k);
+    PutFixed64(&key, 0);  // pad to 16-byte cache key for HCC backing
+    auto* h = cache->Lookup(key, &kHelper, nullptr);
+    if (h != nullptr) {
+      if (count) {
+        ++(*hits);
+      }
+      cache->Release(h);
+    } else {
+      cache->Insert(key, EncodeValue(k), &kHelper, charge_of(k));
+    }
+  };
+  size_t hits = 0, dummy = 0;
+  for (size_t i = 0; i < warmup; ++i) {
+    step(false, &dummy);
+  }
+  for (size_t i = 0; i < measure; ++i) {
+    step(true, &hits);
+  }
+  return static_cast<double>(hits) / static_cast<double>(measure);
+}
+}  // namespace
+
+// Decisive isolation: does a plain HCC at the cacheus backing size hold all
+// keys, and does an eviction-callback-returning-false change that?
+TEST(CacheusCacheTest, DISABLED_BackingIsolation) {
+  const uint32_t N = 50000;
+  const double alpha = 0.99;
+  const size_t backing_cap = 16 * 20000 + (1 << 20);  // ComputeBackingCapacity
+  const size_t warmup = static_cast<size_t>(N) * 8;
+  const size_t measure = static_cast<size_t>(N) * 16;
+  const uint64_t seed = 20260613;
+
+  auto run = [&](std::shared_ptr<Cache> cache, const char* label) {
+    Zipf z(N, alpha, seed);
+    auto step = [&](bool count, size_t* hits) {
+      const uint32_t k = z.Next();
+      std::string key;
+      PutFixed64(&key, k);
+      PutFixed64(&key, 0);
+      auto* h = cache->Lookup(key, &kHelper, nullptr);
+      if (h != nullptr) {
+        if (count) ++(*hits);
+        cache->Release(h);
+      } else {
+        cache->Insert(key, EncodeValue(k), &kHelper, 1);
+      }
+    };
+    size_t dummy = 0, hits = 0;
+    for (size_t i = 0; i < warmup; ++i) step(false, &dummy);
+    for (size_t i = 0; i < measure; ++i) step(true, &hits);
+    printf("%-28s hit=%.4f usage=%zu cap=%zu\n", label,
+           static_cast<double>(hits) / measure, cache->GetUsage(),
+           cache->GetCapacity());
+  };
+
+  {
+    HyperClockCacheOptions o(backing_cap, 0, 0, false, nullptr,
+                             kDontChargeCacheMetadata);
+    run(o.MakeSharedCache(), "plain_hcc");
+  }
+  {
+    HyperClockCacheOptions o(backing_cap, 0, 0, false, nullptr,
+                             kDontChargeCacheMetadata);
+    auto c = o.MakeSharedCache();
+    c->SetEvictionCallback(
+        [](const Slice&, Cache::Handle*, bool) { return false; });
+    run(c, "hcc_with_evict_cb_false");
+  }
+}
+
+// Low-coverage regime: large keyspace, few ops per key (mimics YCSB wlC where
+// 8GB cache fills with mid-tail blocks revisited <1x within the run). This is
+// the regime where Cacheus's 2-miss Q->S admission cost is expected to bite.
+TEST(CacheusCacheTest, DISABLED_LowCoverageRegime) {
+  const uint32_t N = 200000;
+  const double alpha = 0.99;
+  const size_t block = 8192;
+  g_variable_block_size = false;
+
+  for (double cov : {0.5, 1.0, 2.0}) {
+    const size_t warmup = static_cast<size_t>(N * cov);
+    const size_t measure = static_cast<size_t>(N * cov);
+    printf("\n[coverage=%.1fx warmup=%zu measure=%zu]\n%-6s %10s %10s %10s\n",
+           cov, warmup, measure, "ratio", "cacheus_s0", "lru_s0", "delta");
+    for (double ratio : {0.05, 0.10, 0.20, 0.40, 0.60}) {
+      const size_t cap = std::max<size_t>(64, static_cast<size_t>(N * ratio));
+      const double c0 =
+          RunRealPath(true, 0, N, alpha, cap, warmup, measure, 20260613, block);
+      const double l0 =
+          RunRealPath(false, 0, N, alpha, cap, warmup, measure, 20260613,
+                      block);
+      printf("%-6.2f %10.4f %10.4f %+10.4f\n", ratio, c0, l0, c0 - l0);
+    }
+  }
+}
+
+// Single-instance real-path deep dump: compares measured backing hit ratio to
+// the shadow policy's internal state to locate where hits are lost.
+TEST(CacheusCacheTest, DISABLED_RealPathDeepDump) {
+  const uint32_t N = 50000;
+  const double alpha = 0.99;
+  const size_t cap = 20000;  // 40%
+  const size_t warmup = static_cast<size_t>(N) * 8;
+  const size_t measure = static_cast<size_t>(N) * 16;
+  const uint64_t seed = 20260613;
+
+  LRUCacheOptions opts;
+  opts.capacity = cap;
+  opts.num_shard_bits = 0;
+  opts.metadata_charge_policy = kDontChargeCacheMetadata;
+  auto cache = NewCacheusCache(opts);
+  auto* typed = dynamic_cast<CacheusCache*>(cache.get());
+  ASSERT_NE(typed, nullptr);
+
+  Zipf z(N, alpha, seed);
+  auto step = [&](bool count, size_t* hits) {
+    const uint32_t k = z.Next();
+    std::string key;
+    PutFixed64(&key, k);
+    PutFixed64(&key, 0);
+    auto* h = cache->Lookup(key, &kHelper, nullptr);
+    if (h != nullptr) {
+      if (count) ++(*hits);
+      cache->Release(h);
+    } else {
+      cache->Insert(key, EncodeValue(k), &kHelper, 1);
+    }
+  };
+  size_t dummy = 0, hits = 0;
+  for (size_t i = 0; i < warmup; ++i) step(false, &dummy);
+  for (size_t i = 0; i < measure; ++i) step(true, &hits);
+
+  printf("\nmeasured backing hit ratio = %.4f\n",
+         static_cast<double>(hits) / measure);
+  printf("--- shadow printable ---\n%s\n",
+         cache->GetPrintableOptions().c_str());
+  printf("GetUsage(backing-reported)=%zu GetCapacity=%zu\n", cache->GetUsage(),
+         cache->GetCapacity());
+}
+
+// Isolates the effect of wrapper sharding on Cacheus vs LRU hit ratio.
+TEST(CacheusCacheTest, DISABLED_ShardingHitRatioDiagnostic) {
+  const uint32_t N = 50000;
+  const double alpha = 0.99;
+  const size_t warmup = static_cast<size_t>(N) * 8;
+  const size_t measure = static_cast<size_t>(N) * 16;
+  const uint64_t seed = 20260613;
+
+  for (bool var : {false, true}) {
+    g_variable_block_size = var;
+    printf("\n[block_size=%s]\n%-6s %10s %10s %10s %10s\n",
+           var ? "variable_4-32KB" : "uniform_16KB", "ratio", "cacheus_s0",
+           "cacheus_s6", "lru_s0", "lru_s6");
+    for (double ratio : {0.02, 0.05, 0.10, 0.20, 0.40}) {
+      const size_t cap = std::max<size_t>(64, static_cast<size_t>(N * ratio));
+      const double c0 =
+          RunRealPath(true, 0, N, alpha, cap, warmup, measure, seed);
+      const double c6 =
+          RunRealPath(true, 6, N, alpha, cap, warmup, measure, seed);
+      const double l0 =
+          RunRealPath(false, 0, N, alpha, cap, warmup, measure, seed);
+      const double l6 =
+          RunRealPath(false, 6, N, alpha, cap, warmup, measure, seed);
+      printf("%-6.2f %10.4f %10.4f %10.4f %10.4f\n", ratio, c0, c6, l0, l6);
+    }
+  }
+  g_variable_block_size = false;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
