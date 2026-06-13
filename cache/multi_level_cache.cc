@@ -32,12 +32,20 @@ std::shared_ptr<Cache> MakeSubCacheWithCapacity(const CacheOptionsT& base_option
 }
 
 std::shared_ptr<Cache> MakeSubCacheWithCapacity(
-    const HyperClockCacheOptions& base_options, size_t capacity) {
+    const HyperClockCacheOptions& base_options, size_t capacity,
+    size_t mmap_capacity) {
   HyperClockCacheOptions options = base_options;
-  // Auto HCC may fail to initialize when constructed with zero capacity.
-  // Use a tiny bootstrap capacity; runtime SetCapacity(0) is still allowed.
-  options.capacity = std::max<size_t>(capacity, 1);
-  return options.MakeSharedCache();
+  // The Auto HCC slot array is an mmap whose size is fixed at construction
+  // from `capacity` (CalcMaxUsableLength) and can never grow beyond it. MLC's
+  // allocator later raises a hot level far above its equal-split start (e.g.
+  // L6 to ~0.9x total), so reserve the mapping for the whole budget here and
+  // set the smaller starting capacity afterward; otherwise Grow() runs past
+  // the mapping and corrupts the heap. Auto HCC may also fail to initialize at
+  // zero capacity, so floor the reservation at 1.
+  options.capacity = std::max<size_t>(mmap_capacity, 1);
+  auto cache = options.MakeSharedCache();
+  cache->SetCapacity(capacity);
+  return cache;
 }
 
 constexpr uint32_t kRatioScalePpm = 1000000U;
@@ -143,9 +151,9 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
       level_capacity = total_capacity;
     }
     sub_caches_.emplace_back(
-        MakeSubCacheWithCapacity(hcc_options, level_capacity));
+        MakeSubCacheWithCapacity(hcc_options, level_capacity, total_capacity));
   }
-  shared_cache_ = MakeSubCacheWithCapacity(hcc_options, 0);
+  shared_cache_ = MakeSubCacheWithCapacity(hcc_options, 0, total_capacity);
   InitializePerLevelState(level_count);
 }
 
