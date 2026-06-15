@@ -692,6 +692,14 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
         return Status::OK();
       }
       *handle = StandaloneInsert<HandleImpl>(proto);
+      // StandaloneInsert only bumps standalone_usage_, but Release() of a
+      // standalone handle decrements usage_ too (see the IsStandalone()
+      // branches in Release). So usage_ must be charged here to stay balanced
+      // -- exactly as the non-strict fallback path below does. Without this,
+      // every doorkeeper rejection permanently leaks `total_charge` out of
+      // usage_, making the shard under-report usage, over-fill past capacity,
+      // and inflate hit ratio.
+      usage_.FetchAddRelaxed(proto.GetTotalCharge());
       return Status::OkOverwritten();
     }
   }
