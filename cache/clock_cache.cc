@@ -391,11 +391,18 @@ void ClockHandleBasicData::FreeData(MemoryAllocator* allocator) const {
 BaseClockTable::BaseClockTable(size_t capacity, bool strict_capacity_limit,
                                int eviction_effort_cap,
                                bool probation_insert,
+                               const BaseOpts& base_opts,
                                CacheMetadataChargePolicy metadata_charge_policy,
                                MemoryAllocator* allocator,
                                const Cache::EvictionCallback* eviction_callback,
                                const uint32_t* hash_seed)
     : probation_insert_(probation_insert),
+      frequency_aware_admission_(base_opts.frequency_aware_admission),
+      freq_cold_threshold_(base_opts.freq_cold_threshold),
+      freq_warm_threshold_(base_opts.freq_warm_threshold),
+      freq_doorkeeper_(base_opts.freq_doorkeeper),
+      freq_lookup_sample_mask_((uint64_t{1} << base_opts.freq_lookup_sample_log2) -
+                               1),
       capacity_(capacity),
       eec_and_scl_(EecAndScl{}
                        .With<EvictionEffortCap>(
@@ -404,7 +411,29 @@ BaseClockTable::BaseClockTable(size_t capacity, bool strict_capacity_limit,
       metadata_charge_policy_(metadata_charge_policy),
       allocator_(allocator),
       eviction_callback_(*eviction_callback),
-      hash_seed_(*hash_seed) {}
+      hash_seed_(*hash_seed) {
+  if (frequency_aware_admission_) {
+    // Size the per-shard sketch to roughly the number of entries the shard can
+    // hold. We don't know the exact average charge here, so assume a typical
+    // data-block size; the sketch is robust to misestimation via aging.
+    constexpr size_t kAssumedEntryCharge = 4096;
+    freq_sketch_.Init(capacity / kAssumedEntryCharge);
+  }
+}
+
+void BaseClockTable::CountLookupAccess(const UniqueId64x2& hashed_key) {
+  // Only the W-TinyLFU doorkeeper mode counts lookups; plain frequency-aware
+  // admission (countdown-only) updates the sketch on inserts alone. Sampled and
+  // lock-free. The caller has already checked IsFrequencyAwareAdmission().
+  if (!freq_doorkeeper_) {
+    return;
+  }
+  static thread_local uint64_t sample_counter = 0;
+  if ((sample_counter++ & freq_lookup_sample_mask_) != 0) {
+    return;
+  }
+  freq_sketch_.TouchAndEstimate(hashed_key);
+}
 
 template <class HandleImpl>
 HandleImpl* BaseClockTable::StandaloneInsert(
@@ -642,6 +671,31 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
   typename Table::InsertState state;
   derived.StartInsert(state);
 
+  // Frequency-aware admission: estimate (and record) this key's access
+  // frequency once up front so it drives both the doorkeeper decision here and
+  // the initial countdown chosen below.
+  const bool fa_active =
+      frequency_aware_admission_ && priority == Cache::Priority::LOW;
+  uint32_t fa_freq = 0;
+  if (fa_active) {
+    fa_freq = freq_sketch_.TouchAndEstimate(proto.hashed_key);
+    // W-TinyLFU doorkeeper: when the shard is already at capacity, a cold
+    // newcomer would only displace a (likely warmer) resident entry, so refuse
+    // to cache it. The block is still returned to the caller as a standalone
+    // (uncached) handle, so correctness/availability is unaffected; it just
+    // does not pollute the table. Underfull shards admit everything (warmup).
+    if (freq_doorkeeper_ && fa_freq <= freq_cold_threshold_ &&
+        usage_.LoadRelaxed() + proto.GetTotalCharge() >
+            capacity_.LoadRelaxed()) {
+      if (handle == nullptr) {
+        proto.FreeData(allocator_);
+        return Status::OK();
+      }
+      *handle = StandaloneInsert<HandleImpl>(proto);
+      return Status::OkOverwritten();
+    }
+  }
+
   // Do we have the available occupancy? Optimistically assume we do
   // and deal with it if we don't.
   size_t old_occupancy = occupancy_.FetchAdd(1);
@@ -693,8 +747,23 @@ Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
     // * Have to insert into a suboptimal location (more probes) so that the
     // old entry can be kept around as well.
 
-    uint32_t initial_countdown =
-        GetInitialCountdown(priority, probation_insert_.load(std::memory_order_relaxed));
+    uint32_t initial_countdown;
+    if (fa_active) {
+      // Pick the initial countdown from the frequency estimated above. Cold/
+      // one-hit keys enter on probation so they die on the next sweep;
+      // repeatedly (re-)fetched hot keys earn full residency. HIGH/BOTTOM
+      // priority (index/filter) keep the priority-based defaults.
+      if (fa_freq <= freq_cold_threshold_) {
+        initial_countdown = 0;
+      } else if (fa_freq <= freq_warm_threshold_) {
+        initial_countdown = 1;
+      } else {
+        initial_countdown = ClockHandle::kLowCountdown;
+      }
+    } else {
+      initial_countdown = GetInitialCountdown(
+          priority, probation_insert_.load(std::memory_order_relaxed));
+    }
 
     HandleImpl* e =
         derived.DoInsert(proto, initial_countdown, handle != nullptr, state);
@@ -777,7 +846,7 @@ FixedHyperClockTable::FixedHyperClockTable(
     const Cache::EvictionCallback* eviction_callback, const uint32_t* hash_seed,
     const Opts& opts)
     : BaseClockTable(capacity, strict_capacity_limit, opts.eviction_effort_cap,
-                     opts.probation_insert,
+                     opts.probation_insert, opts,
                      metadata_charge_policy, allocator, eviction_callback,
                      hash_seed),
       length_bits_(CalcHashBits(capacity, opts.estimated_value_size,
@@ -1347,6 +1416,9 @@ typename ClockCacheShard<Table>::HandleImpl* ClockCacheShard<Table>::Lookup(
     const Slice& key, const UniqueId64x2& hashed_key) {
   if (UNLIKELY(key.size() != kCacheKeySize)) {
     return nullptr;
+  }
+  if (table_.IsFrequencyAwareAdmission()) {
+    table_.CountLookupAccess(hashed_key);
   }
   return table_.Lookup(hashed_key);
 }
@@ -2007,7 +2079,7 @@ AutoHyperClockTable::AutoHyperClockTable(
     const Cache::EvictionCallback* eviction_callback, const uint32_t* hash_seed,
     const Opts& opts)
     : BaseClockTable(capacity, strict_capacity_limit, opts.eviction_effort_cap,
-                     opts.probation_insert,
+                     opts.probation_insert, opts,
                      metadata_charge_policy, allocator, eviction_callback,
                      hash_seed),
       array_(MemMapping::AllocateLazyZeroed(

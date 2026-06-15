@@ -466,6 +466,35 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
   // one-hit scan entries more likely to be evicted on first sweep.
   bool probation_insert = false;
 
+  // Frequency-aware admission (a lock-free, ARC/TinyLFU-inspired generalization
+  // of probation_insert). When true, each shard maintains a small lock-free
+  // Count-Min sketch updated on insert (the miss path only, so the Lookup hot
+  // path is untouched). A new LOW-priority (data block) entry's initial
+  // countdown is chosen from its recent insert frequency instead of the fixed
+  // priority value: keys never/rarely seen enter on probation (low countdown)
+  // so one-hit-wonders die on the next sweep, while keys that keep being
+  // re-fetched (the hot reuse set ARC would protect via ghosts) enter with a
+  // higher countdown. HIGH/BOTTOM priority entries are unaffected.
+  // Takes precedence over probation_insert when both are set.
+  bool frequency_aware_admission = false;
+  // Insert frequency at/below which a new entry is admitted on probation
+  // (initial countdown 0). Default 1 => first-ever insert of a key.
+  uint32_t freq_admission_cold_threshold = 1;
+  // Insert frequency at/below which a new entry gets initial countdown 1
+  // (above cold_threshold). Above this, entries get the normal LOW countdown.
+  uint32_t freq_admission_warm_threshold = 2;
+  // W-TinyLFU-style admission (only meaningful when frequency_aware_admission).
+  // When true, the sketch is also updated on lookups (sampled) so it reflects
+  // true access frequency (hits included), not just the insert/miss stream; and
+  // a cold newcomer (estimated frequency <= freq_admission_cold_threshold) is
+  // refused admission to the table -- returned as a standalone (uncached)
+  // handle -- whenever the shard is already at capacity, so one-hit-wonders
+  // cannot evict warmer resident entries. Underfull shards admit everything.
+  bool freq_admission_doorkeeper = false;
+  // Update the sketch on this fraction (1 in 2^freq_lookup_sample_log2) of
+  // lookups. 0 = every lookup. Only used when freq_admission_doorkeeper.
+  uint32_t freq_lookup_sample_log2 = 1;
+
   explicit HyperClockCacheOptions(
       size_t _capacity, size_t _estimated_entry_charge = 0,
       int _num_shard_bits = -1, bool _strict_capacity_limit = false,

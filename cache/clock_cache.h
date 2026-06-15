@@ -416,6 +416,102 @@ struct ClockHandle : public ClockHandleBasicData {
   mutable BitFieldsAtomic<SlotMeta> meta{};
 };  // struct ClockHandle
 
+// A small, lock-free Count-Min sketch used for frequency-aware admission
+// (see HyperClockCacheOptions::frequency_aware_admission). Counters are single
+// bytes updated with relaxed atomics; races merely drop a few counts, which is
+// acceptable for an approximate frequency estimate. One sketch lives per shard
+// (inside BaseClockTable), so there is no cross-shard contention. It is only
+// allocated when the feature is enabled.
+class FrequencySketch {
+ public:
+  FrequencySketch() = default;
+
+  // (Re)initializes the sketch sized to roughly hold `est_entries` distinct
+  // keys. Must be called single-threaded (during construction).
+  void Init(size_t est_entries) {
+    size_t target = est_entries < kMinWidth ? kMinWidth : est_entries;
+    if (target > kMaxWidth) {
+      target = kMaxWidth;
+    }
+    size_t w = 1;
+    while (w < target) {
+      w <<= 1;
+    }
+    width_ = w;
+    mask_ = w - 1;
+    const size_t total = kRows * w;
+    counters_.reset(new std::atomic<uint8_t>[total]);
+    for (size_t i = 0; i < total; ++i) {
+      counters_[i].store(0, std::memory_order_relaxed);
+    }
+    reset_threshold_ = static_cast<uint64_t>(w) * kSampleFactor;
+    additions_.store(0, std::memory_order_relaxed);
+  }
+
+  bool Initialized() const { return counters_ != nullptr; }
+
+  // Increments the key's counters (saturating) and returns the post-increment
+  // min estimate. Performs periodic aging. Lock-free.
+  uint32_t TouchAndEstimate(const UniqueId64x2& hashed_key) {
+    if (counters_ == nullptr) {
+      return 0;
+    }
+    const uint64_t h0 = hashed_key[0];
+    const uint64_t h1 = hashed_key[1];
+    const size_t idx[kRows] = {
+        static_cast<size_t>(h0) & mask_,
+        static_cast<size_t>(h0 >> 32) & mask_,
+        static_cast<size_t>(h1) & mask_,
+        static_cast<size_t>(h1 >> 32) & mask_,
+    };
+    uint32_t est = kCounterMax;
+    for (size_t r = 0; r < kRows; ++r) {
+      std::atomic<uint8_t>& c = counters_[r * width_ + idx[r]];
+      uint8_t cur = c.load(std::memory_order_relaxed);
+      if (cur < kCounterMax) {
+        ++cur;
+        c.store(cur, std::memory_order_relaxed);
+      }
+      if (cur < est) {
+        est = cur;
+      }
+    }
+    MaybeAge();
+    return est;
+  }
+
+ private:
+  void MaybeAge() {
+    // fetch_add hands every integer to exactly one thread, so the reset is
+    // triggered by exactly one thread when it observes the threshold value.
+    const uint64_t n = additions_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n != reset_threshold_) {
+      return;
+    }
+    const size_t total = kRows * width_;
+    for (size_t i = 0; i < total; ++i) {
+      uint8_t cur = counters_[i].load(std::memory_order_relaxed);
+      if (cur != 0) {
+        counters_[i].store(static_cast<uint8_t>(cur >> 1),
+                           std::memory_order_relaxed);
+      }
+    }
+    additions_.store(0, std::memory_order_relaxed);
+  }
+
+  static constexpr size_t kRows = 4;
+  static constexpr size_t kMinWidth = 1024;
+  static constexpr size_t kMaxWidth = size_t{1} << 22;  // cap counters/row
+  static constexpr uint8_t kCounterMax = 15;
+  static constexpr uint64_t kSampleFactor = 10;
+
+  std::unique_ptr<std::atomic<uint8_t>[]> counters_;
+  size_t width_ = 0;
+  size_t mask_ = 0;
+  uint64_t reset_threshold_ = 0;
+  std::atomic<uint64_t> additions_{0};
+};
+
 class BaseClockTable {
  public:
   struct BaseOpts {
@@ -423,14 +519,26 @@ class BaseClockTable {
         : eviction_effort_cap(_eviction_effort_cap),
           probation_insert(_probation_insert) {}
     explicit BaseOpts(const HyperClockCacheOptions& opts)
-        : BaseOpts(opts.eviction_effort_cap, opts.probation_insert) {}
+        : BaseOpts(opts.eviction_effort_cap, opts.probation_insert) {
+      frequency_aware_admission = opts.frequency_aware_admission;
+      freq_cold_threshold = opts.freq_admission_cold_threshold;
+      freq_warm_threshold = opts.freq_admission_warm_threshold;
+      freq_doorkeeper = opts.freq_admission_doorkeeper;
+      freq_lookup_sample_log2 = opts.freq_lookup_sample_log2;
+    }
     int eviction_effort_cap;
     bool probation_insert;
+    bool frequency_aware_admission = false;
+    uint32_t freq_cold_threshold = 1;
+    uint32_t freq_warm_threshold = 2;
+    bool freq_doorkeeper = false;
+    uint32_t freq_lookup_sample_log2 = 1;
   };
 
   BaseClockTable(size_t capacity, bool strict_capacity_limit,
                  int eviction_effort_cap,
                  bool probation_insert,
+                 const BaseOpts& base_opts,
                  CacheMetadataChargePolicy metadata_charge_policy,
                  MemoryAllocator* allocator,
                  const Cache::EvictionCallback* eviction_callback,
@@ -471,6 +579,15 @@ class BaseClockTable {
   bool GetProbationInsert() const {
     return probation_insert_.load(std::memory_order_relaxed);
   }
+
+  // Cheap hot-path predicate so callers can skip the (sampled) sketch update
+  // entirely when frequency-aware admission is off.
+  bool IsFrequencyAwareAdmission() const { return frequency_aware_admission_; }
+
+  // Updates the frequency sketch for an access (lookup), subject to the
+  // configured sampling rate. No-op unless frequency-aware admission with the
+  // doorkeeper/lookup-counting enabled. Lock-free.
+  void CountLookupAccess(const UniqueId64x2& hashed_key);
 
   uint32_t GetHashSeed() const { return hash_seed_; }
 
@@ -557,6 +674,19 @@ class BaseClockTable {
 
   std::atomic<bool> probation_insert_{false};
 
+  // Frequency-aware admission (set once at construction; see
+  // HyperClockCacheOptions::frequency_aware_admission). When enabled,
+  // freq_sketch_ is allocated and consulted on insert to pick a new LOW
+  // priority entry's initial countdown.
+  bool frequency_aware_admission_ = false;
+  uint32_t freq_cold_threshold_ = 1;
+  uint32_t freq_warm_threshold_ = 2;
+  // W-TinyLFU doorkeeper: reject cold newcomers when at capacity, and count
+  // lookups (sampled) into the sketch. freq_lookup_sample_mask_ = 2^log2 - 1.
+  bool freq_doorkeeper_ = false;
+  uint64_t freq_lookup_sample_mask_ = 1;
+  FrequencySketch freq_sketch_;
+
   // TODO: is this separation needed if we don't do background evictions?
   ALIGN_AS(CACHE_LINE_SIZE)
   // Number of elements in the table.
@@ -637,6 +767,11 @@ class FixedHyperClockTable : public BaseClockTable {
         : BaseOpts(opts.eviction_effort_cap) {
       assert(opts.estimated_entry_charge > 0);
       estimated_value_size = opts.estimated_entry_charge;
+      frequency_aware_admission = opts.frequency_aware_admission;
+      freq_cold_threshold = opts.freq_admission_cold_threshold;
+      freq_warm_threshold = opts.freq_admission_warm_threshold;
+      freq_doorkeeper = opts.freq_admission_doorkeeper;
+      freq_lookup_sample_log2 = opts.freq_lookup_sample_log2;
     }
     size_t estimated_value_size;
   };
@@ -951,6 +1086,11 @@ class AutoHyperClockTable : public BaseClockTable {
         : BaseOpts(opts.eviction_effort_cap) {
       assert(opts.estimated_entry_charge == 0);
       min_avg_value_size = opts.min_avg_entry_charge;
+      frequency_aware_admission = opts.frequency_aware_admission;
+      freq_cold_threshold = opts.freq_admission_cold_threshold;
+      freq_warm_threshold = opts.freq_admission_warm_threshold;
+      freq_doorkeeper = opts.freq_admission_doorkeeper;
+      freq_lookup_sample_log2 = opts.freq_lookup_sample_log2;
     }
     size_t min_avg_value_size;
   };
