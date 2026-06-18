@@ -15,8 +15,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <utility>
 
 namespace ROCKSDB_NAMESPACE {
@@ -508,25 +510,17 @@ void MultiLevelCacheAllocator::EnforceMinActiveLevelFloor(
 }
 
 void MultiLevelCacheAllocator::BackgroundLoop() {
-  uint64_t backoff = 1;
   while (running_.load(std::memory_order_acquire)) {
-    bool applied = false;
     {
       std::lock_guard<std::mutex> lock(mu_);
       Status s = RunOnceLocked();
       s.PermitUncheckedError();
-      applied = last_round_applied_;
     }
-    // Adaptive interval: in steady state (rounds that change nothing) back
-    // off exponentially so the allocator stops perturbing a converged
-    // configuration; any applied change snaps back to the base interval.
-    if (applied) {
-      backoff = 1;
-    } else {
-      backoff = std::min<uint64_t>(backoff * 2, options_.max_interval_backoff);
-    }
-    const uint64_t sleep_total_ms = options_.interval_ms * backoff;
-    // Sleep in small chunks so Stop() stays responsive under long backoffs.
+    // Fixed cadence: wake every interval_ms. (No adaptive backoff: the model-
+    // stability gate already suppresses needless applies, and a constant
+    // interval keeps adaptation latency predictable.) Sleep in small chunks so
+    // Stop() stays responsive.
+    const uint64_t sleep_total_ms = options_.interval_ms;
     uint64_t slept = 0;
     while (slept < sleep_total_ms && running_.load(std::memory_order_acquire)) {
       const uint64_t chunk = std::min<uint64_t>(100, sleep_total_ms - slept);
@@ -625,6 +619,9 @@ void MultiLevelCacheAllocator::ApplyAntiOscillation(
 
 Status MultiLevelCacheAllocator::RunOnceLocked() {
   last_round_applied_ = false;
+  static const bool kAllocDebug = getenv("MLC_ALLOC_DEBUG") != nullptr;
+  static std::atomic<uint64_t> dbg_applied{0};
+  static std::atomic<uint64_t> dbg_skipped{0};
   if (cache_ == nullptr) {
     return Status::InvalidArgument("cache cannot be null");
   }
@@ -677,6 +674,47 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     }
   }
 
+  // Model-stability gate. If the raw solved target swings too far from the
+  // previous round's target, the model signal is untrustworthy (write-heavy or
+  // low cache-to-data-ratio noise makes the water-filling solver emit wildly
+  // different allocations each round). Acting on it churns
+  // SetCapacity/PurgeToCapacity on the hot sub-caches every round with no
+  // hit-ratio benefit and a large, compounding throughput loss. Skip the round
+  // instead (hold the current allocation; the adaptive interval backs off). A
+  // stable workload yields consecutive targets that agree, so it still adapts.
+  if (options_.mode == MultiLevelAllocatorMode::kModel &&
+      options_.model_stability_threshold > 0.0 && total_capacity > 0 &&
+      prev_target_capacities_.size() == target_capacities.size()) {
+    uint64_t target_swing = 0;
+    for (size_t i = 0; i < target_capacities.size(); ++i) {
+      const size_t a = target_capacities[i];
+      const size_t b = prev_target_capacities_[i];
+      target_swing += static_cast<uint64_t>(a > b ? a - b : b - a);
+    }
+    const double swing_ratio =
+        static_cast<double>(target_swing) / static_cast<double>(total_capacity);
+    if (swing_ratio > options_.model_stability_threshold) {
+      if (kAllocDebug) {
+        const uint64_t s = dbg_skipped.fetch_add(1) + 1;
+        const uint64_t ap = dbg_applied.load();
+        if ((s + ap) % 50 == 0 || ap <= 5) {
+          fprintf(stderr,
+                  "[MLC_ALLOC] round=%llu SKIP(unstable) swing=%.2f "
+                  "applied=%llu skipped=%llu\n",
+                  (unsigned long long)round_id_, swing_ratio,
+                  (unsigned long long)ap, (unsigned long long)s);
+        }
+      }
+      prev_target_capacities_ = target_capacities;
+      prev_data_sizes_ = snapshot.data_sizes;
+      prev_lookups_ = snapshot.lookups;
+      prev_hits_ = snapshot.hits;
+      ++round_id_;
+      return Status::OK();
+    }
+  }
+  prev_target_capacities_ = target_capacities;
+
   std::vector<size_t> capacities_to_apply = target_capacities;
   if (!last_capacities_.empty() &&
       last_capacities_.size() == capacities_to_apply.size()) {
@@ -716,6 +754,18 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         static_cast<uint64_t>(static_cast<double>(total_capacity) *
                               options_.total_deadband_ratio));
     if (total_change < effective_min_change) {
+      if (kAllocDebug) {
+        const uint64_t s = dbg_skipped.fetch_add(1) + 1;
+        const uint64_t a = dbg_applied.load();
+        if ((s + a) % 50 == 0) {
+          fprintf(stderr,
+                  "[MLC_ALLOC] round=%llu SKIP total_change=%llu applied=%llu "
+                  "skipped=%llu\n",
+                  (unsigned long long)round_id_,
+                  (unsigned long long)total_change, (unsigned long long)a,
+                  (unsigned long long)s);
+        }
+      }
       prev_data_sizes_ = snapshot.data_sizes;
       prev_lookups_ = snapshot.lookups;
       prev_hits_ = snapshot.hits;
@@ -724,7 +774,42 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     }
   }
 
+  uint64_t dbg_t0 = 0;
+  if (kAllocDebug) {
+    dbg_t0 = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+  }
   Status adjust = cache_->AdjustCapacities(capacities_to_apply);
+  if (kAllocDebug) {
+    const uint64_t t1 = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    const uint64_t a = dbg_applied.fetch_add(1) + 1;
+    const uint64_t s = dbg_skipped.load();
+    if ((a + s) % 50 == 0 || a <= 5) {
+      uint64_t tc = 0;
+      for (size_t i = 0; i < capacities_to_apply.size(); ++i) {
+        const size_t lhs = capacities_to_apply[i];
+        const size_t rhs =
+            i < last_capacities_.size() ? last_capacities_[i] : 0;
+        tc += static_cast<uint64_t>(lhs > rhs ? lhs - rhs : rhs - lhs);
+      }
+      std::string caps;
+      for (size_t i = 0; i < capacities_to_apply.size(); ++i) {
+        caps += std::to_string(capacities_to_apply[i] >> 20);
+        caps += i + 1 < capacities_to_apply.size() ? "," : "";
+      }
+      fprintf(stderr,
+              "[MLC_ALLOC] round=%llu APPLY change=%lluMiB apply_us=%llu "
+              "applied=%llu skipped=%llu caps(MiB)=[%s]\n",
+              (unsigned long long)round_id_, (unsigned long long)(tc >> 20),
+              (unsigned long long)(t1 - dbg_t0), (unsigned long long)a,
+              (unsigned long long)s, caps.c_str());
+    }
+  }
   prev_data_sizes_ = snapshot.data_sizes;
   prev_lookups_ = snapshot.lookups;
   prev_hits_ = snapshot.hits;

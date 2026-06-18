@@ -66,9 +66,8 @@ struct MultiLevelAllocationOptions {
   // proposing a shrink for it, and then only half the gap per round.
   // Grows apply immediately. <= 1 disables the hysteresis.
   uint32_t shrink_confirm_rounds = 3;
-  // After rounds that apply no change, the background loop backs off
-  // exponentially up to interval_ms * max_interval_backoff; any applied
-  // change resets the interval. 1 disables the backoff.
+  // Deprecated/unused: the background loop now wakes at a fixed interval_ms
+  // cadence (no adaptive backoff). Kept for ABI/option compatibility.
   uint32_t max_interval_backoff = 8;
 
   // --- Data-size cap (don't allocate a level more than it can cache) ---
@@ -84,6 +83,22 @@ struct MultiLevelAllocationOptions {
   // Capacity granted to levels with zero data (keeps the sub-cache functional
   // without squandering budget on empty levels).
   size_t empty_level_cap_bytes = 1 << 16;  // 64 KiB
+
+  // --- Model-stability gate (don't act on an untrustworthy signal) ---
+  // Under write-heavy or low-cache/data-ratio workloads the per-round model
+  // inputs (per-level access rate lambda, hit-rate-derived alpha) are noisy, so
+  // the water-filling solver emits wildly different target allocations from one
+  // round to the next (e.g. the bulk bottom level swinging between ~5% and ~50%
+  // of the budget). Applying those churns SetCapacity/PurgeToCapacity on the hot
+  // sub-caches every round (no hit-ratio benefit, large throughput loss that
+  // compounds as the run lengthens). When two consecutive raw solved targets
+  // disagree by more than this fraction of the total capacity, the signal is
+  // deemed unstable and the round is skipped (the previous allocation is held).
+  // A stable workload produces consecutive targets that agree, so it still
+  // adapts normally. Note the metric double-counts a transfer (moving X bytes
+  // between levels contributes 2X to the swing), so this 0.20 fraction gates at
+  // roughly a 10% single-round budget relocation. 0 disables the gate.
+  double model_stability_threshold = 0.20;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -152,6 +167,9 @@ class MultiLevelCacheAllocator {
   std::thread worker_;
   mutable std::mutex mu_;
   std::vector<size_t> last_capacities_;
+  // Previous round's raw solved target capacities (pre-smoothing), used by the
+  // model-stability gate to detect an untrustworthy (rapidly swinging) signal.
+  std::vector<size_t> prev_target_capacities_;
   std::vector<uint64_t> prev_data_sizes_;
   std::vector<uint64_t> prev_lookups_;
   std::vector<uint64_t> prev_hits_;
