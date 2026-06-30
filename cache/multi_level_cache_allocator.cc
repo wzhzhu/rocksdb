@@ -509,6 +509,95 @@ void MultiLevelCacheAllocator::EnforceMinActiveLevelFloor(
   *out = std::move(adjusted);
 }
 
+void MultiLevelCacheAllocator::EnforceDataShareFloor(
+    const std::vector<size_t>& in_capacities,
+    const std::vector<uint64_t>& level_data_sizes, size_t total_budget,
+    double ratio, size_t floor_min_bytes, std::vector<size_t>* out,
+    const std::vector<unsigned char>* relief_mask) {
+  *out = in_capacities;
+  const size_t levels = in_capacities.size();
+  if (levels == 0 || level_data_sizes.size() != levels || ratio <= 0.0 ||
+      total_budget == 0) {
+    return;
+  }
+
+  std::vector<size_t> active;
+  active.reserve(levels);
+  uint64_t sum_active_data = 0;
+  for (size_t i = 0; i < levels; ++i) {
+    if (level_data_sizes[i] > 0) {
+      active.push_back(i);
+      sum_active_data += level_data_sizes[i];
+    }
+  }
+  if (active.empty() || sum_active_data == 0) {
+    return;
+  }
+
+  // Per-active-level floor: data-share-weighted slice of the reserved pool,
+  // lifted to the absolute minimum so small upper levels stay functional.
+  std::vector<size_t> adjusted = in_capacities;
+  std::vector<size_t> required_floor(levels, 0);
+  const double pool = static_cast<double>(total_budget) * ratio;
+  for (size_t idx : active) {
+    const double share =
+        static_cast<double>(level_data_sizes[idx]) /
+        static_cast<double>(sum_active_data);
+    size_t fl = static_cast<size_t>(std::floor(pool * share));
+    if (fl < floor_min_bytes) {
+      fl = floor_min_bytes;
+    }
+    required_floor[idx] = fl;
+  }
+
+  // Only lift levels the mask permits (persistence gate). When no mask is given
+  // every active level below its floor is lifted (original behaviour).
+  uint64_t deficit = 0;
+  for (size_t idx : active) {
+    if (relief_mask != nullptr && (*relief_mask)[idx] == 0) {
+      continue;
+    }
+    if (adjusted[idx] < required_floor[idx]) {
+      deficit += static_cast<uint64_t>(required_floor[idx] - adjusted[idx]);
+    }
+  }
+  if (deficit == 0) {
+    *out = std::move(adjusted);
+    return;
+  }
+
+  // Drain removable bytes from donors (largest first), never below their floor.
+  std::vector<size_t> donor_order(levels);
+  std::iota(donor_order.begin(), donor_order.end(), 0);
+  std::sort(donor_order.begin(), donor_order.end(),
+            [&](size_t a, size_t b) { return adjusted[a] > adjusted[b]; });
+  for (size_t idx : donor_order) {
+    const size_t floor = required_floor[idx];
+    if (adjusted[idx] <= floor) {
+      continue;
+    }
+    const size_t removable = adjusted[idx] - floor;
+    const size_t take =
+        static_cast<size_t>(std::min<uint64_t>(removable, deficit));
+    adjusted[idx] -= take;
+    deficit -= take;
+    if (deficit == 0) {
+      break;
+    }
+  }
+  if (deficit > 0) {
+    // Cannot satisfy all floors under the current budget distribution; leave
+    // the input unchanged (best-effort, avoid a partial/invalid reshape).
+    return;
+  }
+  for (size_t idx : active) {
+    if (adjusted[idx] < required_floor[idx]) {
+      adjusted[idx] += required_floor[idx] - adjusted[idx];
+    }
+  }
+  *out = std::move(adjusted);
+}
+
 void MultiLevelCacheAllocator::BackgroundLoop() {
   while (running_.load(std::memory_order_acquire)) {
     {
@@ -643,12 +732,13 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
   std::vector<double> lambda;
   std::vector<double> data;
   std::vector<double> alpha;
+  uint64_t l0_file_count = 0;
   std::vector<size_t> target_capacities;
   if (options_.mode == MultiLevelAllocatorMode::kBaselineEmulation) {
     target_capacities.assign(level_count, 0);
     target_capacities[0] = total_capacity;
   } else {
-    if (!provider_(&lambda, &data, &alpha)) {
+    if (!provider_(&lambda, &data, &alpha, &l0_file_count)) {
       prev_data_sizes_ = snapshot.data_sizes;
       prev_lookups_ = snapshot.lookups;
       prev_hits_ = snapshot.hits;
@@ -671,6 +761,67 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                         upper_bounds);
     if (!solve_status.ok()) {
       return solve_status;
+    }
+  }
+
+  // Data-share floor + persistence gate. Compute each active level's floor and
+  // track how many consecutive rounds the solver has proposed it below that
+  // floor. The floor relief only fires for levels starved for >=
+  // min_starvation_relief_rounds consecutive rounds: this distinguishes a
+  // *transient* dip (benign read-only early convergence, which recovers on its
+  // own within a few rounds and must NOT be perturbed) from *persistent*
+  // starvation (the write-heavy doom loop, where the model-stability gate
+  // suppresses the corrective swing every round and the level never recovers).
+  // Relief is applied on BOTH the gate-skip path (minimal relief) and the apply
+  // path (keeps the level at its floor every round so deep-level compaction
+  // reads do not 100%-miss -> no L0 backlog -> no write stall).
+  std::vector<unsigned char> relief_mask(level_count, 0);
+  const bool floor_configured =
+      options_.mode == MultiLevelAllocatorMode::kModel &&
+      options_.min_active_level_capacity_ratio > 0.0 &&
+      snapshot.data_sizes.size() == level_count && total_capacity > 0;
+  // Compaction-pressure gate: only fire the floor relief when L0 is backing up
+  // (the doom-loop signature). On a healthy read-only workload L0 stays at ~1
+  // file, so relief never fires and the adaptive convergence is not perturbed.
+  const bool l0_under_pressure =
+      options_.floor_relief_l0_file_threshold == 0 ||
+      l0_file_count >= options_.floor_relief_l0_file_threshold;
+  const bool floor_enabled = floor_configured && l0_under_pressure;
+  if (floor_configured) {
+    if (starvation_rounds_.size() < level_count) {
+      starvation_rounds_.assign(level_count, 0);
+    }
+    uint64_t sum_active_data = 0;
+    for (size_t i = 0; i < level_count; ++i) {
+      if (snapshot.data_sizes[i] > 0) sum_active_data += snapshot.data_sizes[i];
+    }
+    const double pool = static_cast<double>(total_capacity) *
+                        options_.min_active_level_capacity_ratio;
+    for (size_t i = 0; i < level_count; ++i) {
+      if (snapshot.data_sizes[i] == 0 || sum_active_data == 0) {
+        starvation_rounds_[i] = 0;
+        continue;
+      }
+      const double share = static_cast<double>(snapshot.data_sizes[i]) /
+                           static_cast<double>(sum_active_data);
+      size_t fl = static_cast<size_t>(std::floor(pool * share));
+      if (fl < options_.min_active_level_floor_bytes) {
+        fl = options_.min_active_level_floor_bytes;
+      }
+      // Always track consecutive-below-floor rounds so the count resets cleanly
+      // when a level recovers, even on rounds the L0 gate suppresses relief.
+      if (target_capacities[i] < fl) {
+        ++starvation_rounds_[i];
+      } else {
+        starvation_rounds_[i] = 0;
+      }
+      // Relief only fires when both the persistence count and the L0-pressure
+      // gate are satisfied.
+      if (floor_enabled &&
+          static_cast<uint64_t>(starvation_rounds_[i]) >=
+              options_.min_starvation_relief_rounds) {
+        relief_mask[i] = 1;
+      }
     }
   }
 
@@ -705,6 +856,33 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                   (unsigned long long)ap, (unsigned long long)s);
         }
       }
+      // Even though the discretionary model decision is untrustworthy this
+      // round, the data-share floor is a mandatory safety constraint for
+      // PERSISTENTLY starved levels (prevents deep-level starvation ->
+      // compaction stall -> write stall). Apply just the floor compliance to
+      // the live allocation: lift any level that has been below its floor for
+      // >= min_starvation_relief_rounds up to its floor, draining donors above
+      // their floor. Transient dips (mask=0) are left alone so benign read-only
+      // convergence is not perturbed. This is the minimal relief that breaks
+      // the doom loop without acting on the noisy model signal.
+      if (floor_enabled && !last_capacities_.empty() &&
+          last_capacities_.size() == level_count) {
+        std::vector<size_t> floor_compliant;
+        EnforceDataShareFloor(last_capacities_, snapshot.data_sizes,
+                              total_capacity,
+                              options_.min_active_level_capacity_ratio,
+                              options_.min_active_level_floor_bytes,
+                              &floor_compliant, &relief_mask);
+        if (floor_compliant != last_capacities_) {
+          Status floor_status = cache_->AdjustCapacities(floor_compliant);
+          if (floor_status.ok()) {
+            last_capacities_ = std::move(floor_compliant);
+            last_round_applied_ = true;
+          } else {
+            floor_status.PermitUncheckedError();
+          }
+        }
+      }
       prev_target_capacities_ = target_capacities;
       prev_data_sizes_ = snapshot.data_sizes;
       prev_lookups_ = snapshot.lookups;
@@ -725,6 +903,18 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                              total_capacity,
                              options_.min_active_level_capacity_bytes,
                              &capacities_to_apply);
+  // Persistence-gated data-share floor on the apply path: lift only levels that
+  // have been starved for >= min_starvation_relief_rounds consecutive rounds up
+  // to their floor, draining donors above their floor. Keeps a doom-looped deep
+  // level at its floor every apply round (so compaction keeps up); a transient
+  // dip on a healthy read-only workload has mask=0 and is left unperturbed.
+  if (floor_enabled) {
+    EnforceDataShareFloor(capacities_to_apply, snapshot.data_sizes,
+                          total_capacity,
+                          options_.min_active_level_capacity_ratio,
+                          options_.min_active_level_floor_bytes,
+                          &capacities_to_apply, &relief_mask);
+  }
   if (options_.mode == MultiLevelAllocatorMode::kModel && has_prev &&
       options_.compaction_shift_ratio > 0.0) {
     ApplyCompactionAwareShiftByDataDelta(

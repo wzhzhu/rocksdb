@@ -41,8 +41,35 @@ struct MultiLevelAllocationOptions {
   // Allocation mode.
   MultiLevelAllocatorMode mode = MultiLevelAllocatorMode::kModel;
   // Minimum capacity for each active level (data_size > 0), applied before
-  // AdjustCapacities.
+  // AdjustCapacities. When > 0 this acts as a flat per-active-level floor
+  // (legacy/compat interface).
   size_t min_active_level_capacity_bytes = 0;
+  // Data-share-weighted floor: reserve this fraction of the total budget as a
+  // floor pool, distributed across active levels (data_size > 0) in proportion
+  // to their data size so deep levels (e.g. L6 holding ~99% of data) get a
+  // proportionally larger floor than small upper levels. Each active level also
+  // receives at least `min_active_level_floor_bytes`. The floor is enforced
+  // BEFORE the model-stability gate and is applied even on gate-skip, so a
+  // starved level is always relieved (breaks the doom loop where the gate
+  // suppresses the large corrective swing out of a starved state). 0 disables.
+  double min_active_level_capacity_ratio = 0.05;
+  // Per-active-level absolute floor minimum (keeps small upper-level sub-caches
+  // functional even when their data share rounds toward zero).
+  size_t min_active_level_floor_bytes = 1 << 16;  // 64 KiB
+  // Persistence gate for the data-share floor: a level is only force-fed its
+  // floor after it has been proposed below that floor for this many CONSECUTIVE
+  // rounds. Default 1 = fire whenever a level is below its floor. (A value > 1
+  // was found to worsen read-only perturbation; kept as a knob.)
+  uint64_t min_starvation_relief_rounds = 1;
+  // Compaction-pressure gate for the data-share floor: the floor relief only
+  // fires when the L0 SST file count is >= this threshold, i.e. when compaction
+  // is falling behind (the write-heavy doom-loop signature). On a healthy
+  // read-only workload L0 stays at ~1 file, so the floor never fires and the
+  // adaptive convergence is not perturbed. 0 = fire whenever a level is below
+  // its floor regardless of L0 (aggressive; perturbs read-only). The threshold
+  // is intentionally well below RocksDB's level0_slowdown_trigger so relief
+  // starts before any actual write stall.
+  uint64_t floor_relief_l0_file_threshold = 4;
   // Compaction-aware capacity transfer ratio in [0, 1].
   // 0 disables this heuristic.
   double compaction_shift_ratio = 0.0;
@@ -106,10 +133,15 @@ struct MultiLevelAllocationOptions {
 class MultiLevelCacheAllocator {
  public:
   // Fills lambda/data/alpha vectors and returns true when a valid sample
-  // is available. Return false to skip this round.
+  // is available. Return false to skip this round. `l0_file_count` (when non-
+  // null) is filled with the current L0 SST file count -- a direct compaction-
+  // backlog signal used to gate the data-share floor relief so it only fires
+  // under real compaction pressure (write-heavy doom loop) and never perturbs a
+  // healthy read-only workload (where L0 stays at ~1 file).
   using MetricsProvider = std::function<bool(std::vector<double>* lambda,
                                              std::vector<double>* data,
-                                             std::vector<double>* alpha)>;
+                                             std::vector<double>* alpha,
+                                             uint64_t* l0_file_count)>;
 
   MultiLevelCacheAllocator(std::shared_ptr<MultiLevelCache> cache,
                            MetricsProvider provider,
@@ -152,6 +184,18 @@ class MultiLevelCacheAllocator {
       const std::vector<size_t>& in_capacities,
       const std::vector<uint64_t>& level_data_sizes, size_t total_budget,
       size_t min_active_level_capacity_bytes, std::vector<size_t>* out);
+  // Data-share-weighted floor: floor_i = max(min_active_level_floor_bytes,
+  // total * ratio * data_share_i), where data_share_i = data_size_i /
+  // sum(active data_sizes). Lifts starved levels up to their floor, draining
+  // the surplus from donors (largest first, never below their own floor). When
+  // `relief_mask` is non-null, only levels with `(*relief_mask)[i] != 0` are
+  // force-lifted; masked-off levels are left alone (neither lifted nor blocked
+  // from donating), used by the persistence gate so transient dips don't fire.
+  static void EnforceDataShareFloor(
+      const std::vector<size_t>& in_capacities,
+      const std::vector<uint64_t>& level_data_sizes, size_t total_budget,
+      double ratio, size_t floor_min_bytes, std::vector<size_t>* out,
+      const std::vector<unsigned char>* relief_mask = nullptr);
 
   void BackgroundLoop();
   Status RunOnceLocked();
@@ -175,6 +219,10 @@ class MultiLevelCacheAllocator {
   std::vector<uint64_t> prev_hits_;
   // Consecutive rounds each level has been proposed to shrink.
   std::vector<uint32_t> shrink_streak_;
+  // Consecutive rounds each active level's solved target has fallen below its
+  // data-share floor. Drives the persistence gate for the floor relief so it
+  // only fires on persistent (doom-loop) starvation, not transient dips.
+  std::vector<uint32_t> starvation_rounds_;
   // Whether the last RunOnceLocked applied a capacity change (drives the
   // adaptive interval backoff).
   bool last_round_applied_ = false;
