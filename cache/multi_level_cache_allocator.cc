@@ -10,6 +10,7 @@
 #include "cache/multi_level_cache_allocator.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -245,8 +246,28 @@ Status MultiLevelCacheAllocator::SolveCapacities(
     }
   }
 
+  // Diagnostics for the sparse-table Evict pathology: pin down whether capacity
+  // spikes originate from the EqualSplit degenerate-signal fallback or from the
+  // data/alpha prefactor exploding in the water-filling. Gated by MLC_ALLOC_DEBUG.
+  static const bool kSolveDebug = getenv("MLC_ALLOC_DEBUG") != nullptr;
+  static std::atomic<uint64_t> dbg_solve_calls{0};
+  const uint64_t solve_call = dbg_solve_calls.fetch_add(1) + 1;
+
   if (!has_positive_term || a_max <= 0.0) {
-    EqualSplit(total_capacity, levels, capacities);
+    if (kSolveDebug) {
+      fprintf(stderr,
+              "[MLC_SOLVE] call=%llu NO_SIGNAL_FALLBACK levels=%zu "
+              "budget=%lluMiB (no fundable term) -> zeros (hold via floor)\n",
+              (unsigned long long)solve_call, levels,
+              (unsigned long long)(total_capacity >> 20));
+    }
+    // Degenerate round: no level has a fundable (lambda>=floor, alpha>0, data>0)
+    // term. Do NOT EqualSplit the whole budget across all levels -- that spikes
+    // every level (including idle deep ones) to budget/levels and ratchets their
+    // grow-only tables. Return zeros; the caller then lifts active levels to
+    // their data-share floor and smooths from the previous allocation, i.e.
+    // effectively holds the last stable allocation instead of thrashing.
+    capacities->assign(levels, 0);
     return Status::OK();
   }
 
@@ -296,6 +317,21 @@ Status MultiLevelCacheAllocator::SolveCapacities(
 
   std::vector<double> continuous(levels, 0.0);
   sum_capacities_for_mu(high, &continuous);
+  if (kSolveDebug && (solve_call % 50 == 0 || solve_call <= 5)) {
+    std::string raw;
+    for (size_t i = 0; i < levels; ++i) {
+      raw += std::to_string(static_cast<uint64_t>(continuous[i]) >> 20);
+      raw += (i + 1 < levels) ? "," : "";
+    }
+    std::string scale;
+    for (size_t i = 0; i < levels; ++i) {
+      scale += std::to_string(static_cast<uint64_t>(data[i]) >> 20);
+      scale += (i + 1 < levels) ? "," : "";
+    }
+    fprintf(stderr,
+            "[MLC_SOLVE] call=%llu raw_solve(MiB)=[%s] scale(MiB)=[%s]\n",
+            (unsigned long long)solve_call, raw.c_str(), scale.c_str());
+  }
   *capacities = QuantizeToBudget(continuous, effective_budget);
   if (use_caps) {
     // Guard against quantization rounding pushing a level past its cap.
@@ -353,21 +389,48 @@ std::vector<size_t> MultiLevelCacheAllocator::QuantizeToBudget(
   }
 
   size_t remaining = budget - used;
+  // Distribute any under-allocation surplus ONLY across levels the solver
+  // actually funded (result[i] > 0), never equally across all levels. When the
+  // access signal is weak (e.g. config B's foreground-only lambda), the solver
+  // wants far less than the full budget; spreading the surplus equally hands
+  // idle deep levels (L5/L6) a chunk of capacity they do not need, which grows
+  // their grow-only AutoHCC hash tables. A later round then drains them, leaving
+  // the table oversized and sparse -> every insert-time Evict sweeps it (CPU
+  // thrash + lock contention = the config-B collapse). Keeping the surplus on
+  // already-funded levels (re-capped afterward at their data size by the caller,
+  // so any true excess is simply left unallocated) keeps idle levels at zero.
   if (!result.empty() && remaining > 0) {
-    const size_t base_add = remaining / result.size();
-    if (base_add > 0) {
-      for (size_t i = 0; i < result.size(); ++i) {
-        result[i] += base_add;
+    size_t funded = 0;
+    for (size_t i = 0; i < result.size(); ++i) {
+      if (result[i] > 0) {
+        ++funded;
       }
-      remaining -= base_add * result.size();
     }
-  }
-  std::sort(fractions.begin(), fractions.end(),
-            [](const FractionalPart& lhs, const FractionalPart& rhs) {
-              return lhs.fraction > rhs.fraction;
-            });
-  for (size_t i = 0; i < remaining && i < fractions.size(); ++i) {
-    ++result[fractions[i].index];
+    if (funded > 0) {
+      const size_t base_add = remaining / funded;
+      if (base_add > 0) {
+        for (size_t i = 0; i < result.size(); ++i) {
+          if (result[i] > 0) {
+            result[i] += base_add;
+            remaining -= base_add;
+          }
+        }
+      }
+      std::sort(fractions.begin(), fractions.end(),
+                [](const FractionalPart& lhs, const FractionalPart& rhs) {
+                  return lhs.fraction > rhs.fraction;
+                });
+      for (size_t i = 0; i < fractions.size() && remaining > 0; ++i) {
+        const size_t idx = fractions[i].index;
+        if (result[idx] > 0) {
+          ++result[idx];
+          --remaining;
+        }
+      }
+    }
+    // funded == 0 (solver returned all zeros): leave result all zero. The caller
+    // lifts active levels to their floor and smooths from the previous
+    // allocation, i.e. holds the last stable state rather than EqualSplitting.
   }
   return result;
 }

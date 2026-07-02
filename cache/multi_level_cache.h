@@ -29,9 +29,23 @@ class MultiLevelCache : public Cache {
   struct LevelMetricsSnapshot {
     std::vector<uint64_t> lookups;
     std::vector<uint64_t> hits;
+    // Foreground-only (excludes compaction-induced) counters. `lookups`/`hits`
+    // are totals (include compaction) and feed the allocator's per-level access
+    // frequency (lambda); `fg_lookups`/`fg_hits` exclude compaction's streaming
+    // one-shot reads and feed the hit-curve shape (alpha), so the model does not
+    // let compaction misses dilute foreground cache value.
+    std::vector<uint64_t> fg_lookups;
+    std::vector<uint64_t> fg_hits;
     std::vector<size_t> capacities;
     std::vector<size_t> usages;
     std::vector<uint64_t> data_sizes;
+    // Diagnostics for the AutoHCC sparse-table Evict pathology: the hash table
+    // grows to fit peak occupancy but never shrinks, so after the allocator
+    // shrinks a sub-cache its table stays large while occupancy is small ->
+    // Evict sweeps a sparse oversized table. table_address_counts is the table
+    // slot count; occupancy_counts is the live entry count.
+    std::vector<size_t> table_address_counts;
+    std::vector<size_t> occupancy_counts;
   };
 
   static const char* kClassName() { return "MultiLevelCache"; }
@@ -114,6 +128,23 @@ class MultiLevelCache : public Cache {
   std::vector<std::vector<uint64_t>> DrainLookupSamples();
   void SetLookupSampleRateLog2(uint32_t sample_rate_log2);
 
+  // Foreground working-set tracking (Solution A: model-level fix for the
+  // saturation-scale ill-conditioning). When enabled, every foreground Lookup
+  // feeds a per-level HyperLogLog that estimates the count of DISTINCT blocks
+  // the foreground touches, which the allocator uses as the MRC saturation
+  // scale instead of the full on-disk data size. Off by default (zero hot-path
+  // cost when disabled).
+  // sample_shift>0 enables unbiased hash-gated sampling: only keys whose low
+  // sample_shift hash bits are zero feed the sketch (1/2^shift of distinct
+  // keys), and the drained estimate is scaled back up by 2^shift. Trades a
+  // higher-variance distinct estimate for skipping the register write on the
+  // (1-1/2^shift) unsampled foreground lookups.
+  void SetWorkingSetTrackingEnabled(bool enabled, uint32_t sample_shift = 0);
+  // Returns the per-level estimated distinct foreground block count observed
+  // since the previous drain, and resets the sketches (windowed estimate).
+  // Returns an empty vector when tracking is disabled.
+  std::vector<double> DrainForegroundWorkingSetDistinct();
+
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
   // For A/B diagnostics: force all requests to route into L0.
@@ -168,6 +199,24 @@ class MultiLevelCache : public Cache {
     std::atomic<uint64_t> drained_seq{0};
   };
 
+  // Per-level HyperLogLog for the foreground working-set (distinct block)
+  // estimate. Registers hold the max observed rank and are updated with relaxed
+  // atomic max, so concurrent Adds need no locking. Drain reads+resets each
+  // register via exchange; the (rare) race between a concurrent Add and the
+  // drain only perturbs an estimate, which is acceptable. 2^11 = 2048 registers
+  // gives ~2.3% standard error at ~2KB/level.
+  static constexpr uint32_t kWssRegisterBitsLog2 = 11;
+  static constexpr size_t kWssRegisterCount = size_t{1} << kWssRegisterBitsLog2;
+  struct ForegroundWorkingSetSketch {
+    std::unique_ptr<std::atomic<uint8_t>[]> registers;
+    ForegroundWorkingSetSketch()
+        : registers(new std::atomic<uint8_t>[kWssRegisterCount]) {
+      for (size_t i = 0; i < kWssRegisterCount; ++i) {
+        registers[i].store(0, std::memory_order_relaxed);
+      }
+    }
+  };
+
   Cache* SubCacheByLevel(size_t level_index);
   const Cache* SubCacheByLevel(size_t level_index) const;
   Cache* PrimarySubCache();
@@ -185,6 +234,7 @@ class MultiLevelCache : public Cache {
   static const char* RouteCallerToString(RouteCaller caller);
   static int64_t ParseDebugMissLimit();
   void MaybeRecordLookupSample(size_t level_index, const Slice& key);
+  void RecordForegroundWorkingSet(size_t level_index, const Slice& base_key);
   void MaybeAdaptLevelMode(size_t level_index);
   bool MaybeSetLevelProbationInsert(size_t level_index, bool probation_insert);
   void StartDynamicSRHCCWorker();
@@ -223,6 +273,10 @@ class MultiLevelCache : public Cache {
   void IncHitCounter(size_t level_index);
   uint64_t SumLookupCounter(size_t level_index) const;
   uint64_t SumHitCounter(size_t level_index) const;
+  void IncFgLookupCounter(size_t level_index);
+  void IncFgHitCounter(size_t level_index);
+  uint64_t SumFgLookupCounter(size_t level_index) const;
+  uint64_t SumFgHitCounter(size_t level_index) const;
 
   std::vector<std::shared_ptr<Cache>> sub_caches_;
   std::shared_ptr<Cache> shared_cache_;
@@ -231,6 +285,8 @@ class MultiLevelCache : public Cache {
   std::vector<HandleOwnerRange> handle_owner_ranges_;
   std::unique_ptr<StripedCounter[]> lookups_;
   std::unique_ptr<StripedCounter[]> hits_;
+  std::unique_ptr<StripedCounter[]> fg_lookups_;
+  std::unique_ptr<StripedCounter[]> fg_hits_;
   std::deque<std::atomic<uint64_t>> level_data_sizes_;
   // False until someone actually consumes lookup samples (dynamic SR-HCC
   // worker or an external driver via SetLookupSampleRateLog2). Lets the
@@ -241,6 +297,11 @@ class MultiLevelCache : public Cache {
   // Large enough to absorb full-sampling bursts under high concurrency.
   static constexpr size_t kLookupSampleRingSize = 65536;
   std::vector<std::unique_ptr<LevelSampleRing>> lookup_sample_rings_;
+  // Solution A working-set tracking. Off unless the allocator's saturation
+  // scale is driven by the observed foreground footprint.
+  std::atomic<bool> working_set_tracking_enabled_{false};
+  std::atomic<uint32_t> working_set_sample_shift_{0};
+  std::vector<std::unique_ptr<ForegroundWorkingSetSketch>> fg_working_set_;
   mutable std::atomic<uint64_t> insert_route_queries_{0};
   mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
   mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstdio>
@@ -14,8 +15,25 @@
 
 #include "cache/cache_key.h"
 #include "cache/clock_cache.h"
+#include "cache/multi_level_cache_compaction.h"
 #include "util/coding.h"
 namespace ROCKSDB_NAMESPACE {
+
+// Per-thread flag set by MLCLookupCompactionScope on the compaction read path.
+// Read by MultiLevelCache::Lookup to skip per-level/hit counters for
+// compaction-induced accesses so they never feed the allocator's model.
+thread_local bool tls_mlc_lookup_is_compaction = false;
+
+bool MLCLookupIsCompaction() { return tls_mlc_lookup_is_compaction; }
+
+MLCLookupCompactionScope::MLCLookupCompactionScope(bool is_compaction)
+    : prev_(tls_mlc_lookup_is_compaction) {
+  tls_mlc_lookup_is_compaction = is_compaction;
+}
+
+MLCLookupCompactionScope::~MLCLookupCompactionScope() {
+  tls_mlc_lookup_is_compaction = prev_;
+}
 
 namespace {
 
@@ -254,11 +272,26 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
                                        const CacheItemHelper* helper,
                                        CreateContext* create_context,
                                        Priority priority, Statistics* stats) {
+  // Compaction-induced lookups feed the per-level access frequency (lambda,
+  // via lookups_/hits_) because compaction activity is a proxy for write-path
+  // pressure on levels like L0 -- excluding it defunds the write buffer and
+  // stalls. But compaction reads are streaming/one-shot, so their hits/misses
+  // must NOT feed the hit-curve shape (alpha): that is captured by the
+  // foreground-only fg_lookups_/fg_hits_ counters. The is_compaction flag is
+  // set on the compaction read path via MLCLookupCompactionScope.
+  const bool is_compaction = MLCLookupIsCompaction();
   Slice base_key = key;
   const size_t level_index =
       RouteLevelByKey(key, RouteCaller::kLookup, &base_key);
   MaybeRecordLookupSample(level_index, base_key);
+  if (!is_compaction &&
+      working_set_tracking_enabled_.load(std::memory_order_relaxed)) {
+    RecordForegroundWorkingSet(level_index, base_key);
+  }
   IncLookupCounter(level_index);
+  if (!is_compaction) {
+    IncFgLookupCounter(level_index);
+  }
   Cache* level_cache = SubCacheByLevel(level_index);
   Cache::Handle* inner =
       level_cache->Lookup(base_key, helper, create_context, priority, stats);
@@ -281,6 +314,9 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
     owner_cache = SharedCache();
   }
   IncHitCounter(level_index);
+  if (!is_compaction) {
+    IncFgHitCounter(level_index);
+  }
   return WrapOrPassHandle(owner_cache, inner);
 }
 
@@ -348,6 +384,36 @@ uint64_t MultiLevelCache::SumHitCounter(size_t level_index) const {
   uint64_t sum = 0;
   for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
     sum += hits_[stripe * sub_caches_.size() + level_index].v.load(
+        std::memory_order_relaxed);
+  }
+  return sum;
+}
+
+void MultiLevelCache::IncFgLookupCounter(size_t level_index) {
+  fg_lookups_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() +
+              level_index]
+      .v.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MultiLevelCache::IncFgHitCounter(size_t level_index) {
+  fg_hits_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() +
+           level_index]
+      .v.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t MultiLevelCache::SumFgLookupCounter(size_t level_index) const {
+  uint64_t sum = 0;
+  for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
+    sum += fg_lookups_[stripe * sub_caches_.size() + level_index].v.load(
+        std::memory_order_relaxed);
+  }
+  return sum;
+}
+
+uint64_t MultiLevelCache::SumFgHitCounter(size_t level_index) const {
+  uint64_t sum = 0;
+  for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
+    sum += fg_hits_[stripe * sub_caches_.size() + level_index].v.load(
         std::memory_order_relaxed);
   }
   return sum;
@@ -635,14 +701,23 @@ MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
   LevelMetricsSnapshot snapshot;
   snapshot.lookups.resize(sub_caches_.size());
   snapshot.hits.resize(sub_caches_.size());
+  snapshot.fg_lookups.resize(sub_caches_.size());
+  snapshot.fg_hits.resize(sub_caches_.size());
   snapshot.capacities.resize(sub_caches_.size());
   snapshot.usages.resize(sub_caches_.size());
   snapshot.data_sizes.resize(sub_caches_.size());
+  snapshot.table_address_counts.resize(sub_caches_.size());
+  snapshot.occupancy_counts.resize(sub_caches_.size());
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
     snapshot.lookups[level] = SumLookupCounter(level);
     snapshot.hits[level] = SumHitCounter(level);
+    snapshot.fg_lookups[level] = SumFgLookupCounter(level);
+    snapshot.fg_hits[level] = SumFgHitCounter(level);
     snapshot.capacities[level] = sub_caches_[level]->GetCapacity();
     snapshot.usages[level] = sub_caches_[level]->GetUsage();
+    snapshot.table_address_counts[level] =
+        sub_caches_[level]->GetTableAddressCount();
+    snapshot.occupancy_counts[level] = sub_caches_[level]->GetOccupancyCount();
     snapshot.data_sizes[level] =
         level_data_sizes_[level].load(std::memory_order_relaxed);
   }
@@ -1148,6 +1223,86 @@ void MultiLevelCache::MaybeRecordLookupSample(size_t level_index,
   ring->seq[idx].store(seq + 1, std::memory_order_release);
 }
 
+void MultiLevelCache::SetWorkingSetTrackingEnabled(bool enabled,
+                                                   uint32_t sample_shift) {
+  working_set_sample_shift_.store(sample_shift, std::memory_order_relaxed);
+  working_set_tracking_enabled_.store(enabled, std::memory_order_relaxed);
+}
+
+void MultiLevelCache::RecordForegroundWorkingSet(size_t level_index,
+                                                 const Slice& base_key) {
+  if (level_index >= fg_working_set_.size()) {
+    return;
+  }
+  ForegroundWorkingSetSketch* sketch = fg_working_set_[level_index].get();
+  if (sketch == nullptr) {
+    return;
+  }
+  const uint64_t hash = HashCacheKey(base_key);
+  // Unbiased hash-gated sampling: keep only keys whose low `shift` bits are
+  // zero. Uses low bits for the gate and high bits for the register index/rank,
+  // so the two are independent. Drain scales the estimate back up by 2^shift.
+  const uint32_t shift = working_set_sample_shift_.load(std::memory_order_relaxed);
+  if (shift > 0 && (hash & ((uint64_t{1} << shift) - 1)) != 0) {
+    return;
+  }
+  // Top kWssRegisterBitsLog2 bits select the register; the remaining bits give
+  // the rank (1 + count of leading zeros). Shifting the index bits out and OR-
+  // ing a sentinel at the boundary bounds the rank and keeps clz well-defined.
+  const uint32_t idx =
+      static_cast<uint32_t>(hash >> (64 - kWssRegisterBitsLog2));
+  const uint64_t w = (hash << kWssRegisterBitsLog2) |
+                     (uint64_t{1} << (kWssRegisterBitsLog2 - 1));
+  const uint8_t rho =
+      static_cast<uint8_t>(__builtin_clzll(w) + 1);
+  std::atomic<uint8_t>& reg = sketch->registers[idx];
+  uint8_t cur = reg.load(std::memory_order_relaxed);
+  while (rho > cur) {
+    if (reg.compare_exchange_weak(cur, rho, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+}
+
+std::vector<double> MultiLevelCache::DrainForegroundWorkingSetDistinct() {
+  std::vector<double> result;
+  if (!working_set_tracking_enabled_.load(std::memory_order_relaxed)) {
+    return result;
+  }
+  const size_t levels = fg_working_set_.size();
+  result.assign(levels, 0.0);
+  const double m = static_cast<double>(kWssRegisterCount);
+  // Standard HLL bias constant for m registers.
+  const double alpha_m = 0.7213 / (1.0 + 1.079 / m);
+  // Scale sampled cardinality back to the full stream (1/2^shift sampled).
+  const double sample_scale = static_cast<double>(
+      uint64_t{1} << working_set_sample_shift_.load(std::memory_order_relaxed));
+  for (size_t level = 0; level < levels; ++level) {
+    ForegroundWorkingSetSketch* sketch = fg_working_set_[level].get();
+    if (sketch == nullptr) {
+      continue;
+    }
+    double harmonic = 0.0;
+    size_t zeros = 0;
+    for (size_t i = 0; i < kWssRegisterCount; ++i) {
+      // Read-and-reset so each drain yields a fresh window.
+      const uint8_t r =
+          sketch->registers[i].exchange(0, std::memory_order_relaxed);
+      harmonic += std::ldexp(1.0, -static_cast<int>(r));
+      if (r == 0) {
+        ++zeros;
+      }
+    }
+    double estimate = harmonic > 0.0 ? alpha_m * m * m / harmonic : 0.0;
+    // Small-range correction: linear counting when many registers are empty.
+    if (estimate <= 2.5 * m && zeros > 0) {
+      estimate = m * std::log(m / static_cast<double>(zeros));
+    }
+    result[level] = estimate * sample_scale;
+  }
+  return result;
+}
+
 void MultiLevelCache::MaybeAdaptLevelMode(size_t level_index) {
   if (!dynamic_srhcc_enabled_.load(std::memory_order_relaxed) ||
       level_index >= sub_caches_.size()) {
@@ -1399,13 +1554,17 @@ void MultiLevelCache::InitializePerLevelState(size_t level_count) {
   // Value-initialized: all stripes start at zero.
   lookups_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
   hits_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
+  fg_lookups_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
+  fg_hits_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
   level_data_sizes_.resize(level_count);
   lookup_sample_rings_.resize(level_count);
+  fg_working_set_.resize(level_count);
   adapt_last_lookups_.resize(level_count);
   adapt_last_hits_.resize(level_count);
   level_probation_insert_enabled_.resize(level_count);
   for (size_t level = 0; level < level_count; ++level) {
     level_data_sizes_[level].store(0, std::memory_order_relaxed);
+    fg_working_set_[level] = std::make_unique<ForegroundWorkingSetSketch>();
     lookup_sample_rings_[level] = std::make_unique<LevelSampleRing>();
     lookup_sample_rings_[level]->seq =
         std::make_unique<std::atomic<uint64_t>[]>(kLookupSampleRingSize);

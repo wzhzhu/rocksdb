@@ -23,6 +23,7 @@
 #include "cache/cache_entry_roles.h"
 #include "cache/cache_key.h"
 #include "cache/multi_level_cache.h"
+#include "cache/multi_level_cache_compaction.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
 #include "db/pinned_iterators_manager.h"
@@ -1865,6 +1866,12 @@ BlockBasedTable::MaybeReadBlockAndLoadToCache(
     BlockContents* contents, bool async_read,
     bool use_block_cache_for_lookup) const {
   assert(out_parsed_block != nullptr);
+  // Mark this read's block-cache lookups as compaction-induced so the MLC
+  // allocator's per-level model excludes them (compaction reads are streaming
+  // and don't reflect foreground value; RocksDB already skips their cache
+  // insert, and this extends the same principle to the MLC counters). The
+  // scope covers the whole function; only MultiLevelCache::Lookup reads it.
+  MLCLookupCompactionScope compaction_lookup_scope(for_compaction);
   const bool no_io = (ro.read_tier == kBlockCacheTier);
   BlockCacheInterface<TBlocklike> block_cache{
       rep_->table_options.block_cache.get()};
