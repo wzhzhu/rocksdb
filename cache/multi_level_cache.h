@@ -162,6 +162,16 @@ class MultiLevelCache : public Cache {
   // When enabled, initial capacities are also switched to L0-only so the
   // setup is closer to single-cache baseline behavior.
   void SetForceRouteAllToL0(bool force_route_all_to_l0);
+  // Capacity-gated insertion. When min_capacity_bytes > 0, an Insert routed to
+  // a sub-cache whose current capacity is below this threshold bypasses the
+  // hash-table insert and instead returns a standalone entry (CreateStandalone,
+  // uncharged). A level the allocator has starved below this floor caches
+  // nothing durably -- every insert is immediately evicted -- so a real insert
+  // is pure churn (insert -> evict -> cfree over a grow-only sparse AutoHCC
+  // table) with ~0 hit-ratio benefit. The standalone path never populates the
+  // table, so the deep-level Evict sweep that dominates its CPU disappears while
+  // the caller still gets a usable pinned block. 0 disables the gate (default).
+  void SetInsertBypassCapacity(size_t min_capacity_bytes);
   void SetSharedPoolRatio(double shared_pool_ratio);
   void SetSharedPoolAdmissionThreshold(uint32_t admission_threshold);
   void SetSharedPoolDecayIntervalOps(uint32_t decay_interval_ops);
@@ -380,6 +390,9 @@ class MultiLevelCache : public Cache {
   std::atomic<uint32_t> shared_pool_admission_threshold_{2};
   std::atomic<uint32_t> shared_pool_decay_interval_ops_{2048};
   std::atomic<bool> force_route_all_to_l0_{false};
+  // Capacity-gated insertion threshold (bytes). 0 = disabled. See
+  // SetInsertBypassCapacity.
+  std::atomic<size_t> insert_bypass_capacity_bytes_{0};
   std::atomic<bool> dynamic_srhcc_enabled_{false};
   std::atomic<uint32_t> dynamic_srhcc_check_interval_ops_{4096};
   std::atomic<uint32_t> dynamic_srhcc_min_samples_{64};

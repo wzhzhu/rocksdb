@@ -241,6 +241,30 @@ Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
     target_cache = SharedCache();
     route_to_shared = true;
   }
+  // Capacity-gated insertion: when the routed (non-shared) level has been
+  // starved by the allocator below the bypass floor, it evicts anything it
+  // admits immediately, so a real Insert is pure churn (grow-only AutoHCC table
+  // -> sparse Evict sweep -> cfree) with ~0 hit-ratio benefit. Hand back a
+  // standalone (uncharged) entry instead: the caller still gets a usable pinned
+  // block, but the table is never populated so the deep-level Evict hotspot
+  // disappears.
+  const size_t bypass_floor =
+      insert_bypass_capacity_bytes_.load(std::memory_order_relaxed);
+  if (!route_to_shared && bypass_floor > 0 && charge > 0 &&
+      target_cache->GetCapacity() < bypass_floor) {
+    Cache::Handle* standalone = target_cache->CreateStandalone(
+        base_key, obj, helper, charge, /*allow_uncharged=*/true);
+    if (standalone != nullptr) {
+      if (handle != nullptr) {
+        *handle = WrapOrPassHandle(target_cache, standalone);
+      } else {
+        target_cache->Release(standalone, /*erase_if_last_ref=*/true);
+      }
+      return Status::OK();
+    }
+    // Standalone creation failed (should not happen with allow_uncharged);
+    // fall through to the normal insert so ownership of obj is not dropped.
+  }
   Cache::Handle* inner = nullptr;
   Cache::Handle** inner_handle = handle != nullptr ? &inner : nullptr;
   Status s = target_cache->Insert(base_key, obj, helper, charge, inner_handle,
@@ -813,6 +837,11 @@ void MultiLevelCache::SetForceRouteAllToL0(bool force_route_all_to_l0) {
   ApplyCapacities(l0_only_capacities);
 }
 
+void MultiLevelCache::SetInsertBypassCapacity(size_t min_capacity_bytes) {
+  insert_bypass_capacity_bytes_.store(min_capacity_bytes,
+                                      std::memory_order_relaxed);
+}
+
 void MultiLevelCache::SetSharedPoolRatio(double shared_pool_ratio) {
   const double clamped = std::max(0.0, std::min(0.9, shared_pool_ratio));
   const uint32_t ppm =
@@ -875,6 +904,13 @@ size_t MultiLevelCache::RouteLevelByKey(const Slice& key, RouteCaller caller,
   if (base_key != nullptr) {
     *base_key = key;
   }
+  // Route hit/miss counters are diagnostic only (surfaced in
+  // GetPrintableOptions, never consumed by the allocator). Each is a single
+  // process-wide atomic touched on every Lookup/Insert, so at high thread
+  // counts they become cache-line ping-pong hotspots on the read hot path.
+  // Keep them opt-in (MLC_ROUTE_STATS=1) so the default hot path pays nothing.
+  static const bool kRouteStatsEnabled =
+      std::getenv("MLC_ROUTE_STATS") != nullptr;
   std::atomic<uint64_t>* route_queries = nullptr;
   std::atomic<uint64_t>* route_parse_failures = nullptr;
   std::atomic<uint64_t>* route_prefix_hits = nullptr;
@@ -895,7 +931,7 @@ size_t MultiLevelCache::RouteLevelByKey(const Slice& key, RouteCaller caller,
     case RouteCaller::kOther:
       break;
   }
-  if (route_queries != nullptr) {
+  if (kRouteStatsEnabled && route_queries != nullptr) {
     route_queries->fetch_add(1, std::memory_order_relaxed);
   }
   if (force_route_all_to_l0_.load(std::memory_order_relaxed)) {
@@ -907,21 +943,21 @@ size_t MultiLevelCache::RouteLevelByKey(const Slice& key, RouteCaller caller,
     if (base_key != nullptr) {
       *base_key = extended_base_key;
     }
-    if (route_prefix_hits != nullptr) {
+    if (kRouteStatsEnabled && route_prefix_hits != nullptr) {
       route_prefix_hits->fetch_add(1, std::memory_order_relaxed);
     }
     return extended_level;
   }
   const std::optional<uint64_t> key_prefix = GetCacheKeyPrefix(key);
   if (!key_prefix.has_value()) {
-    if (route_parse_failures != nullptr) {
+    if (kRouteStatsEnabled && route_parse_failures != nullptr) {
       route_parse_failures->fetch_add(1, std::memory_order_relaxed);
     }
     MaybeLogRouteMiss(caller, key, /*has_prefix=*/false, 0,
                       "prefix_parse_failure");
     return 0;
   }
-  if (route_prefix_misses != nullptr) {
+  if (kRouteStatsEnabled && route_prefix_misses != nullptr) {
     route_prefix_misses->fetch_add(1, std::memory_order_relaxed);
   }
   MaybeLogRouteMiss(caller, key, /*has_prefix=*/true, *key_prefix,
