@@ -600,6 +600,15 @@ enum Tickers : uint32_t {
   // via FileOptions::file_metadata (on DB open / table cache miss)
   FILE_OPEN_METADATA_PASSED,
 
+  // Foreground-only block cache hit/miss: the same events as BLOCK_CACHE_HIT /
+  // BLOCK_CACHE_MISS but restricted to non-compaction lookups (see
+  // MLCLookupIsCompaction). BLOCK_CACHE_HIT/MISS lump in compaction-induced
+  // reads, which dilute the hit ratio that reflects foreground query value;
+  // these tickers let a report state a compaction-free hit ratio uniformly
+  // across every cache type (LRU / HyperClockCache / MultiLevelCache).
+  BLOCK_CACHE_FOREGROUND_MISS,
+  BLOCK_CACHE_FOREGROUND_HIT,
+
   TICKER_ENUM_MAX
 };
 

@@ -270,6 +270,13 @@ void BlockBasedTable::UpdateCacheHitMetrics(BlockType block_type,
                                             size_t usage) const {
   Statistics* const statistics = rep_->ioptions.stats;
 
+  // Foreground-only hit accounting (compaction lookups excluded). Counted once
+  // per hit here, before the get_context/RecordTick split below, so it captures
+  // both point-Get hits (flushed later from get_context) and iterator hits.
+  if (!MLCLookupIsCompaction()) {
+    RecordTick(statistics, BLOCK_CACHE_FOREGROUND_HIT);
+  }
+
   PERF_COUNTER_ADD(block_cache_hit_count, 1);
   PERF_COUNTER_ADD(block_cache_read_byte, usage);
   PERF_COUNTER_BY_LEVEL_ADD(block_cache_hit_count, 1,
@@ -332,6 +339,12 @@ void BlockBasedTable::UpdateCacheHitMetrics(BlockType block_type,
 void BlockBasedTable::UpdateCacheMissMetrics(BlockType block_type,
                                              GetContext* get_context) const {
   Statistics* const statistics = rep_->ioptions.stats;
+
+  // Foreground-only miss accounting (compaction lookups excluded); see the
+  // matching hit path in UpdateCacheHitMetrics.
+  if (!MLCLookupIsCompaction()) {
+    RecordTick(statistics, BLOCK_CACHE_FOREGROUND_MISS);
+  }
 
   // TODO: introduce aggregate (not per-level) block cache miss count
   PERF_COUNTER_BY_LEVEL_ADD(block_cache_miss_count, 1,

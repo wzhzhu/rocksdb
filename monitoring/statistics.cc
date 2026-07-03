@@ -302,6 +302,8 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.read.path.range.tombstones.discarded"},
     {FILE_OPEN_METADATA_RETRIEVED, "rocksdb.file.open.metadata.retrieved"},
     {FILE_OPEN_METADATA_PASSED, "rocksdb.file.open.metadata.passed"},
+    {BLOCK_CACHE_FOREGROUND_MISS, "rocksdb.block.cache.foreground.miss"},
+    {BLOCK_CACHE_FOREGROUND_HIT, "rocksdb.block.cache.foreground.hit"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
