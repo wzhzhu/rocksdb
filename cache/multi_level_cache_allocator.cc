@@ -662,22 +662,60 @@ void MultiLevelCacheAllocator::EnforceDataShareFloor(
 }
 
 void MultiLevelCacheAllocator::BackgroundLoop() {
+  // Priming: always run one round immediately so the initial equal-split is
+  // replaced by a model-driven allocation without waiting for the first op
+  // window / interval to elapse.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    Status s = RunOnceLocked();
+    s.PermitUncheckedError();
+  }
+  if (cache_) {
+    last_round_lookups_ = cache_->GetTotalLookups();
+  }
+
   while (running_.load(std::memory_order_acquire)) {
+    // Short poll so Stop() stays responsive and (when op-gating is enabled) the
+    // op counter is checked frequently. When adjust_interval_ops == 0 we fall
+    // back to the legacy fixed wall-clock cadence.
+    const uint64_t poll_ms =
+        options_.adjust_interval_ops > 0
+            ? std::min<uint64_t>(50, std::max<uint64_t>(1, options_.interval_ms))
+            : options_.interval_ms;
+    uint64_t slept = 0;
+    while (slept < poll_ms && running_.load(std::memory_order_acquire)) {
+      const uint64_t chunk = std::min<uint64_t>(50, poll_ms - slept);
+      std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
+      slept += chunk;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+      break;
+    }
+
+    if (options_.adjust_interval_ops > 0) {
+      // Op-count cadence: decouple the number of adjustment rounds from thread
+      // count / throughput (wall-clock cadence made the number of rounds scale
+      // with wall time, so hit ratio moved non-monotonically with thread
+      // count). Gate on TOTAL lookups, NOT foreground-only: spacing rounds by
+      // foreground ops makes each round's window wide enough that the model's
+      // inter-round swing drops below the stability threshold and the (now
+      // large, hundreds-of-MiB) reallocation is APPLIED every round. Each apply
+      // runs PurgeSubCacheToCapacity under the shard locks, stalling the hot
+      // path (measured: ~4.5x throughput collapse, 75 -> 17 KTPS at t8). Gating
+      // on total lookups keeps rounds frequent so consecutive swings stay large
+      // and the stability gate suppresses them, holding a stable allocation.
+      const uint64_t total_lookups =
+          cache_ ? cache_->GetTotalLookups() : 0;
+      if (total_lookups - last_round_lookups_ < options_.adjust_interval_ops) {
+        continue;
+      }
+      last_round_lookups_ = total_lookups;
+    }
+
     {
       std::lock_guard<std::mutex> lock(mu_);
       Status s = RunOnceLocked();
       s.PermitUncheckedError();
-    }
-    // Fixed cadence: wake every interval_ms. (No adaptive backoff: the model-
-    // stability gate already suppresses needless applies, and a constant
-    // interval keeps adaptation latency predictable.) Sleep in small chunks so
-    // Stop() stays responsive.
-    const uint64_t sleep_total_ms = options_.interval_ms;
-    uint64_t slept = 0;
-    while (slept < sleep_total_ms && running_.load(std::memory_order_acquire)) {
-      const uint64_t chunk = std::min<uint64_t>(100, sleep_total_ms - slept);
-      std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
-      slept += chunk;
     }
   }
 }

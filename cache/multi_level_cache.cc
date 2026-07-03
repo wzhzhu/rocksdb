@@ -172,6 +172,12 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
         MakeSubCacheWithCapacity(hcc_options, level_capacity, total_capacity));
   }
   shared_cache_ = MakeSubCacheWithCapacity(hcc_options, 0, total_capacity);
+  // Enable sparse-table rebuild: fresh empty HCC with the mmap reserved for the
+  // whole budget (lazy RSS), so a defunded level's grow-only slot array can be
+  // reclaimed and a new small table can grow again later if refunded.
+  rebuild_sub_cache_ = [hcc_options, total_capacity](size_t new_capacity) {
+    return MakeSubCacheWithCapacity(hcc_options, new_capacity, total_capacity);
+  };
   InitializePerLevelState(level_count);
 }
 
@@ -197,7 +203,7 @@ std::string MultiLevelCache::GetPrintableOptions() const {
   oss << "multilevel_cache.total_capacity="
       << total_capacity_.load(std::memory_order_relaxed) << "\n";
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
-    const auto& sub = sub_caches_[level];
+    const Cache* sub = current_ptr_[level].load(std::memory_order_acquire);
     oss << "multilevel_cache.level[" << level
         << "].name=" << sub->Name() << "\n";
     const std::string sub_opts = sub->GetPrintableOptions();
@@ -439,8 +445,9 @@ void MultiLevelCache::SetCapacity(size_t capacity) {
 }
 
 void MultiLevelCache::SetStrictCapacityLimit(bool strict_capacity_limit) {
-  for (const auto& sub_cache : sub_caches_) {
-    sub_cache->SetStrictCapacityLimit(strict_capacity_limit);
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    current_ptr_[level].load(std::memory_order_acquire)
+        ->SetStrictCapacityLimit(strict_capacity_limit);
   }
   if (shared_cache_ != nullptr) {
     shared_cache_->SetStrictCapacityLimit(strict_capacity_limit);
@@ -456,8 +463,8 @@ bool MultiLevelCache::HasStrictCapacityLimit() const {
 
 size_t MultiLevelCache::GetCapacity() const {
   size_t total = 0;
-  for (const auto& sub_cache : sub_caches_) {
-    total += sub_cache->GetCapacity();
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    total += current_ptr_[level].load(std::memory_order_acquire)->GetCapacity();
   }
   if (shared_cache_ != nullptr) {
     total += shared_cache_->GetCapacity();
@@ -467,8 +474,8 @@ size_t MultiLevelCache::GetCapacity() const {
 
 size_t MultiLevelCache::GetUsage() const {
   size_t total = 0;
-  for (const auto& sub_cache : sub_caches_) {
-    total += sub_cache->GetUsage();
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    total += current_ptr_[level].load(std::memory_order_acquire)->GetUsage();
   }
   if (shared_cache_ != nullptr) {
     total += shared_cache_->GetUsage();
@@ -485,8 +492,9 @@ size_t MultiLevelCache::GetUsage(Handle* handle) const {
 
 size_t MultiLevelCache::GetPinnedUsage() const {
   size_t total = 0;
-  for (const auto& sub_cache : sub_caches_) {
-    total += sub_cache->GetPinnedUsage();
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    total +=
+        current_ptr_[level].load(std::memory_order_acquire)->GetPinnedUsage();
   }
   if (shared_cache_ != nullptr) {
     total += shared_cache_->GetPinnedUsage();
@@ -513,8 +521,9 @@ void MultiLevelCache::ApplyToAllEntries(
     const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
                              const CacheItemHelper* helper)>& callback,
     const ApplyToAllEntriesOptions& opts) {
-  for (const auto& sub_cache : sub_caches_) {
-    sub_cache->ApplyToAllEntries(callback, opts);
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    current_ptr_[level].load(std::memory_order_acquire)
+        ->ApplyToAllEntries(callback, opts);
   }
   if (shared_cache_ != nullptr) {
     shared_cache_->ApplyToAllEntries(callback, opts);
@@ -532,8 +541,8 @@ void MultiLevelCache::ApplyToHandle(
 }
 
 void MultiLevelCache::EraseUnRefEntries() {
-  for (const auto& sub_cache : sub_caches_) {
-    sub_cache->EraseUnRefEntries();
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    current_ptr_[level].load(std::memory_order_acquire)->EraseUnRefEntries();
   }
   if (shared_cache_ != nullptr) {
     shared_cache_->EraseUnRefEntries();
@@ -542,8 +551,9 @@ void MultiLevelCache::EraseUnRefEntries() {
 
 size_t MultiLevelCache::GetOccupancyCount() const {
   size_t total = 0;
-  for (const auto& sub_cache : sub_caches_) {
-    const size_t count = sub_cache->GetOccupancyCount();
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    const size_t count =
+        current_ptr_[level].load(std::memory_order_acquire)->GetOccupancyCount();
     if (count == SIZE_MAX) {
       return SIZE_MAX;
     }
@@ -561,8 +571,9 @@ size_t MultiLevelCache::GetOccupancyCount() const {
 
 size_t MultiLevelCache::GetTableAddressCount() const {
   size_t total = 0;
-  for (const auto& sub_cache : sub_caches_) {
-    total += sub_cache->GetTableAddressCount();
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    total += current_ptr_[level].load(std::memory_order_acquire)
+                 ->GetTableAddressCount();
   }
   if (shared_cache_ != nullptr) {
     total += shared_cache_->GetTableAddressCount();
@@ -666,8 +677,10 @@ std::string MultiLevelCache::PrintStats() const {
         level_lookups == 0 ? 0.0
                            : static_cast<double>(level_hits) /
                                  static_cast<double>(level_lookups);
-    oss << "L" << level << ": capacity=" << sub_caches_[level]->GetCapacity()
-        << ", usage=" << sub_caches_[level]->GetUsage()
+    const Cache* level_cache =
+        current_ptr_[level].load(std::memory_order_acquire);
+    oss << "L" << level << ": capacity=" << level_cache->GetCapacity()
+        << ", usage=" << level_cache->GetUsage()
         << ", lookups=" << level_lookups << ", hits=" << level_hits
         << ", hit_rate=" << level_hit_rate
         << ", data_size=" << level_data_size
@@ -709,19 +722,36 @@ MultiLevelCache::LevelMetricsSnapshot MultiLevelCache::GetLevelMetricsSnapshot()
   snapshot.table_address_counts.resize(sub_caches_.size());
   snapshot.occupancy_counts.resize(sub_caches_.size());
   for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    const Cache* level_cache =
+        current_ptr_[level].load(std::memory_order_acquire);
     snapshot.lookups[level] = SumLookupCounter(level);
     snapshot.hits[level] = SumHitCounter(level);
     snapshot.fg_lookups[level] = SumFgLookupCounter(level);
     snapshot.fg_hits[level] = SumFgHitCounter(level);
-    snapshot.capacities[level] = sub_caches_[level]->GetCapacity();
-    snapshot.usages[level] = sub_caches_[level]->GetUsage();
-    snapshot.table_address_counts[level] =
-        sub_caches_[level]->GetTableAddressCount();
-    snapshot.occupancy_counts[level] = sub_caches_[level]->GetOccupancyCount();
+    snapshot.capacities[level] = level_cache->GetCapacity();
+    snapshot.usages[level] = level_cache->GetUsage();
+    snapshot.table_address_counts[level] = level_cache->GetTableAddressCount();
+    snapshot.occupancy_counts[level] = level_cache->GetOccupancyCount();
     snapshot.data_sizes[level] =
         level_data_sizes_[level].load(std::memory_order_relaxed);
   }
   return snapshot;
+}
+
+uint64_t MultiLevelCache::GetTotalLookups() const {
+  uint64_t total = 0;
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    total += SumLookupCounter(level);
+  }
+  return total;
+}
+
+uint64_t MultiLevelCache::GetTotalForegroundLookups() const {
+  uint64_t total = 0;
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    total += SumFgLookupCounter(level);
+  }
+  return total;
 }
 
 std::vector<std::vector<uint64_t>> MultiLevelCache::DrainLookupSamples() {
@@ -933,9 +963,9 @@ std::optional<uint64_t> MultiLevelCache::GetCacheKeyPrefix(
   return DecodeFixed64(key.data());
 }
 
-void MultiLevelCache::BuildHandleOwnerRanges() {
-  handle_owner_ranges_.clear();
-  auto append_ranges = [this](Cache* cache) {
+void MultiLevelCache::RebuildHandleOwnerRangesLocked() {
+  auto ranges_vec = std::make_unique<std::vector<HandleOwnerRange>>();
+  auto append_ranges = [&ranges_vec](Cache* cache) {
     if (cache == nullptr) {
       return;
     }
@@ -954,29 +984,51 @@ void MultiLevelCache::BuildHandleOwnerRanges() {
       return;
     }
     for (const auto& range : ranges) {
-      handle_owner_ranges_.push_back(
-          {reinterpret_cast<uintptr_t>(range.first),
-           reinterpret_cast<uintptr_t>(range.second), cache});
+      ranges_vec->push_back({reinterpret_cast<uintptr_t>(range.first),
+                             reinterpret_cast<uintptr_t>(range.second), cache});
     }
   };
   for (const auto& sub_cache : sub_caches_) {
     append_ranges(sub_cache.get());
   }
   append_ranges(shared_cache_.get());
-  std::sort(handle_owner_ranges_.begin(), handle_owner_ranges_.end(),
+  // Retired-but-not-yet-reclaimed caches still hold outstanding handles that
+  // must resolve back to them on Release, so keep advertising their ranges.
+  for (const auto& retired : retired_sub_caches_) {
+    append_ranges(retired.cache.get());
+  }
+  std::sort(ranges_vec->begin(), ranges_vec->end(),
             [](const HandleOwnerRange& a, const HandleOwnerRange& b) {
               return a.begin < b.begin;
             });
+  const std::vector<HandleOwnerRange>* raw = ranges_vec.get();
+  if (live_ranges_) {
+    // Retire the previous snapshot; readers that already loaded its pointer
+    // finish within microseconds, well inside the grace period.
+    retired_ranges_.emplace_back(rebuild_round_, std::move(live_ranges_));
+  }
+  live_ranges_ = std::move(ranges_vec);
+  handle_owner_ranges_.store(raw, std::memory_order_release);
+}
+
+void MultiLevelCache::BuildHandleOwnerRanges() {
+  std::lock_guard<std::mutex> lock(rebuild_mutex_);
+  RebuildHandleOwnerRangesLocked();
 }
 
 Cache* MultiLevelCache::FindHandleOwner(const void* handle_addr) const {
+  const std::vector<HandleOwnerRange>* ranges =
+      handle_owner_ranges_.load(std::memory_order_acquire);
+  if (ranges == nullptr) {
+    return nullptr;
+  }
   const uintptr_t addr = reinterpret_cast<uintptr_t>(handle_addr);
-  // Binary search over at most (levels + 1) * shards ranges.
+  // Binary search over at most (levels + 1 + retired) * shards ranges.
   size_t lo = 0;
-  size_t hi = handle_owner_ranges_.size();
+  size_t hi = ranges->size();
   while (lo < hi) {
     const size_t mid = lo + (hi - lo) / 2;
-    if (handle_owner_ranges_[mid].begin <= addr) {
+    if ((*ranges)[mid].begin <= addr) {
       lo = mid + 1;
     } else {
       hi = mid;
@@ -985,7 +1037,7 @@ Cache* MultiLevelCache::FindHandleOwner(const void* handle_addr) const {
   if (lo == 0) {
     return nullptr;
   }
-  const HandleOwnerRange& range = handle_owner_ranges_[lo - 1];
+  const HandleOwnerRange& range = (*ranges)[lo - 1];
   return addr < range.end ? range.owner : nullptr;
 }
 
@@ -1056,13 +1108,15 @@ void MultiLevelCache::ApplyCapacities(const std::vector<size_t>& capacities) {
   if (force_route_all_to_l0_.load(std::memory_order_relaxed)) {
     level_capacities[0] = total_capacity_.load(std::memory_order_relaxed);
     for (size_t level = 0; level < level_capacities.size(); ++level) {
-      sub_caches_[level]->SetCapacity(level_capacities[level]);
+      current_ptr_[level].load(std::memory_order_acquire)
+          ->SetCapacity(level_capacities[level]);
     }
     if (shared_cache_ != nullptr) {
       shared_cache_->SetCapacity(0);
     }
-    for (const auto& sub_cache : sub_caches_) {
-      PurgeSubCacheToCapacity(sub_cache.get());
+    for (size_t level = 0; level < sub_caches_.size(); ++level) {
+      PurgeSubCacheToCapacity(
+          current_ptr_[level].load(std::memory_order_acquire));
     }
     PurgeSubCacheToCapacity(shared_cache_.get());
     return;
@@ -1098,27 +1152,150 @@ void MultiLevelCache::ApplyCapacities(const std::vector<size_t>& capacities) {
   }
 
   for (size_t level = 0; level < level_capacities.size(); ++level) {
-    sub_caches_[level]->SetCapacity(level_capacities[level]);
+    current_ptr_[level].load(std::memory_order_acquire)
+        ->SetCapacity(level_capacities[level]);
   }
   if (shared_cache_ != nullptr) {
     shared_cache_->SetCapacity(shared_capacity);
   }
   // Apply all new capacities first, then reclaim, so that purges run against
   // the final targets (a level being grown is never purged spuriously).
-  for (const auto& sub_cache : sub_caches_) {
-    PurgeSubCacheToCapacity(sub_cache.get());
+  for (size_t level = 0; level < sub_caches_.size(); ++level) {
+    PurgeSubCacheToCapacity(current_ptr_[level].load(std::memory_order_acquire));
   }
   PurgeSubCacheToCapacity(shared_cache_.get());
+
+  // A level that was funded (its AutoHCC slot array grew large) and then
+  // defunded leaves a sparse grow-only table whose Evict scans thrash. Swap
+  // any such table for a fresh empty one, and reclaim previously-retired tables
+  // whose handles have drained. Advances the retire/reclaim grace clock.
+  MaybeRebuildSparseSubCaches();
+}
+
+void MultiLevelCache::MaybeRebuildSparseSubCaches() {
+  static const bool kRebuildDebug = getenv("MLC_ALLOC_DEBUG") != nullptr;
+  std::lock_guard<std::mutex> lock(rebuild_mutex_);
+  ++rebuild_round_;
+
+  if (rebuild_sub_cache_) {
+    // A level whose grow-only AutoHCC table grew large while funded but is now
+    // nearly empty (after being defunded + purged) forces Evict to scan a huge,
+    // mostly-empty slot array on every insert. Only AutoHCC is grow-only, so
+    // only it needs a rebuild to actually shrink its table.
+    static constexpr size_t kMinSlotsForRebuild = 4096;
+    static constexpr double kSparseOccupancyRatio = 0.10;
+    // No hysteresis: with the op-count cadence the model-stability gate already
+    // holds a stable allocation (large swings are SKIPped), so a level only
+    // reads sparse after a genuine, sustained defund -- rebuild it immediately.
+    bool swapped = false;
+    for (size_t level = 0; level < sub_caches_.size(); ++level) {
+      Cache* cur = current_ptr_[level].load(std::memory_order_acquire);
+      if (cur == nullptr ||
+          std::strcmp(cur->Name(), "AutoHyperClockCache") != 0) {
+        continue;
+      }
+      const size_t slots = cur->GetTableAddressCount();
+      const size_t occ = cur->GetOccupancyCount();
+      const bool sparse =
+          slots > kMinSlotsForRebuild && occ != SIZE_MAX &&
+          static_cast<double>(occ) < kSparseOccupancyRatio *
+                                         static_cast<double>(slots);
+      if (!sparse) {
+        continue;
+      }
+      const double occ_ratio =
+          static_cast<double>(occ) / static_cast<double>(slots);
+      // Fresh empty table at the level's current (shrunk) target capacity; the
+      // mmap is still reserved for the whole budget so the level can grow again
+      // if later refunded, while RSS drops to near-zero for the sparse table.
+      std::shared_ptr<Cache> fresh = rebuild_sub_cache_(cur->GetCapacity());
+      if (fresh == nullptr) {
+        continue;
+      }
+      fresh->SetStrictCapacityLimit(cur->HasStrictCapacityLimit());
+      Cache* fresh_raw = fresh.get();
+      std::shared_ptr<Cache> old = sub_caches_[level];
+      sub_caches_[level] = std::move(fresh);
+      // Publish on the hot path before retiring the old owner. Outstanding
+      // handles issued from `old` keep it alive (and pinned) in retired_.
+      current_ptr_[level].store(fresh_raw, std::memory_order_release);
+      retired_sub_caches_.push_back({std::move(old), rebuild_round_});
+      swapped = true;
+      if (kRebuildDebug) {
+        std::fprintf(stderr,
+                     "[MLC_REBUILD] round=%llu level=%zu slots=%zu occ=%zu "
+                     "occ_ratio=%.4f new_cap=%zu retired=%zu\n",
+                     static_cast<unsigned long long>(rebuild_round_), level,
+                     slots, occ, occ_ratio,
+                     current_ptr_[level].load(std::memory_order_acquire)
+                         ->GetCapacity(),
+                     retired_sub_caches_.size());
+      }
+    }
+    if (swapped) {
+      // Advertise the new tables' handle ranges (and keep the retired ones).
+      RebuildHandleOwnerRangesLocked();
+    }
+  }
+
+  ReclaimRetiredCachesLocked();
+}
+
+void MultiLevelCache::ReclaimRetiredCachesLocked() {
+  static const bool kReclaimDebug = getenv("MLC_ALLOC_DEBUG") != nullptr;
+  // Grace period (in adjustment rounds) covering the microsecond in-flight
+  // window between a hot-path thread reading current_ptr_/handle_owner_ranges_
+  // and dereferencing the result.
+  static constexpr uint64_t kReclaimGraceRounds = 2;
+  // Destroyed only after the ranges snapshot is republished without them, so an
+  // in-flight FindHandleOwner never resolves to a freed (unmapped) table.
+  std::vector<std::shared_ptr<Cache>> to_free;
+  bool reclaimed = false;
+  for (auto it = retired_sub_caches_.begin();
+       it != retired_sub_caches_.end();) {
+    const bool grace_passed =
+        rebuild_round_ - it->retire_round >= kReclaimGraceRounds;
+    // A retired cache issues no new handles, so its pinned usage only decreases;
+    // once it reaches zero it stays zero and the table is safe to unmap.
+    if (grace_passed && it->cache->GetPinnedUsage() == 0) {
+      if (kReclaimDebug) {
+        std::fprintf(stderr,
+                     "[MLC_RECLAIM] round=%llu freeing retired cache "
+                     "(retire_round=%llu) remaining_retired=%zu\n",
+                     static_cast<unsigned long long>(rebuild_round_),
+                     static_cast<unsigned long long>(it->retire_round),
+                     retired_sub_caches_.size() - 1);
+      }
+      to_free.push_back(std::move(it->cache));
+      it = retired_sub_caches_.erase(it);
+      reclaimed = true;
+    } else {
+      ++it;
+    }
+  }
+  if (reclaimed) {
+    RebuildHandleOwnerRangesLocked();
+  }
+  // GC superseded range snapshots whose readers have long since finished.
+  for (auto it = retired_ranges_.begin(); it != retired_ranges_.end();) {
+    if (rebuild_round_ - it->first >= kReclaimGraceRounds) {
+      it = retired_ranges_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // `to_free` destructs here, after the ranges snapshot no longer references it;
+  // the AutoHCC destructor munmaps the slot array, returning RSS to the OS.
 }
 
 Cache* MultiLevelCache::SubCacheByLevel(size_t level_index) {
   assert(level_index < sub_caches_.size());
-  return sub_caches_[level_index].get();
+  return current_ptr_[level_index].load(std::memory_order_acquire);
 }
 
 const Cache* MultiLevelCache::SubCacheByLevel(size_t level_index) const {
   assert(level_index < sub_caches_.size());
-  return sub_caches_[level_index].get();
+  return current_ptr_[level_index].load(std::memory_order_acquire);
 }
 
 Cache* MultiLevelCache::SharedCache() {
@@ -1551,6 +1728,13 @@ size_t MultiLevelCache::GetSharedPoolCapacity(size_t total_capacity) const {
 }
 
 void MultiLevelCache::InitializePerLevelState(size_t level_count) {
+  // Publish the initial hot-path routing pointers before anything (including
+  // MaybeSetLevelProbationInsert below) resolves a level to its sub-cache.
+  current_ptr_ = std::make_unique<std::atomic<Cache*>[]>(level_count);
+  for (size_t level = 0; level < level_count; ++level) {
+    current_ptr_[level].store(sub_caches_[level].get(),
+                              std::memory_order_release);
+  }
   // Value-initialized: all stripes start at zero.
   lookups_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
   hits_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);

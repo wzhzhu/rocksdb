@@ -29,8 +29,17 @@ enum class MultiLevelAllocatorMode {
 };
 
 struct MultiLevelAllocationOptions {
-  // Background solve interval in milliseconds.
+  // Background solve interval in milliseconds. When adjust_interval_ops > 0 this
+  // is only the poll granularity (how often the loop wakes to check the op
+  // counter and Stop()); the round itself is gated on op count, not wall time.
   uint64_t interval_ms = 1000;
+  // Op-count adjustment cadence: run a solve/apply round once this many cache
+  // lookups have elapsed since the previous round, instead of on a wall-clock
+  // interval. This decouples the number of adjustment rounds from thread count /
+  // throughput (a 5s wall interval gives fewer rounds at high throughput, which
+  // made the converged allocation -- and hit ratio -- vary non-monotonically
+  // with thread count). 0 falls back to the legacy fixed interval_ms cadence.
+  uint64_t adjust_interval_ops = 100000;
   // Exponential smoothing factor in [0, 1], where 1 means no smoothing.
   double smoothing_ratio = 0.5;
   // Skip applying capacities when total delta is below this threshold.
@@ -227,6 +236,9 @@ class MultiLevelCacheAllocator {
   // adaptive interval backoff).
   bool last_round_applied_ = false;
   uint64_t round_id_ = 0;
+  // Total cache lookups (summed across levels) at the last op-gated round.
+  // Used by BackgroundLoop to decide when adjust_interval_ops have elapsed.
+  uint64_t last_round_lookups_ = 0;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

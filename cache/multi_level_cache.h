@@ -125,6 +125,17 @@ class MultiLevelCache : public Cache {
   std::string PrintStats() const;
   void ResetStats();
   LevelMetricsSnapshot GetLevelMetricsSnapshot() const;
+  // Total cache lookups summed across all levels. Cheap (16 stripes x levels
+  // relaxed loads); used by the allocator's op-count adjustment cadence to gate
+  // rounds without allocating a full metrics snapshot on every poll.
+  uint64_t GetTotalLookups() const;
+  // Foreground-only total lookups (compaction-induced lookups excluded). The
+  // allocator's op-count cadence gates on THIS so the number of adjustment
+  // rounds tracks foreground traffic, not compaction streaming -- consistent
+  // with the compaction-excluded (config B) model, and so a write-heavy /
+  // compaction-heavy workload does not fire far more rounds (and PurgeToCapacity
+  // churn) than a read-only one at the same foreground op rate.
+  uint64_t GetTotalForegroundLookups() const;
   std::vector<std::vector<uint64_t>> DrainLookupSamples();
   void SetLookupSampleRateLog2(uint32_t sample_rate_log2);
 
@@ -250,6 +261,16 @@ class MultiLevelCache : public Cache {
   size_t GetSharedPoolCapacity(size_t total_capacity) const;
 
   void BuildHandleOwnerRanges();
+  // Rebuilds and atomically publishes the handle-owner range snapshot from the
+  // current sub-caches, the shared cache, and all not-yet-reclaimed retired
+  // sub-caches. Must be called under rebuild_mutex_.
+  void RebuildHandleOwnerRangesLocked();
+  // After capacities are applied, swaps any sub-cache that has become sparse
+  // (grown-large but now nearly empty, the AutoHCC grow-only pathology) for a
+  // fresh empty one, and reclaims retired caches whose grace period elapsed and
+  // whose handles have all been released. Runs on the allocator thread.
+  void MaybeRebuildSparseSubCaches();
+  void ReclaimRetiredCachesLocked();
   Cache* FindHandleOwner(const void* handle_addr) const;
   Handle* WrapOrPassHandle(Cache* owner_cache, Cache::Handle* inner);
   // Recovers (owner, inner) for any handle previously returned by this cache.
@@ -278,11 +299,48 @@ class MultiLevelCache : public Cache {
   uint64_t SumFgLookupCounter(size_t level_index) const;
   uint64_t SumFgHitCounter(size_t level_index) const;
 
+  // Owning vector of the current sub-cache per level. Elements are only
+  // reassigned during a sparse-table rebuild, always under rebuild_mutex_.
+  // Never dereference an element off the allocator/rebuild thread; readers on
+  // other threads must route through current_ptr_ (below) instead.
   std::vector<std::shared_ptr<Cache>> sub_caches_;
+  // Lock-free hot-path routing: current_ptr_[i] is the raw pointer of the cache
+  // currently serving level i. Published with release ordering on rebuild and
+  // read with acquire ordering by SubCacheByLevel and the low-frequency
+  // iteration helpers. The pointee is kept alive by sub_caches_ (current) or
+  // retired_sub_caches_ (retired, grace-period reclaimed), so a raw pointer read
+  // here stays valid for the microsecond-scoped duration of any single call.
+  std::unique_ptr<std::atomic<Cache*>[]> current_ptr_;
   std::shared_ptr<Cache> shared_cache_;
-  // Sorted by begin; built once after sub-caches are created, immutable
-  // afterwards (HCC slot arrays are never reallocated).
-  std::vector<HandleOwnerRange> handle_owner_ranges_;
+  // Builds a fresh empty sub-cache for a given target capacity, with the mmap
+  // reservation sized for the whole budget (so it can grow again later). Set
+  // only for HCC-backed construction; null disables sparse-table rebuild (e.g.
+  // LRU sub-caches, which shrink in place and never need it).
+  std::function<std::shared_ptr<Cache>(size_t new_capacity)> rebuild_sub_cache_;
+  // Serializes sub_caches_ element reassignment and retired_sub_caches_ /
+  // range-snapshot bookkeeping against the low-frequency iteration helpers.
+  // Never held on the Lookup/Insert/Release hot path.
+  mutable std::mutex rebuild_mutex_;
+  // A sub-cache displaced by a rebuild, kept alive until all its outstanding
+  // handles are released and a grace period has elapsed, then destroyed (which
+  // munmaps its slot array, returning RSS to the OS).
+  struct RetiredCache {
+    std::shared_ptr<Cache> cache;
+    uint64_t retire_round;
+  };
+  std::vector<RetiredCache> retired_sub_caches_;
+  // Monotonic round counter driving retire/reclaim grace periods; advanced once
+  // per ApplyCapacities under rebuild_mutex_.
+  uint64_t rebuild_round_ = 0;
+  // Sorted by begin. Published atomically; rebuilt when a sub-cache is swapped
+  // or a retired cache is reclaimed (so freed address ranges are dropped).
+  // Readers load with acquire ordering; the pointee is owned by live_ranges_.
+  std::atomic<const std::vector<HandleOwnerRange>*> handle_owner_ranges_{nullptr};
+  std::unique_ptr<const std::vector<HandleOwnerRange>> live_ranges_;
+  // Superseded range snapshots awaiting grace-period reclaim (readers that
+  // loaded the old pointer finish within microseconds).
+  std::vector<std::pair<uint64_t, std::unique_ptr<const std::vector<HandleOwnerRange>>>>
+      retired_ranges_;
   std::unique_ptr<StripedCounter[]> lookups_;
   std::unique_ptr<StripedCounter[]> hits_;
   std::unique_ptr<StripedCounter[]> fg_lookups_;
