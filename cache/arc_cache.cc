@@ -1,11 +1,13 @@
 #include "cache/arc_cache.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <vector>
 
 #include "cache/clock_cache.h"
+#include "cache/multi_level_cache_compaction.h"
 #include "cache/sharded_wrapper_cache.h"
 namespace ROCKSDB_NAMESPACE {
 namespace {
@@ -566,6 +568,25 @@ Cache::Handle* ARCCache::Lookup(const Slice& key, const CacheItemHelper* helper,
                                 Statistics* stats) {
   const std::string key_str = SliceToKey(key);
   Handle* handle = target_->Lookup(key, helper, create_context, priority, stats);
+  // Ablation (gated off by default via CACHE_ABLATE_COMPACTION_POLICY): on the
+  // compaction read path, serve hits but leave ARC's replacement metadata
+  // (T1/T2/B1/B2 lists and the adaptive target) untouched, and record no ghost
+  // history on a miss. This isolates how much compaction-lookup pollution
+  // affects the baseline's hit ratio. Tombstones are still honored.
+  static const bool kAblateCompactionPolicy =
+      std::getenv("CACHE_ABLATE_COMPACTION_POLICY") != nullptr;
+  if (kAblateCompactionPolicy && MLCLookupIsCompaction()) {
+    if (handle == nullptr) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (IsTombstonedLocked(key_str)) {
+      target_->Release(handle);
+      target_->Erase(key);
+      return nullptr;
+    }
+    return handle;
+  }
   bool tombstoned_hit = false;
   bool wrapper_hit = false;
   std::vector<std::string> evicted_keys;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -9,6 +10,7 @@
 
 #include "cache/clock_cache.h"
 #include "cache/lru_cache.h"
+#include "cache/multi_level_cache_compaction.h"
 #include "cache/sharded_wrapper_cache.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -925,6 +927,26 @@ Cache::Handle* CacheusCache::Lookup(const Slice& key,
                                     Priority priority, Statistics* stats) {
   const std::string key_str = SliceToKey(key);
   Handle* handle = target_->Lookup(key, helper, create_context, priority, stats);
+  // Ablation (gated off by default via CACHE_ABLATE_COMPACTION_POLICY): on the
+  // compaction read path, serve hits but leave CacheUS's replacement metadata
+  // (S/Q queues, LFU set, frequency/time counters, learning rate) untouched,
+  // and record no ghost history on a miss. This isolates how much
+  // compaction-lookup pollution affects the baseline's hit ratio. Tombstones
+  // are still honored.
+  static const bool kAblateCompactionPolicy =
+      std::getenv("CACHE_ABLATE_COMPACTION_POLICY") != nullptr;
+  if (kAblateCompactionPolicy && MLCLookupIsCompaction()) {
+    if (handle == nullptr) {
+      return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    if (IsTombstonedLocked(key_str)) {
+      target_->Release(handle);
+      target_->Erase(key);
+      return nullptr;
+    }
+    return handle;
+  }
   bool tombstoned_hit = false;
   bool request_counted = false;
   if (handle != nullptr) {
