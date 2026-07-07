@@ -1150,8 +1150,29 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       // as recipient (belt: upper_bytes cap still applies).
       const std::vector<uint64_t> ghost = cache_->DrainGhostHits();
       if (ghost.size() == level_count) {
+        // EMA smoothing (steady-state suppression #1): per-window counts are
+        // Poisson-noisy and compaction-bursty; smoothing keeps a transient
+        // spike from flipping the transfer direction for a round.
+        const double beta =
+            (options_.ghost_score_ema_beta > 0.0 &&
+             options_.ghost_score_ema_beta < 1.0)
+                ? options_.ghost_score_ema_beta
+                : 1.0;
+        if (ghost_score_ema_.size() != level_count) {
+          ghost_score_ema_.assign(level_count, 0.0);
+        }
         for (size_t i = 0; i < level_count; ++i) {
-          score[i] = static_cast<double>(ghost[i]);
+          ghost_score_ema_[i] = (1.0 - beta) * ghost_score_ema_[i] +
+                                beta * static_cast<double>(ghost[i]);
+          score[i] = ghost_score_ema_[i];
+          // Per-byte normalization: the raw count says how many misses more
+          // capacity could convert, but the bytes needed per converted hit
+          // scale with the level's footprint. Without this, comparable raw
+          // counts on L3 (0.8 GiB data) and L5 (15 GiB data) read as equal
+          // marginal value even though L5 needs ~20x the capacity per hit.
+          if (options_.ghost_normalize_by_data && data[i] > 0.0) {
+            score[i] = ghost_score_ema_[i] / data[i];
+          }
         }
         ghost_scored = true;
       }
@@ -1185,14 +1206,67 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       }
     }
 
+    // Direction locks (steady-state suppression #2): a recent recipient may
+    // not donate and a recent donor may not receive, killing ping-pong
+    // transfers (observed: L3->L0 then L0->L5 within 50 rounds) regardless
+    // of score noise.
+    if (received_lock_round_.size() != level_count) {
+      received_lock_round_.assign(level_count, 0);
+      donated_lock_round_.assign(level_count, 0);
+    }
+
+    // --- Excess detection (structural reclaim) ---
+    //
+    // upper_bytes only limits a level's growth at transfer time; nothing
+    // reclaims capacity once the level's data shrinks below it. L0 is the
+    // canonical victim: its data is pulse-shaped (flush files arrive, then
+    // compaction consumes them within seconds), and its ghost score stays
+    // permanently high from compulsory misses on newly created files --
+    // misses no amount of capacity can prevent, which the repeat-miss signal
+    // cannot distinguish. Score-driven transfers therefore park a large
+    // fraction of the budget on L0 and never take it back (observed: 768 MiB
+    // for ~0 resident data at a 2 GiB budget, starving L4/L5 and costing
+    // ~3pt fg hit ratio). Capacity beyond data*margin is unusable by
+    // definition, so a level holding it becomes a mandatory donor,
+    // overriding the score-based donor choice and the steady-state gates.
+    size_t excess_donor = level_count;
+    size_t excess_bytes = 0;
+    for (size_t i = 0; i < level_count; ++i) {
+      if (last_capacities_[i] > upper_bytes[i]) {
+        const size_t ex = last_capacities_[i] - upper_bytes[i];
+        if (ex > excess_bytes) {
+          excess_bytes = ex;
+          excess_donor = i;
+        }
+      }
+    }
+    // Ignore sub-MiB slack (accounting noise).
+    const bool structural_reclaim =
+        excess_donor != level_count && excess_bytes >= (size_t{1} << 20);
+
     // --- Find recipient (highest score, has data, has room to grow) ---
     size_t recipient = level_count;
     double best_recv = -1.0;
     for (size_t i = 0; i < level_count; ++i) {
+      if (structural_reclaim && i == excess_donor) continue;
+      if (donated_lock_round_[i] > round_id_) continue;  // recent donor
       if (data[i] > 0.0 && last_capacities_[i] < upper_bytes[i] &&
           score[i] > best_recv) {
         best_recv = score[i];
         recipient = i;
+      }
+    }
+    if (structural_reclaim && recipient == level_count) {
+      // No score-bearing recipient (e.g. zero-signal window): fall back to
+      // the largest-data level with room, so the reclaim still proceeds.
+      double best_data = 0.0;
+      for (size_t i = 0; i < level_count; ++i) {
+        if (i == excess_donor) continue;
+        if (data[i] > best_data && last_capacities_[i] < upper_bytes[i]) {
+          best_data = data[i];
+          recipient = i;
+          best_recv = score[i];
+        }
       }
     }
 
@@ -1200,13 +1274,20 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     size_t donor = level_count;
     double best_donor_score = kInfiniteScore;
     bool donor_found = false;
-    for (size_t i = 0; i < level_count; ++i) {
-      if (i == recipient) continue;
-      if (last_capacities_[i] <= floor_bytes[i]) continue;
-      if (!donor_found || score[i] < best_donor_score) {
-        best_donor_score = score[i];
-        donor = i;
-        donor_found = true;
+    if (structural_reclaim) {
+      donor = excess_donor;
+      best_donor_score = score[donor];
+      donor_found = true;
+    } else {
+      for (size_t i = 0; i < level_count; ++i) {
+        if (i == recipient) continue;
+        if (received_lock_round_[i] > round_id_) continue;  // recent recipient
+        if (last_capacities_[i] <= floor_bytes[i]) continue;
+        if (!donor_found || score[i] < best_donor_score) {
+          best_donor_score = score[i];
+          donor = i;
+          donor_found = true;
+        }
       }
     }
 
@@ -1222,6 +1303,10 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                   (unsigned long long)ap, (unsigned long long)s);
         }
       }
+      // Any skipped round breaks the same-direction streak: drop the
+      // accelerated step back to the base step.
+      current_step_bytes_ = 0;
+      last_step_recipient_ = SIZE_MAX;
       prev_data_sizes_ = snapshot.data_sizes;
       prev_lookups_ = snapshot.lookups;
       prev_hits_ = snapshot.hits;
@@ -1233,16 +1318,21 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       return Status::OK();
     }
 
+    // The steady-state gates below compare marginal scores; a structural
+    // reclaim is not a score-driven decision (the excess is unusable
+    // regardless of any score), so it bypasses all of them.
+    //
     // Require a real traffic signal before transferring: if best score is
     // zero (lambda=0 for all levels in the current window, e.g. the first
     // few rounds during wait_for_compact), defer until we have data.
-    if (best_recv <= 0.0) {
+    if (!structural_reclaim && best_recv <= 0.0) {
       do_skip_step("no_signal");
       return Status::OK();
     }
 
     // Gap check: skip if allocation is near-optimal (scores converged).
-    if (options_.step_min_score_ratio > 0.0 && std::isfinite(best_recv)) {
+    if (!structural_reclaim && options_.step_min_score_ratio > 0.0 &&
+        std::isfinite(best_recv)) {
       const double gap = (best_recv - best_donor_score) / best_recv;
       if (gap < options_.step_min_score_ratio) {
         do_skip_step("near_optimal");
@@ -1250,14 +1340,83 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       }
     }
 
-    // --- Compute and apply transfer ---
-    const size_t donor_avail = last_capacities_[donor] - floor_bytes[donor];
+    // Significance gate for count-based ghost scores (steady-state
+    // suppression #3): require both a multiplicative gap and a
+    // Poisson-significance gap, so steady-state noise (all levels thrashing
+    // comparably) stops transfers while convergence-phase gaps (10-100x)
+    // pass trivially. Poisson noise lives on the raw counts; when the
+    // selection scores are per-byte normalized (count/D), the noise must be
+    // propagated through the same normalization -- σ(count/D) = sqrt(count)/D
+    // -- rather than compared on raw counts, otherwise a legitimate transfer
+    // between levels with similar counts but very different footprints
+    // (e.g. L3 at 0.8 GiB vs L5 at 15 GiB) would read as insignificant.
+    if (!structural_reclaim && ghost_scored &&
+        options_.ghost_min_recv_donor_ratio > 0.0) {
+      const bool ratio_ok =
+          best_recv >
+          options_.ghost_min_recv_donor_ratio * std::max(0.0, best_donor_score);
+      // Scale factor applied to each level's count in score[]: 1/D (or 1).
+      const double recv_scale =
+          (options_.ghost_normalize_by_data && data[recipient] > 0.0)
+              ? 1.0 / data[recipient]
+              : 1.0;
+      const double donor_scale =
+          (options_.ghost_normalize_by_data && data[donor] > 0.0)
+              ? 1.0 / data[donor]
+              : 1.0;
+      const double var =
+          std::max(1.0, ghost_score_ema_[recipient]) * recv_scale * recv_scale +
+          std::max(1.0, ghost_score_ema_[donor]) * donor_scale * donor_scale;
+      const bool significant =
+          (best_recv - best_donor_score) >
+          options_.ghost_significance_k * std::sqrt(var);
+      if (!ratio_ok || !significant) {
+        do_skip_step("insignificant");
+        return Status::OK();
+      }
+    }
+
+    // --- Compute and apply transfer (adaptive step) ---
+    //
+    // Rprop-style acceleration: consecutive applied rounds with the SAME
+    // recipient mean the allocation is still far from the optimum and pushing
+    // in one direction, so the step doubles (up to the effective max) to cut
+    // the cold-start convergence tax. The moment the recipient changes -- or
+    // any round is skipped -- the step resets to the effective base, so near
+    // the optimum (where recipients alternate) transfers stay small.
+    //
+    // Both the base and max step are capped RELATIVE to the total budget
+    // (total/32 and total/8). The absolute options (64 MiB / 512 MiB) were
+    // tuned at 8 GiB; at a 1 GiB budget an uncapped 512 MiB step moves half
+    // the cache in one round, and the resulting capacity swing leaves the
+    // grow-only AutoHCC tables sparse relative to usage, degrading every
+    // subsequent Evict sweep (the profiled 55%-of-cycles Evict hotspot).
+    const size_t base_step = std::max<size_t>(
+        1 << 20, std::min(options_.adjust_step_bytes, total_capacity / 32));
+    const size_t max_step = std::max(
+        base_step, std::min(options_.step_max_bytes, total_capacity / 8));
+    size_t step = base_step;
+    if (options_.step_growth > 1.0 && recipient == last_step_recipient_ &&
+        current_step_bytes_ > 0) {
+      const double grown =
+          static_cast<double>(current_step_bytes_) * options_.step_growth;
+      step = static_cast<size_t>(
+          std::min(grown, static_cast<double>(max_step)));
+    }
+
+    // A structural reclaim drains at the max step (the excess is dead
+    // capacity; converge in few rounds) but never digs below the donor's
+    // upper bound, and only moves the excess itself.
+    size_t donor_avail = last_capacities_[donor] - floor_bytes[donor];
+    if (structural_reclaim) {
+      step = max_step;
+      donor_avail = std::min(donor_avail, excess_bytes);
+    }
     const size_t recv_room =
         upper_bytes[recipient] > last_capacities_[recipient]
             ? upper_bytes[recipient] - last_capacities_[recipient]
             : 0;
-    const size_t transfer =
-        std::min({options_.adjust_step_bytes, donor_avail, recv_room});
+    const size_t transfer = std::min({step, donor_avail, recv_room});
 
     if (transfer == 0) {
       do_skip_step("zero_transfer");
@@ -1293,11 +1452,13 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                              ? (best_recv - best_donor_score) / best_recv
                              : 1.0;
         fprintf(stderr,
-                "[MLC_ALLOC] round=%llu APPLY(step) L%zu->L%zu "
-                "transfer=%lluMiB scorer=%s score_gap=%.3f apply_us=%llu "
-                "applied=%llu skipped=%llu caps(MiB)=[%s]\n",
-                (unsigned long long)round_id_, donor, recipient,
+                "[MLC_ALLOC] round=%llu APPLY(%s) L%zu->L%zu "
+                "transfer=%lluMiB step=%lluMiB scorer=%s score_gap=%.3f "
+                "apply_us=%llu applied=%llu skipped=%llu caps(MiB)=[%s]\n",
+                (unsigned long long)round_id_,
+                structural_reclaim ? "reclaim" : "step", donor, recipient,
                 (unsigned long long)(transfer >> 20),
+                (unsigned long long)(step >> 20),
                 ghost_scored ? "ghost" : "model", gap_val,
                 (unsigned long long)(t1 - dbg_t0),
                 (unsigned long long)ap, (unsigned long long)sk,
@@ -1311,6 +1472,26 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     if (s.ok()) {
       last_capacities_ = std::move(new_caps);
       last_round_applied_ = true;
+      // Feed the adaptive-step streak tracker. A structural reclaim moves at
+      // max_step out-of-band; letting it seed the streak would hand the next
+      // score-driven round an already-accelerated step, so reset instead.
+      if (structural_reclaim) {
+        current_step_bytes_ = 0;
+        last_step_recipient_ = SIZE_MAX;
+      } else {
+        current_step_bytes_ = step;
+        last_step_recipient_ = recipient;
+      }
+      // Arm the direction locks (round_id_ was already advanced above).
+      if (options_.step_direction_lock_rounds > 0) {
+        received_lock_round_[recipient] =
+            round_id_ + options_.step_direction_lock_rounds;
+        donated_lock_round_[donor] =
+            round_id_ + options_.step_direction_lock_rounds;
+      }
+    } else {
+      current_step_bytes_ = 0;
+      last_step_recipient_ = SIZE_MAX;
     }
     return s;
   }  // end incremental marginal-step mode

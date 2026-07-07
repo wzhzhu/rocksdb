@@ -171,6 +171,17 @@ class MultiLevelCache : public Cache {
   // counter). Empty when tracking is disabled.
   std::vector<uint64_t> DrainGhostHits();
 
+  // Installs the factory used by the sparse-table rebuild (swap a defunded
+  // level's grow-only AutoHCC table for a fresh empty one). The HCC-options
+  // constructor installs one automatically; callers of the per-level
+  // (vector<Cache>) constructor MUST install one themselves or sparse-table
+  // rebuild stays disabled and a defunded level's Evict sweeps degrade.
+  void SetRebuildSubCacheFactory(
+      std::function<std::shared_ptr<Cache>(size_t level, size_t new_capacity)>
+          factory) {
+    rebuild_sub_cache_ = std::move(factory);
+  }
+
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
   // For A/B diagnostics: force all requests to route into L0.
@@ -339,11 +350,14 @@ class MultiLevelCache : public Cache {
   // here stays valid for the microsecond-scoped duration of any single call.
   std::unique_ptr<std::atomic<Cache*>[]> current_ptr_;
   std::shared_ptr<Cache> shared_cache_;
-  // Builds a fresh empty sub-cache for a given target capacity, with the mmap
-  // reservation sized for the whole budget (so it can grow again later). Set
-  // only for HCC-backed construction; null disables sparse-table rebuild (e.g.
-  // LRU sub-caches, which shrink in place and never need it).
-  std::function<std::shared_ptr<Cache>(size_t new_capacity)> rebuild_sub_cache_;
+  // Builds a fresh empty sub-cache for a given level and target capacity, with
+  // the mmap reservation sized for the whole budget (so it can grow again
+  // later). Set by the HCC-backed constructor, or via
+  // SetRebuildSubCacheFactory for the per-level (vector<Cache>) construction
+  // path; null disables sparse-table rebuild (e.g. LRU sub-caches, which
+  // shrink in place and never need it).
+  std::function<std::shared_ptr<Cache>(size_t level, size_t new_capacity)>
+      rebuild_sub_cache_;
   // Serializes sub_caches_ element reassignment and retired_sub_caches_ /
   // range-snapshot bookkeeping against the low-frequency iteration helpers.
   // Never held on the Lookup/Insert/Release hot path.

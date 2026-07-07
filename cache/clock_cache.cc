@@ -462,6 +462,15 @@ typename Table::HandleImpl* BaseClockTable::CreateStandalone(
   derived.StartInsert(state);
 
   const size_t total_charge = proto.GetTotalCharge();
+  if (total_charge == 0) {
+    // Zero-charge standalone (e.g. MultiLevelCache capacity-gated insert
+    // bypass): nothing to charge, so skip ChargeUsageMaybeEvict* entirely.
+    // The non-strict path would otherwise still force an Evict(1) sweep
+    // whenever usage sits above capacity -- persistent on a starved level
+    // that no longer admits real (charged) inserts -- turning every bypass
+    // into a scan of the sparse table.
+    return StandaloneInsert<typename Table::HandleImpl>(proto);
+  }
   // NOTE: we can use eec_and_scl as eviction_effort_cap below because
   // strict_capacity_limit=true is supposed to disable the limit on eviction
   // effort, and a large value effectively does that.

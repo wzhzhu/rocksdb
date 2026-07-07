@@ -171,6 +171,23 @@ struct MultiLevelAllocationOptions {
   // pair exists.
   double step_min_score_ratio = 0.02;
 
+  // Adaptive step acceleration (Rprop-style): while consecutive APPLIED rounds
+  // pick the same recipient (the allocation is still far from the optimum and
+  // keeps pushing in one direction), the effective step grows by step_growth
+  // per round up to step_max_bytes; as soon as the recipient changes -- or a
+  // round is skipped -- the step resets to adjust_step_bytes. Large steps
+  // early (fast convergence out of the equal-split cold start), small steps
+  // late (bounded churn near the optimum), with no schedule or target
+  // knowledge required. step_max_bytes also bounds the per-round
+  // PurgeToCapacity cost. Set step_growth <= 1.0 to disable acceleration.
+  //
+  // Both values are additionally capped relative to the total budget at run
+  // time (base <= total/32, max <= total/8): the absolute defaults were tuned
+  // at 8 GiB and would otherwise move up to half of a 1 GiB cache in a single
+  // round, leaving the grow-only AutoHCC tables sparse and degrading Evict.
+  size_t step_max_bytes = 512 << 20;  // 512 MiB cap for the accelerated step
+  double step_growth = 2.0;           // per-round multiplier on same recipient
+
   // Ghost (repeat-miss) marginal scoring for the incremental mode. When true
   // and the cache has ghost tracking enabled, the per-level step score is the
   // windowed ghost-hit count -- a direct, model-free measurement of the miss
@@ -180,6 +197,47 @@ struct MultiLevelAllocationOptions {
   // λ·m·(-ln m)/c, prior drag, fill-delay feedback). Falls back to the model
   // score when the drained ghost vector is unavailable.
   bool use_ghost_marginal = false;
+
+  // Per-byte normalization of the ghost score: score_i = ghost_i / D_i.
+  // The raw ghost count measures HOW MANY misses more capacity could convert
+  // into hits, but not the capacity price per hit: converting L3's repeat
+  // misses (data 0.8 GiB) costs an order of magnitude fewer bytes per hit
+  // than L5's (data 15 GiB), whose recently-missed keys are spread over a
+  // far larger footprint. With raw counts the allocator parked ~1 GiB on L5
+  // for a 0.037 level hit ratio while L3/L4 (which the model-based allocator
+  // funded to 0.25/0.26) starved. Dividing by data size restores the per-byte
+  // marginal ordering -- the same structural information the exponential
+  // model carried in its α/D factor. The Poisson significance gate still
+  // operates on the raw (EMA) counts of the selected pair, since the
+  // sqrt-noise model only makes sense for counts.
+  bool ghost_normalize_by_data = true;
+
+  // --- Steady-state suppression (incremental mode) ---
+  // Observed pathology on write-heavy steady state (wlA, 100M ops): ghost
+  // hits never reach zero (compaction keeps shuffling data), per-window
+  // counts are noisy, and the raw argmax/argmin flip every round -- so the
+  // allocator applied a transfer on ~890 of 900 rounds, including ping-pong
+  // pairs (L3->L0 followed by L0->L5), each paying a PurgeToCapacity that
+  // grows to 9-39ms as the cache fills. Three complementary guards:
+  //
+  // 1. EMA smoothing of ghost scores: kills single-window noise as the
+  //    direction signal. 1.0 = no smoothing (raw window counts).
+  double ghost_score_ema_beta = 0.3;
+  // 2. Direction lock: a level that received capacity in one of the last
+  //    step_direction_lock_rounds APPLIED rounds cannot be a donor, and a
+  //    recent donor cannot be a recipient. Directly prevents ping-pong
+  //    transfers regardless of score noise. 0 disables.
+  uint64_t step_direction_lock_rounds = 3;
+  // 3. Significance gate (ghost scores only): a transfer requires BOTH
+  //      recv_score > ghost_min_recv_donor_ratio * donor_score
+  //    AND
+  //      recv_score - donor_score > ghost_significance_k *
+  //                                 sqrt(recv_score + donor_score)
+  //    (Poisson-noise significance for count data). During convergence the
+  //    gaps are 10-100x and pass trivially; in steady-state noise they fail
+  //    and the round is skipped. Set ratio to 0 to disable both checks.
+  double ghost_min_recv_donor_ratio = 2.0;
+  double ghost_significance_k = 3.0;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -281,6 +339,18 @@ class MultiLevelCacheAllocator {
   // adaptive interval backoff).
   bool last_round_applied_ = false;
   uint64_t round_id_ = 0;
+  // Adaptive step state (incremental mode): the accelerated step used by the
+  // last applied round, and its recipient. current_step_bytes_ == 0 means
+  // "start from options_.adjust_step_bytes".
+  size_t current_step_bytes_ = 0;
+  size_t last_step_recipient_ = SIZE_MAX;
+  // Steady-state suppression state (incremental mode). EMA-smoothed ghost
+  // scores, and per-level direction locks: a level with
+  // received_lock_round_[i] > round_id_ cannot donate, one with
+  // donated_lock_round_[i] > round_id_ cannot receive.
+  std::vector<double> ghost_score_ema_;
+  std::vector<uint64_t> received_lock_round_;
+  std::vector<uint64_t> donated_lock_round_;
   // Total cache lookups (summed across levels) at the last op-gated round.
   // Used by BackgroundLoop to decide when adjust_interval_ops have elapsed.
   uint64_t last_round_lookups_ = 0;

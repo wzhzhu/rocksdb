@@ -175,7 +175,8 @@ MultiLevelCache::MultiLevelCache(size_t num_levels, size_t total_capacity,
   // Enable sparse-table rebuild: fresh empty HCC with the mmap reserved for the
   // whole budget (lazy RSS), so a defunded level's grow-only slot array can be
   // reclaimed and a new small table can grow again later if refunded.
-  rebuild_sub_cache_ = [hcc_options, total_capacity](size_t new_capacity) {
+  rebuild_sub_cache_ = [hcc_options, total_capacity](size_t /*level*/,
+                                                     size_t new_capacity) {
     return MakeSubCacheWithCapacity(hcc_options, new_capacity, total_capacity);
   };
   InitializePerLevelState(level_count);
@@ -248,12 +249,18 @@ Status MultiLevelCache::Insert(const Slice& key, ObjectPtr obj,
   // standalone (uncharged) entry instead: the caller still gets a usable pinned
   // block, but the table is never populated so the deep-level Evict hotspot
   // disappears.
+  //
+  // Pass charge=0 explicitly: CreateStandalone with a real charge first runs
+  // ChargeUsageMaybeEvict* (an Evict sweep on the starved level's sparse
+  // table, profiled at ~17% of total cycles at a 1 GiB budget) and only falls
+  // back to uncharged when that fails. A zero charge skips the eviction
+  // attempt entirely, which is the intended semantics of the bypass.
   const size_t bypass_floor =
       insert_bypass_capacity_bytes_.load(std::memory_order_relaxed);
   if (!route_to_shared && bypass_floor > 0 && charge > 0 &&
       target_cache->GetCapacity() < bypass_floor) {
     Cache::Handle* standalone = target_cache->CreateStandalone(
-        base_key, obj, helper, charge, /*allow_uncharged=*/true);
+        base_key, obj, helper, /*charge=*/0, /*allow_uncharged=*/true);
     if (standalone != nullptr) {
       if (handle != nullptr) {
         *handle = WrapOrPassHandle(target_cache, standalone);
@@ -1257,7 +1264,8 @@ void MultiLevelCache::MaybeRebuildSparseSubCaches() {
       // Fresh empty table at the level's current (shrunk) target capacity; the
       // mmap is still reserved for the whole budget so the level can grow again
       // if later refunded, while RSS drops to near-zero for the sparse table.
-      std::shared_ptr<Cache> fresh = rebuild_sub_cache_(cur->GetCapacity());
+      std::shared_ptr<Cache> fresh =
+          rebuild_sub_cache_(level, cur->GetCapacity());
       if (fresh == nullptr) {
         continue;
       }
