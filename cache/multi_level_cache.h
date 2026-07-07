@@ -156,6 +156,21 @@ class MultiLevelCache : public Cache {
   // Returns an empty vector when tracking is disabled.
   std::vector<double> DrainForegroundWorkingSetDistinct();
 
+  // Ghost (repeat-miss) tracking: a direct, model-free measurement of each
+  // level's marginal utility. Every foreground miss probes a per-level
+  // fixed-size fingerprint table of recently-missed keys; a repeat miss on the
+  // same key means the block was inserted and evicted (or bypassed) before its
+  // re-access -- exactly the traffic that a small capacity increase would
+  // convert into hits. The per-window ghost-hit count is therefore the
+  // per-level marginal benefit signal for the incremental allocator, with no
+  // MRC shape assumption (unlike the exponential-alpha inversion).
+  // slots_log2 sizes the fingerprint table (1<<slots_log2 slots x 8B/level);
+  // it bounds how far beyond current capacity the signal can "see".
+  void SetGhostTrackingEnabled(bool enabled, uint32_t slots_log2 = 16);
+  // Per-level ghost hits since the previous drain (read-and-reset windowed
+  // counter). Empty when tracking is disabled.
+  std::vector<uint64_t> DrainGhostHits();
+
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
   // For A/B diagnostics: force all requests to route into L0.
@@ -308,6 +323,8 @@ class MultiLevelCache : public Cache {
   void IncFgHitCounter(size_t level_index);
   uint64_t SumFgLookupCounter(size_t level_index) const;
   uint64_t SumFgHitCounter(size_t level_index) const;
+  void RecordGhostMiss(size_t level_index, const Slice& base_key);
+  void IncGhostHitCounter(size_t level_index);
 
   // Owning vector of the current sub-cache per level. Elements are only
   // reassigned during a sparse-table rebuild, always under rebuild_mutex_.
@@ -370,6 +387,15 @@ class MultiLevelCache : public Cache {
   std::atomic<bool> working_set_tracking_enabled_{false};
   std::atomic<uint32_t> working_set_sample_shift_{0};
   std::vector<std::unique_ptr<ForegroundWorkingSetSketch>> fg_working_set_;
+  // Ghost (repeat-miss) tracking state. ghost_tables_[level] is a direct-
+  // mapped table of 64-bit key-hash fingerprints of recently-missed keys
+  // (0 = empty slot). Probed and updated with relaxed atomics on the
+  // foreground miss path only; collisions simply overwrite (bounded window).
+  // ghost_hits_ uses the same striping as the other hot-path counters.
+  std::atomic<bool> ghost_tracking_enabled_{false};
+  std::atomic<uint32_t> ghost_slots_log2_{16};
+  std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> ghost_tables_;
+  std::unique_ptr<StripedCounter[]> ghost_hits_;
   mutable std::atomic<uint64_t> insert_route_queries_{0};
   mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
   mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};

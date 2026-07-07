@@ -327,10 +327,20 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
       level_cache->Lookup(base_key, helper, create_context, priority, stats);
   Cache* owner_cache = level_cache;
   if (inner == nullptr) {
+    // Ghost (repeat-miss) marginal-utility signal: recorded only on the FINAL
+    // miss (after the shared pool, which may still hit) and only for
+    // foreground lookups -- compaction misses are one-shot streaming reads
+    // whose repeat pattern says nothing about cacheable reuse.
+    const bool record_ghost =
+        !is_compaction &&
+        ghost_tracking_enabled_.load(std::memory_order_acquire);
     const bool shared_enabled =
         !force_route_all_to_l0_.load(std::memory_order_relaxed) &&
         shared_pool_ratio_ppm_.load(std::memory_order_relaxed) > 0;
     if (!shared_enabled) {
+      if (record_ghost) {
+        RecordGhostMiss(level_index, base_key);
+      }
       return nullptr;
     }
     shared_pool_lookups_.fetch_add(1, std::memory_order_relaxed);
@@ -338,6 +348,9 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
         SharedCache()->Lookup(base_key, helper, create_context, priority, stats);
     if (inner == nullptr) {
       RecordSharedPoolCandidate(HashCacheKey(base_key));
+      if (record_ghost) {
+        RecordGhostMiss(level_index, base_key);
+      }
       return nullptr;
     }
     shared_pool_hits_.fetch_add(1, std::memory_order_relaxed);
@@ -1512,6 +1525,92 @@ std::vector<double> MultiLevelCache::DrainForegroundWorkingSetDistinct() {
       estimate = m * std::log(m / static_cast<double>(zeros));
     }
     result[level] = estimate * sample_scale;
+  }
+  return result;
+}
+
+void MultiLevelCache::SetGhostTrackingEnabled(bool enabled,
+                                              uint32_t slots_log2) {
+  if (enabled) {
+    // Bound: 2^10 (8KB/level) .. 2^22 (32MB/level).
+    if (slots_log2 < 10) slots_log2 = 10;
+    if (slots_log2 > 22) slots_log2 = 22;
+    ghost_slots_log2_.store(slots_log2, std::memory_order_relaxed);
+    const size_t levels = sub_caches_.size();
+    if (ghost_tables_.size() != levels) {
+      ghost_tables_.resize(levels);
+    }
+    const size_t slots = size_t{1} << slots_log2;
+    for (size_t level = 0; level < levels; ++level) {
+      if (ghost_tables_[level] == nullptr) {
+        ghost_tables_[level] =
+            std::make_unique<std::atomic<uint64_t>[]>(slots);
+        for (size_t i = 0; i < slots; ++i) {
+          ghost_tables_[level][i].store(0, std::memory_order_relaxed);
+        }
+      }
+    }
+    if (ghost_hits_ == nullptr) {
+      ghost_hits_ =
+          std::make_unique<StripedCounter[]>(kCounterStripes * levels);
+    }
+  }
+  // Publish enable last so the hot path never sees enabled=true with
+  // unallocated tables.
+  ghost_tracking_enabled_.store(enabled, std::memory_order_release);
+}
+
+void MultiLevelCache::RecordGhostMiss(size_t level_index,
+                                      const Slice& base_key) {
+  if (level_index >= ghost_tables_.size()) {
+    return;
+  }
+  std::atomic<uint64_t>* table = ghost_tables_[level_index].get();
+  if (table == nullptr) {
+    return;
+  }
+  uint64_t fp = HashCacheKey(base_key);
+  if (fp == 0) {
+    fp = 1;  // 0 is the empty-slot sentinel
+  }
+  const uint32_t slots_log2 =
+      ghost_slots_log2_.load(std::memory_order_relaxed);
+  // High bits index the direct-mapped table; the full hash is the fingerprint.
+  const size_t idx = static_cast<size_t>(fp >> (64 - slots_log2));
+  std::atomic<uint64_t>& slot = table[idx];
+  const uint64_t prev = slot.load(std::memory_order_relaxed);
+  if (prev == fp) {
+    // Repeat miss on a recently-missed key: capacity-convertible traffic.
+    IncGhostHitCounter(level_index);
+    return;
+  }
+  // First-seen miss (or a colliding key evicting the previous fingerprint):
+  // record it so a future repeat can be detected. Plain store: a lost race
+  // just costs one signal sample.
+  slot.store(fp, std::memory_order_relaxed);
+}
+
+void MultiLevelCache::IncGhostHitCounter(size_t level_index) {
+  ghost_hits_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() +
+              level_index]
+      .v.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::vector<uint64_t> MultiLevelCache::DrainGhostHits() {
+  std::vector<uint64_t> result;
+  if (!ghost_tracking_enabled_.load(std::memory_order_relaxed) ||
+      ghost_hits_ == nullptr) {
+    return result;
+  }
+  const size_t levels = sub_caches_.size();
+  result.assign(levels, 0);
+  for (size_t level = 0; level < levels; ++level) {
+    uint64_t sum = 0;
+    for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
+      sum += ghost_hits_[stripe * levels + level].v.exchange(
+          0, std::memory_order_relaxed);
+    }
+    result[level] = sum;
   }
   return result;
 }

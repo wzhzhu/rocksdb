@@ -845,6 +845,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       prev_hits_ = snapshot.hits;
       return Status::OK();
     }
+
     std::vector<double> upper_bounds;
     if (options_.cap_at_data_size &&
         snapshot.data_sizes.size() == level_count) {
@@ -934,7 +935,10 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
   // hit-ratio benefit and a large, compounding throughput loss. Skip the round
   // instead (hold the current allocation; the adaptive interval backs off). A
   // stable workload yields consecutive targets that agree, so it still adapts.
+  // In incremental-step mode the bounded step size IS the stability mechanism;
+  // the gate would fire on every high-swing round and prevent convergence.
   if (options_.mode == MultiLevelAllocatorMode::kModel &&
+      options_.adjust_step_bytes == 0 &&   // legacy mode only
       options_.model_stability_threshold > 0.0 && total_capacity > 0 &&
       prev_target_capacities_.size() == target_capacities.size()) {
     uint64_t target_swing = 0;
@@ -993,6 +997,323 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     }
   }
   prev_target_capacities_ = target_capacities;
+
+  // -------------------------------------------------------------------------
+  // Incremental marginal-step mode (adjust_step_bytes > 0, kModel only).
+  //
+  // Problem with the legacy apply-full-target path: the water-filling solver
+  // emits correct directions but can swing the entire budget across levels in
+  // one round. Each swing calls PurgeToCapacity under shard locks; eviction
+  // cost grows with the resident set (~175ms/round at 8 GB full cache),
+  // stalling the hot path and collapsing low-concurrency throughput.
+  //
+  // Solution: bounded single-pair transfer per round, guided by the exact
+  // per-byte marginal score from the KKT stationarity condition:
+  //   score_i = λ_i · (α_i / D_i) · exp(-α_i · c_i / D_i)
+  //           = λ_i · (α_i / D_i) · miss_rate_i(c_i)
+  // At the water-filling optimum every active level equalises score_i = μ, so
+  // this is the correct signal for a greedy step: transfer a fixed step from
+  // the lowest-score (over-provisioned) donor to the highest-score (under-
+  // provisioned) recipient, walking the allocation toward the optimum.
+  //
+  //   Recipient = argmax(score) — highest marginal benefit per byte.
+  //   Donor     = argmin(score) — lowest marginal benefit; can give bytes away.
+  //
+  // Prerequisite: lambda must be raw fg_lookups (use_reuse_lambda=false); the
+  // reuse-lambda path drives lambda_L6 → ε, collapsing score_L6 and wrongly
+  // making the largest level a permanent donor (see below).
+  //
+  // Properties:
+  //   - Per-round purge is O(adjust_step_bytes), not O(GB swing) → ≤ ms.
+  //   - No stability gate needed: step size is the stability mechanism.
+  //   - Floors / caps enforced by donor_avail / recv_room constraints.
+  //   - Cold start: equal split so every level gets signal immediately.
+  // -------------------------------------------------------------------------
+  if (options_.mode == MultiLevelAllocatorMode::kModel &&
+      options_.adjust_step_bytes > 0) {
+    // Cold start: equal split.
+    if (last_capacities_.empty() || last_capacities_.size() != level_count) {
+      std::vector<size_t> init;
+      EqualSplit(total_capacity, level_count, &init);
+      Status s = cache_->AdjustCapacities(init);
+      if (s.ok()) {
+        last_capacities_ = std::move(init);
+        last_round_applied_ = true;
+      }
+      prev_data_sizes_ = snapshot.data_sizes;
+      prev_lookups_ = snapshot.lookups;
+      prev_hits_ = snapshot.hits;
+      ++round_id_;
+      return s;
+    }
+
+    // --- Floors (data-share weighted + absolute minimum) ---
+    //
+    // In theory the score is self-capping on the upper side: as a level's
+    // capacity approaches its data size, miss_rate → 0 and score → 0, so it
+    // stops being a recipient on its own.  In practice a level whose capacity
+    // already exceeds its data size drives the *observed* alpha to 0 (all hits,
+    // no signal), which trips the kInfiniteScore sentinel and would make it a
+    // permanent recipient.  The explicit data-size upper bound (upper_bytes,
+    // computed below) is the robust guard against that degenerate case.  The
+    // floor below is the complementary lower bound: it guarantees each active
+    // level retains a minimum allocation so compaction can make forward
+    // progress.
+    std::vector<size_t> floor_bytes(level_count, 0);
+    if (options_.min_active_level_capacity_ratio > 0.0 &&
+        snapshot.data_sizes.size() == level_count && total_capacity > 0) {
+      uint64_t sum_active = 0;
+      for (size_t i = 0; i < level_count; ++i) {
+        if (snapshot.data_sizes[i] > 0) sum_active += snapshot.data_sizes[i];
+      }
+      if (sum_active > 0) {
+        const double pool = static_cast<double>(total_capacity) *
+                            options_.min_active_level_capacity_ratio;
+        for (size_t i = 0; i < level_count; ++i) {
+          if (snapshot.data_sizes[i] == 0) continue;
+          const double share =
+              static_cast<double>(snapshot.data_sizes[i]) /
+              static_cast<double>(sum_active);
+          floor_bytes[i] = std::max(
+              options_.min_active_level_floor_bytes,
+              static_cast<size_t>(std::floor(pool * share)));
+        }
+      }
+    }
+    if (options_.min_active_level_capacity_bytes > 0 &&
+        snapshot.data_sizes.size() == level_count) {
+      for (size_t i = 0; i < level_count; ++i) {
+        if (snapshot.data_sizes[i] > 0) {
+          floor_bytes[i] =
+              std::max(floor_bytes[i],
+                       options_.min_active_level_capacity_bytes);
+        }
+      }
+    }
+    // upper_bytes: cap each level at data_size * data_cap_margin_ratio to
+    // prevent over-provisioned levels (capacity >> data) from being recipients.
+    // A level that has already cached all of its data cannot benefit from more
+    // capacity, and its alpha degenerates to 0 at near-100% hit rate, which
+    // would otherwise trigger the kInfiniteScore sentinel and make it a
+    // permanent recipient, starving larger levels like L6.  The margin ratio
+    // (>1) gives headroom for block/cache accounting overhead so a fully-hot
+    // level can still cache all of its blocks.  Same semantics as the legacy
+    // water-filling upper bound above.
+    std::vector<size_t> upper_bytes(level_count, total_capacity);
+    if (options_.cap_at_data_size) {
+      for (size_t i = 0; i < level_count; ++i) {
+        if (data[i] > 0.0) {
+          const double cap = data[i] * options_.data_cap_margin_ratio;
+          if (cap < static_cast<double>(total_capacity)) {
+            upper_bytes[i] = static_cast<size_t>(cap);
+          }
+        }
+      }
+    }
+
+    // --- Marginal scores: score[i] = lambda[i] * alpha[i] / data[i]  (= a_i) ---
+    //
+    // This is the water-filling marginal value used by the solver: the first
+    // derivative of total miss count with respect to capacity at the current
+    // allocation is  λ_i · (α_i / D_i) · miss_rate_i(c_i).  At the optimal
+    // allocation all active levels equalize  a_i · miss_rate_i* = μ, so a_i
+    // is the correct ordering signal for the greedy step: high a_i means the
+    // level is under-provisioned relative to the optimum and should receive
+    // capacity; low a_i means it is over-provisioned and can donate.
+    //
+    // Prerequisite: lambda must be raw access frequency (use_reuse_lambda=false).
+    // If lambda_L6 → ε via the reuse-lambda path, a_L6 → 0 and L6 wrongly
+    // becomes a permanent donor despite holding 99% of the data.  With raw
+    // fg_lookups, lambda_L6 >> lambda_L5, correctly making a_L6 competitive.
+    //
+    // For levels with data > 0 but alpha == 0 AND capacity < data size
+    // (genuinely starved: all accesses miss, no reliable alpha estimate yet),
+    // use a high sentinel so they are always preferred as recipient.
+    //
+    // Do NOT use kInfiniteScore for over-provisioned levels (capacity >=
+    // data_size): their alpha degenerates to 0 because miss_rate → 0, not
+    // because they lack cache.  Giving them kInfiniteScore would make them
+    // permanent recipients and drain large levels like L6.
+    const double kInfiniteScore = std::numeric_limits<double>::infinity();
+    std::vector<double> score(level_count, 0.0);
+    bool ghost_scored = false;
+    if (options_.use_ghost_marginal) {
+      // --- Ghost (repeat-miss) marginal score: direct measurement ---
+      // score[i] = repeat misses on recently-missed keys this window = the
+      // exact traffic a capacity increase would convert into hits. No MRC
+      // shape assumption; immune to the alpha single-point-inversion
+      // degeneracy (score collapsing to λ·m·(-ln m)/c, prior drag toward
+      // α=1, and the fill-delay feedback loop). A genuinely starved level
+      // produces high ghost hits naturally (its inserts are evicted before
+      // re-access), so no starvation sentinel is needed; a fully-cached
+      // level produces ~0 misses hence ~0 ghost hits, so it self-retires
+      // as recipient (belt: upper_bytes cap still applies).
+      const std::vector<uint64_t> ghost = cache_->DrainGhostHits();
+      if (ghost.size() == level_count) {
+        for (size_t i = 0; i < level_count; ++i) {
+          score[i] = static_cast<double>(ghost[i]);
+        }
+        ghost_scored = true;
+      }
+    }
+    if (!ghost_scored) {
+      // --- Fallback: exponential-model marginal score ---
+      for (size_t i = 0; i < level_count; ++i) {
+        if (lambda[i] > 0.0 && data[i] > 0.0) {
+          if (alpha[i] <= 0.0) {
+            // Only raise sentinel when the level is genuinely
+            // capacity-starved; over-provisioned levels (alpha degenerated
+            // via miss_rate → 0) stay at 0 so they cannot become permanent
+            // recipients.
+            if (last_capacities_[i] < static_cast<size_t>(data[i])) {
+              score[i] = kInfiniteScore;
+            }
+            continue;
+          }
+          // Complete marginal benefit: the exact first derivative of total
+          // miss count w.r.t. c_i (KKT stationarity):
+          //   score_i = λ_i · (α_i / D_i) · exp(-α_i · c_i / D_i)
+          //           = λ_i · (α_i / D_i) · miss_rate_i(c_i)
+          // Prerequisite: lambda must use raw fg_lookups
+          // (use_reuse_lambda=false); with reuse-lambda, lambda_L6 → ε and
+          // L6 becomes a permanent donor regardless of provisioning.
+          const double cap_d =
+              static_cast<double>(last_capacities_[i]) / data[i];
+          const double miss_rate = std::exp(-alpha[i] * cap_d);
+          score[i] = lambda[i] * (alpha[i] / data[i]) * miss_rate;
+        }
+      }
+    }
+
+    // --- Find recipient (highest score, has data, has room to grow) ---
+    size_t recipient = level_count;
+    double best_recv = -1.0;
+    for (size_t i = 0; i < level_count; ++i) {
+      if (data[i] > 0.0 && last_capacities_[i] < upper_bytes[i] &&
+          score[i] > best_recv) {
+        best_recv = score[i];
+        recipient = i;
+      }
+    }
+
+    // --- Find donor (lowest score, capacity above floor, not recipient) ---
+    size_t donor = level_count;
+    double best_donor_score = kInfiniteScore;
+    bool donor_found = false;
+    for (size_t i = 0; i < level_count; ++i) {
+      if (i == recipient) continue;
+      if (last_capacities_[i] <= floor_bytes[i]) continue;
+      if (!donor_found || score[i] < best_donor_score) {
+        best_donor_score = score[i];
+        donor = i;
+        donor_found = true;
+      }
+    }
+
+    auto do_skip_step = [&](const char* reason) {
+      if (kAllocDebug) {
+        const uint64_t s = dbg_skipped.fetch_add(1) + 1;
+        const uint64_t ap = dbg_applied.load();
+        if ((s + ap) % 50 == 0 || ap <= 5) {
+          fprintf(stderr,
+                  "[MLC_ALLOC] round=%llu SKIP(%s) applied=%llu "
+                  "skipped=%llu\n",
+                  (unsigned long long)round_id_, reason,
+                  (unsigned long long)ap, (unsigned long long)s);
+        }
+      }
+      prev_data_sizes_ = snapshot.data_sizes;
+      prev_lookups_ = snapshot.lookups;
+      prev_hits_ = snapshot.hits;
+      ++round_id_;
+    };
+
+    if (recipient == level_count || !donor_found) {
+      do_skip_step("no_pair");
+      return Status::OK();
+    }
+
+    // Require a real traffic signal before transferring: if best score is
+    // zero (lambda=0 for all levels in the current window, e.g. the first
+    // few rounds during wait_for_compact), defer until we have data.
+    if (best_recv <= 0.0) {
+      do_skip_step("no_signal");
+      return Status::OK();
+    }
+
+    // Gap check: skip if allocation is near-optimal (scores converged).
+    if (options_.step_min_score_ratio > 0.0 && std::isfinite(best_recv)) {
+      const double gap = (best_recv - best_donor_score) / best_recv;
+      if (gap < options_.step_min_score_ratio) {
+        do_skip_step("near_optimal");
+        return Status::OK();
+      }
+    }
+
+    // --- Compute and apply transfer ---
+    const size_t donor_avail = last_capacities_[donor] - floor_bytes[donor];
+    const size_t recv_room =
+        upper_bytes[recipient] > last_capacities_[recipient]
+            ? upper_bytes[recipient] - last_capacities_[recipient]
+            : 0;
+    const size_t transfer =
+        std::min({options_.adjust_step_bytes, donor_avail, recv_room});
+
+    if (transfer == 0) {
+      do_skip_step("zero_transfer");
+      return Status::OK();
+    }
+
+    std::vector<size_t> new_caps = last_capacities_;
+    new_caps[donor] -= transfer;
+    new_caps[recipient] += transfer;
+
+    uint64_t dbg_t0 = 0;
+    if (kAllocDebug) {
+      dbg_t0 = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+    }
+    Status s = cache_->AdjustCapacities(new_caps);
+    if (kAllocDebug) {
+      const uint64_t t1 = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+      const uint64_t ap = dbg_applied.fetch_add(1) + 1;
+      const uint64_t sk = dbg_skipped.load();
+      if ((ap + sk) % 50 == 0 || ap <= 5) {
+        std::string caps_str;
+        for (size_t i = 0; i < new_caps.size(); ++i) {
+          caps_str += std::to_string(new_caps[i] >> 20);
+          caps_str += i + 1 < new_caps.size() ? "," : "";
+        }
+        double gap_val = (std::isfinite(best_recv) && best_recv > 0.0)
+                             ? (best_recv - best_donor_score) / best_recv
+                             : 1.0;
+        fprintf(stderr,
+                "[MLC_ALLOC] round=%llu APPLY(step) L%zu->L%zu "
+                "transfer=%lluMiB scorer=%s score_gap=%.3f apply_us=%llu "
+                "applied=%llu skipped=%llu caps(MiB)=[%s]\n",
+                (unsigned long long)round_id_, donor, recipient,
+                (unsigned long long)(transfer >> 20),
+                ghost_scored ? "ghost" : "model", gap_val,
+                (unsigned long long)(t1 - dbg_t0),
+                (unsigned long long)ap, (unsigned long long)sk,
+                caps_str.c_str());
+      }
+    }
+    prev_data_sizes_ = snapshot.data_sizes;
+    prev_lookups_ = snapshot.lookups;
+    prev_hits_ = snapshot.hits;
+    ++round_id_;
+    if (s.ok()) {
+      last_capacities_ = std::move(new_caps);
+      last_round_applied_ = true;
+    }
+    return s;
+  }  // end incremental marginal-step mode
 
   std::vector<size_t> capacities_to_apply = target_capacities;
   if (!last_capacities_.empty() &&

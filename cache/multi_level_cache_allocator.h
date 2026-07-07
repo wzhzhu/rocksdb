@@ -134,7 +134,52 @@ struct MultiLevelAllocationOptions {
   // adapts normally. Note the metric double-counts a transfer (moving X bytes
   // between levels contributes 2X to the swing), so this 0.20 fraction gates at
   // roughly a 10% single-round budget relocation. 0 disables the gate.
+  // Only used in the legacy water-filling mode (adjust_step_bytes == 0).
   double model_stability_threshold = 0.20;
+
+  // --- Incremental marginal-step mode ---
+  // When > 0, RunOnceLocked replaces the global water-filling solver with a
+  // bounded marginal-step algorithm:
+  //   1. Compute a per-level marginal score: the windowed ghost-hit count
+  //      (use_ghost_marginal, direct measurement) or the KKT marginal
+  //      λ_i·(α_i/D_i)·miss_rate_i(c_i) from the exponential model (fallback).
+  //   2. donor    = argmin(score) among levels with capacity > data-share floor.
+  //   3. recipient = argmax(score) among levels with data > 0 and room to grow.
+  //   4. Transfer min(adjust_step_bytes, donor_slack, recipient_room) bytes.
+  //
+  // Why this is better than global water-filling for large caches / low
+  // concurrency:
+  //   - The water-filling solver re-solves a globally optimal allocation each
+  //     round and can swing the entire budget across levels (observed: 7 GB in
+  //     one step). Each such swing evicts the excess under the shard locks, and
+  //     the eviction cost grows with the resident set -- measured ~175 ms/round
+  //     at 8 GB full cache -- stalling t4/t8 threads to ~2 KTPS while the
+  //     working set is purged every round, so the hit ratio never rises either.
+  //   - The incremental step bounds the per-round eviction to a few ms (64 MiB
+  //     at a time), converges naturally to the same optimum over many rounds,
+  //     and needs no stability gate, smoothing, or shrink hysteresis.
+  //   - Near the optimum the score gap falls below step_min_score_ratio and
+  //     transfers stop automatically (self-stabilising).
+  //
+  // Cold start: if last_capacities_ is empty, an equal split is applied once.
+  // Set to 0 to revert to the legacy water-filling mode.
+  size_t adjust_step_bytes = 64 << 20;  // 64 MiB per round
+
+  // Minimum relative score gap (recipient_score - donor_score) / recipient_score
+  // required to trigger a transfer. Prevents micro-transfers when the allocation
+  // is already near-optimal. 0 = always transfer if a valid donor/recipient
+  // pair exists.
+  double step_min_score_ratio = 0.02;
+
+  // Ghost (repeat-miss) marginal scoring for the incremental mode. When true
+  // and the cache has ghost tracking enabled, the per-level step score is the
+  // windowed ghost-hit count -- a direct, model-free measurement of the miss
+  // traffic that a capacity increase would convert into hits -- instead of the
+  // exponential-model score λ·(α/D)·miss_rate. This removes the alpha
+  // single-point-inversion pathologies (score degenerating to
+  // λ·m·(-ln m)/c, prior drag, fill-delay feedback). Falls back to the model
+  // score when the drained ghost vector is unavailable.
+  bool use_ghost_marginal = false;
 };
 
 // Periodically solves and applies multi-level cache capacities from
