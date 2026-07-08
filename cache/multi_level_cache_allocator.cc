@@ -1053,7 +1053,10 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     // Every data-keyed mechanism below (floors, upper_bytes, structural
     // reclaim, score normalization, fully-cached score-0) reads the smoothed
     // series, so a flush burst pulsing L0's data through the thresholds
-    // cannot cycle them (see data_ema_beta in the header).
+    // cannot cycle them (see data_ema_beta in the header). The raw series is
+    // kept for the upper-bound computation below, which wants the OPPOSITE
+    // guard (min instead of smooth): see sustained-data comment there.
+    std::vector<double> raw_data = data;
     if (data.size() == level_count) {
       const double dbeta =
           (options_.data_ema_beta > 0.0 && options_.data_ema_beta < 1.0)
@@ -1122,7 +1125,30 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     // (>1) gives headroom for block/cache accounting overhead so a fully-hot
     // level can still cache all of its blocks.  Same semantics as the legacy
     // water-filling upper bound above.
+    //
+    // upper_bytes serves two mechanisms with opposite transient needs, so
+    // two bounds are computed:
+    //
+    //   - upper_bytes (EMA data): the structural-reclaim threshold and the
+    //     donor-side guard. Smoothed so an L0 data trough between flushes
+    //     does not read as excess and trigger a spurious drain (the pulse
+    //     cycle data_ema_beta exists to prevent).
+    //
+    //   - recv_upper_bytes (min(raw, EMA) = SUSTAINED data): the recipient
+    //     growth cap. A compaction passing through a normally-empty level
+    //     (L1/L2) parks real data there for a handful of rounds; its
+    //     short-distance repeat misses during that window are genuine, so
+    //     the scorer correctly ranks it as a recipient, and under an
+    //     EMA-only cap it wins real capacity that structural reclaim then
+    //     claws back after the data moves on (observed: L1 briefly holding
+    //     370 MiB of a 2 GiB budget -- a purge->refill round trip of
+    //     warm-set loss both ways and a repeat-variance source). min(raw,
+    //     EMA) caps a transient spike at the pre-spike EMA (raw high, EMA
+    //     low) while a steady level (raw ~= EMA) is unaffected, so only
+    //     data that PERSISTS for ~1/beta rounds can attract matching
+    //     capacity. Levels with raw == 0 this round cannot grow at all.
     std::vector<size_t> upper_bytes(level_count, total_capacity);
+    std::vector<size_t> recv_upper_bytes(level_count, total_capacity);
     if (options_.cap_at_data_size) {
       for (size_t i = 0; i < level_count; ++i) {
         if (data[i] > 0.0) {
@@ -1131,6 +1157,17 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
             upper_bytes[i] = static_cast<size_t>(cap);
           }
         }
+        const double sustained =
+            (raw_data.size() == level_count && raw_data[i] < data[i])
+                ? raw_data[i]
+                : data[i];
+        const double rcap = sustained * options_.data_cap_margin_ratio;
+        if (rcap < static_cast<double>(total_capacity)) {
+          recv_upper_bytes[i] = static_cast<size_t>(rcap);
+        }
+        // Growth must also respect the reclaim threshold, or a transfer
+        // could immediately arm structural reclaim on its own recipient.
+        recv_upper_bytes[i] = std::min(recv_upper_bytes[i], upper_bytes[i]);
       }
     }
 
@@ -1400,7 +1437,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     for (size_t i = 0; i < level_count; ++i) {
       if (structural_reclaim && i == excess_donor) continue;
       if (donated_lock_round_[i] > round_id_) continue;  // recent donor
-      if (data[i] > 0.0 && last_capacities_[i] < upper_bytes[i] &&
+      if (data[i] > 0.0 && last_capacities_[i] < recv_upper_bytes[i] &&
           score[i] > best_recv) {
         best_recv = score[i];
         recipient = i;
@@ -1412,7 +1449,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       double best_data = 0.0;
       for (size_t i = 0; i < level_count; ++i) {
         if (i == excess_donor) continue;
-        if (data[i] > best_data && last_capacities_[i] < upper_bytes[i]) {
+        if (data[i] > best_data && last_capacities_[i] < recv_upper_bytes[i]) {
           best_data = data[i];
           recipient = i;
           best_recv = score[i];
@@ -1632,8 +1669,8 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       donor_avail = std::min(donor_avail, excess_bytes);
     }
     const size_t recv_room =
-        upper_bytes[recipient] > last_capacities_[recipient]
-            ? upper_bytes[recipient] - last_capacities_[recipient]
+        recv_upper_bytes[recipient] > last_capacities_[recipient]
+            ? recv_upper_bytes[recipient] - last_capacities_[recipient]
             : 0;
     const size_t transfer = std::min({step, donor_avail, recv_room});
 

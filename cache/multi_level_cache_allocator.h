@@ -332,11 +332,16 @@ struct MultiLevelAllocationOptions {
   uint64_t accel_cold_start_applies = 32;
   // 7. EMA smoothing of per-level data sizes (0 < beta <= 1; 1 = raw).
   //    L0's data pulses 0 <-> ~1.3 GiB with every flush/compaction cycle;
-  //    the three mechanisms keyed off data size (score-0 for fully-cached
-  //    levels, the upper_bytes growth cap, and structural excess reclaim)
-  //    all used the instantaneous value and took turns firing, producing a
-  //    reclaim->refill loop on L0. Smoothing the data series they see
-  //    removes the pulse without changing any of their semantics.
+  //    the mechanisms keyed off data size (score-0 for fully-cached levels,
+  //    floors, structural excess reclaim) all used the instantaneous value
+  //    and took turns firing, producing a reclaim->refill loop on L0.
+  //    Smoothing the data series they see removes the pulse without
+  //    changing any of their semantics. The RECIPIENT growth cap is the one
+  //    exception: it uses min(raw, EMA) -- the sustained data size -- so a
+  //    compaction transiently parking data on a normally-empty level
+  //    (L1/L2) cannot attract matching capacity that structural reclaim
+  //    would have to claw back rounds later (see recv_upper_bytes in the
+  //    allocator).
   double data_ema_beta = 0.3;
 };
 
