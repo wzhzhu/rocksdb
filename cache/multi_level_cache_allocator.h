@@ -198,19 +198,34 @@ struct MultiLevelAllocationOptions {
   // score when the drained ghost vector is unavailable.
   bool use_ghost_marginal = false;
 
-  // Per-byte normalization of the ghost score: score_i = ghost_i / D_i.
+  // Per-byte normalization of the ghost score:
+  //   score_i = ghost_i / max(0, D_i - c_i)   (0 when fully cached).
   // The raw ghost count measures HOW MANY misses more capacity could convert
   // into hits, but not the capacity price per hit: converting L3's repeat
   // misses (data 0.8 GiB) costs an order of magnitude fewer bytes per hit
   // than L5's (data 15 GiB), whose recently-missed keys are spread over a
   // far larger footprint. With raw counts the allocator parked ~1 GiB on L5
   // for a 0.037 level hit ratio while L3/L4 (which the model-based allocator
-  // funded to 0.25/0.26) starved. Dividing by data size restores the per-byte
-  // marginal ordering -- the same structural information the exponential
-  // model carried in its α/D factor. The Poisson significance gate still
-  // operates on the raw (EMA) counts of the selected pair, since the
-  // sqrt-noise model only makes sense for counts.
+  // funded to 0.25/0.26) starved. Normalizing restores the per-byte marginal
+  // ordering -- the same structural information the exponential model
+  // carried in its α/D factor.
+  // The denominator is the UNCACHED footprint (D_i - c_i), because ghost
+  // hits are produced only by the uncached portion; dividing by total D_i
+  // instead made small-data levels capacity magnets (L0's ~150x 1/D
+  // advantage let it hoard 1.1 GiB of a 2 GiB budget and drain L6, while
+  // its residual misses were churn-compulsory and unconvertible).
   bool ghost_normalize_by_data = true;
+  // Floor on the uncached denominator, as a fraction of D_i:
+  //   denom_i = max(D_i - c_i, ghost_uncached_floor_frac * D_i).
+  // Without it the score explodes as c_i -> D_i (denominator -> 0+), which
+  // recreated the small-level magnet in a worse form: a level whose data
+  // pulses just above its capacity (L0 during flush bursts) posts a huge
+  // score, sucks in capacity, then its data recedes, structural reclaim
+  // drains it, and the cycle repeats (observed as the round-250/500/600
+  // L0 reclaim loop with 211 MiB counter-transfers in between). The floor
+  // caps the near-full advantage at 1/floor_frac x the average per-byte
+  // score. Fully-cached levels (c_i >= D_i) still score exactly 0.
+  double ghost_uncached_floor_frac = 0.1;
 
   // --- Steady-state suppression (incremental mode) ---
   // Observed pathology on write-heavy steady state (wlA, 100M ops): ghost
@@ -238,6 +253,36 @@ struct MultiLevelAllocationOptions {
   //    and the round is skipped. Set ratio to 0 to disable both checks.
   double ghost_min_recv_donor_ratio = 2.0;
   double ghost_significance_k = 3.0;
+  // 4. Probe transfers (anti-freeze annealing). The significance gate trades
+  //    hit ratio for quiet: it freezes the allocation wherever convergence
+  //    left it, including overshoot (observed: adaptive-step streaks parked
+  //    1152 MiB on L4 for the same hit ratio it had at 721 MiB, while
+  //    L3/L5 starved ~1.9pt of fg hit ratio below the known optimum).
+  //    After probe_after_skipped_rounds consecutive gate-skipped rounds,
+  //    allow ONE small transfer (base step / probe_step_divisor) from the
+  //    score argmin to argmax, bypassing the near-optimal and significance
+  //    gates but still respecting direction locks, floors, and upper bounds.
+  //    Purge cost is O(base_step/divisor) (~8 MiB) so p99 is unaffected;
+  //    the equilibrium anneals toward the optimum instead of freezing.
+  //    0 disables probing.
+  uint64_t probe_after_skipped_rounds = 8;
+  size_t probe_step_divisor = 4;
+  // 5. Reversal hysteresis. The fixed 3-round direction lock stops
+  //    round-to-round ping-pong but not the 50-100 round oscillation
+  //    observed at 2 GiB (L3 capacity swinging 50<->924 MiB, L4->L0
+  //    followed by reclaim L0->L4), where every accelerated 128-256 MiB
+  //    reversal purges the warm set the previous transfer had just built.
+  //    When a transfer's direction is the OPPOSITE of the last transfer on
+  //    the same level pair within reversal_window_rounds, (a) the step is
+  //    clamped to the base step (undoing prior work at an accelerated step
+  //    maximizes warm-set loss), and (b) the pair's direction locks are
+  //    escalated exponentially with its reversal streak
+  //    (step_direction_lock_rounds << streak, capped at
+  //    reversal_lock_max_rounds), so a pair that keeps flip-flopping gets
+  //    frozen for progressively longer while one-directional (corrective)
+  //    traffic is never slowed. 0 window disables.
+  uint64_t reversal_window_rounds = 200;
+  uint64_t reversal_lock_max_rounds = 96;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -351,6 +396,16 @@ class MultiLevelCacheAllocator {
   std::vector<double> ghost_score_ema_;
   std::vector<uint64_t> received_lock_round_;
   std::vector<uint64_t> donated_lock_round_;
+  // Consecutive rounds skipped by the steady-state gates; when it reaches
+  // probe_after_skipped_rounds, the next round runs as a probe transfer.
+  uint64_t consecutive_gate_skips_ = 0;
+  // Reversal-hysteresis state, indexed by unordered level pair
+  // (min*level_count + max): round of the pair's last applied transfer, its
+  // direction (+1 = lower->higher level index, -1 = reverse, 0 = none), and
+  // the current reversal streak driving the escalated lock length.
+  std::vector<uint64_t> pair_last_round_;
+  std::vector<int> pair_last_dir_;
+  std::vector<uint32_t> pair_reversal_streak_;
   // Total cache lookups (summed across levels) at the last op-gated round.
   // Used by BackgroundLoop to decide when adjust_interval_ops have elapsed.
   uint64_t last_round_lookups_ = 0;

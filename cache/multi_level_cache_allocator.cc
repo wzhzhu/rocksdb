@@ -1170,8 +1170,34 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           // scale with the level's footprint. Without this, comparable raw
           // counts on L3 (0.8 GiB data) and L5 (15 GiB data) read as equal
           // marginal value even though L5 needs ~20x the capacity per hit.
+          //
+          // The denominator is the UNCACHED footprint (data - capacity), not
+          // the total data size: ghost hits are produced exclusively by the
+          // uncached portion (cached blocks do not miss), so the marginal
+          // utility of one more byte is ghost / uncached_bytes. Normalizing
+          // by total data instead turns small-data levels into capacity
+          // magnets: L0 (0.25-1 GiB of fast-churning flush output) had its
+          // score inflated ~150x relative to L6 by the 1/D factor, ended a
+          // 2 GiB run holding 1.1 GiB, and even drained L6 -- while its own
+          // hit ratio barely responds to capacity. When capacity already
+          // covers the data (uncached == 0), the residual ghost hits come
+          // from file churn (new post-flush/compaction blocks always miss
+          // once); no amount of extra capacity converts those, so the
+          // marginal score is exactly 0. For deep levels (cap << data) this
+          // is numerically identical to the old 1/D normalization.
+          // The denominator is floored at floor_frac * D: as cap -> data the
+          // raw uncached size -> 0+ and the score would explode, turning
+          // data-pulsing levels (L0) into oscillating capacity magnets.
           if (options_.ghost_normalize_by_data && data[i] > 0.0) {
-            score[i] = ghost_score_ema_[i] / data[i];
+            const double uncached =
+                data[i] - static_cast<double>(last_capacities_[i]);
+            if (uncached <= 0.0) {
+              score[i] = 0.0;
+            } else {
+              const double denom = std::max(
+                  uncached, options_.ghost_uncached_floor_frac * data[i]);
+              score[i] = ghost_score_ema_[i] / denom;
+            }
           }
         }
         ghost_scored = true;
@@ -1244,6 +1270,16 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     const bool structural_reclaim =
         excess_donor != level_count && excess_bytes >= (size_t{1} << 20);
 
+    // Probe transfer (anti-freeze annealing): after enough consecutive
+    // gate-skipped rounds, run one small score-directed transfer that
+    // bypasses the near-optimal and significance gates (but not the
+    // no-signal check, direction locks, floors, or upper bounds). This
+    // keeps the equilibrium annealing toward the optimum instead of
+    // freezing wherever the convergence phase overshot.
+    const bool probe_transfer =
+        !structural_reclaim && options_.probe_after_skipped_rounds > 0 &&
+        consecutive_gate_skips_ >= options_.probe_after_skipped_rounds;
+
     // --- Find recipient (highest score, has data, has room to grow) ---
     size_t recipient = level_count;
     double best_recv = -1.0;
@@ -1291,7 +1327,13 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       }
     }
 
-    auto do_skip_step = [&](const char* reason) {
+    auto do_skip_step = [&](const char* reason, bool gate_skip = false) {
+      // Only skips caused by the steady-state gates advance the probe
+      // counter; structural skips (no traffic, no pair, nothing to move)
+      // are not situations a probe transfer could improve.
+      if (gate_skip) {
+        ++consecutive_gate_skips_;
+      }
       if (kAllocDebug) {
         const uint64_t s = dbg_skipped.fetch_add(1) + 1;
         const uint64_t ap = dbg_applied.load();
@@ -1331,11 +1373,11 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     }
 
     // Gap check: skip if allocation is near-optimal (scores converged).
-    if (!structural_reclaim && options_.step_min_score_ratio > 0.0 &&
-        std::isfinite(best_recv)) {
+    if (!structural_reclaim && !probe_transfer &&
+        options_.step_min_score_ratio > 0.0 && std::isfinite(best_recv)) {
       const double gap = (best_recv - best_donor_score) / best_recv;
       if (gap < options_.step_min_score_ratio) {
-        do_skip_step("near_optimal");
+        do_skip_step("near_optimal", /*gate_skip=*/true);
         return Status::OK();
       }
     }
@@ -1350,20 +1392,28 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     // -- rather than compared on raw counts, otherwise a legitimate transfer
     // between levels with similar counts but very different footprints
     // (e.g. L3 at 0.8 GiB vs L5 at 15 GiB) would read as insignificant.
-    if (!structural_reclaim && ghost_scored &&
+    if (!structural_reclaim && !probe_transfer && ghost_scored &&
         options_.ghost_min_recv_donor_ratio > 0.0) {
       const bool ratio_ok =
           best_recv >
           options_.ghost_min_recv_donor_ratio * std::max(0.0, best_donor_score);
-      // Scale factor applied to each level's count in score[]: 1/D (or 1).
-      const double recv_scale =
-          (options_.ghost_normalize_by_data && data[recipient] > 0.0)
-              ? 1.0 / data[recipient]
-              : 1.0;
-      const double donor_scale =
-          (options_.ghost_normalize_by_data && data[donor] > 0.0)
-              ? 1.0 / data[donor]
-              : 1.0;
+      // Scale factor applied to each level's count in score[]: 1/uncached
+      // (or 1 when unnormalized), mirroring the normalization above.
+      auto score_scale = [&](size_t lvl) {
+        if (!options_.ghost_normalize_by_data || data[lvl] <= 0.0) {
+          return 1.0;
+        }
+        const double uncached =
+            data[lvl] - static_cast<double>(last_capacities_[lvl]);
+        // A fully-cached level's score is pinned to 0 with no noise term.
+        if (uncached <= 0.0) {
+          return 0.0;
+        }
+        return 1.0 / std::max(uncached,
+                              options_.ghost_uncached_floor_frac * data[lvl]);
+      };
+      const double recv_scale = score_scale(recipient);
+      const double donor_scale = score_scale(donor);
       const double var =
           std::max(1.0, ghost_score_ema_[recipient]) * recv_scale * recv_scale +
           std::max(1.0, ghost_score_ema_[donor]) * donor_scale * donor_scale;
@@ -1371,9 +1421,38 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           (best_recv - best_donor_score) >
           options_.ghost_significance_k * std::sqrt(var);
       if (!ratio_ok || !significant) {
-        do_skip_step("insignificant");
+        do_skip_step("insignificant", /*gate_skip=*/true);
         return Status::OK();
       }
+    }
+
+    // --- Reversal hysteresis (steady-state suppression #5) ---
+    // Detect whether this transfer undoes a recent transfer on the same
+    // level pair. A reversal is applied at the base step only (an
+    // accelerated reversal purges the warm set the previous transfer just
+    // built), and escalates the pair's direction-lock length exponentially
+    // with its streak, freezing a flip-flopping pair for progressively
+    // longer. One-directional traffic keeps streak 0 and is never slowed.
+    if (pair_last_round_.size() != level_count * level_count) {
+      pair_last_round_.assign(level_count * level_count, 0);
+      pair_last_dir_.assign(level_count * level_count, 0);
+      pair_reversal_streak_.assign(level_count * level_count, 0);
+    }
+    const size_t pair_idx = std::min(donor, recipient) * level_count +
+                            std::max(donor, recipient);
+    const int transfer_dir = donor < recipient ? 1 : -1;
+    bool is_reversal = false;
+    uint32_t reversal_streak = 0;
+    if (options_.reversal_window_rounds > 0 && pair_last_dir_[pair_idx] != 0 &&
+        round_id_ - pair_last_round_[pair_idx] <=
+            options_.reversal_window_rounds) {
+      reversal_streak = pair_reversal_streak_[pair_idx];
+      if (pair_last_dir_[pair_idx] != transfer_dir) {
+        is_reversal = true;
+        reversal_streak = std::min<uint32_t>(reversal_streak + 1, 16);
+      }
+      // Same direction within the window: streak carries over unchanged, so
+      // the long locks stay armed against renewed flip-flopping.
     }
 
     // --- Compute and apply transfer (adaptive step) ---
@@ -1397,11 +1476,20 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         base_step, std::min(options_.step_max_bytes, total_capacity / 8));
     size_t step = base_step;
     if (options_.step_growth > 1.0 && recipient == last_step_recipient_ &&
-        current_step_bytes_ > 0) {
+        current_step_bytes_ > 0 && !is_reversal) {
       const double grown =
           static_cast<double>(current_step_bytes_) * options_.step_growth;
       step = static_cast<size_t>(
           std::min(grown, static_cast<double>(max_step)));
+    }
+
+    // A probe bypasses the gates, so it must stay cheap: a fraction of the
+    // base step, never accelerated. Worst case (probing at a genuine
+    // optimum) this is ~1 MiB of purge per gate-skip window -- noise.
+    if (probe_transfer) {
+      step = std::max<size_t>(
+          size_t{1} << 20,
+          base_step / std::max<size_t>(1, options_.probe_step_divisor));
     }
 
     // A structural reclaim drains at the max step (the excess is dead
@@ -1453,12 +1541,15 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                              : 1.0;
         fprintf(stderr,
                 "[MLC_ALLOC] round=%llu APPLY(%s) L%zu->L%zu "
-                "transfer=%lluMiB step=%lluMiB scorer=%s score_gap=%.3f "
-                "apply_us=%llu applied=%llu skipped=%llu caps(MiB)=[%s]\n",
+                "transfer=%lluMiB step=%lluMiB rev=%u scorer=%s "
+                "score_gap=%.3f apply_us=%llu applied=%llu skipped=%llu "
+                "caps(MiB)=[%s]\n",
                 (unsigned long long)round_id_,
-                structural_reclaim ? "reclaim" : "step", donor, recipient,
+                structural_reclaim ? "reclaim"
+                                   : (probe_transfer ? "probe" : "step"),
+                donor, recipient,
                 (unsigned long long)(transfer >> 20),
-                (unsigned long long)(step >> 20),
+                (unsigned long long)(step >> 20), reversal_streak,
                 ghost_scored ? "ghost" : "model", gap_val,
                 (unsigned long long)(t1 - dbg_t0),
                 (unsigned long long)ap, (unsigned long long)sk,
@@ -1472,22 +1563,35 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     if (s.ok()) {
       last_capacities_ = std::move(new_caps);
       last_round_applied_ = true;
+      // Any applied transfer restarts the probe countdown.
+      consecutive_gate_skips_ = 0;
       // Feed the adaptive-step streak tracker. A structural reclaim moves at
-      // max_step out-of-band; letting it seed the streak would hand the next
-      // score-driven round an already-accelerated step, so reset instead.
-      if (structural_reclaim) {
+      // max_step out-of-band, and a probe deliberately runs below the base
+      // step; letting either seed the streak would distort the next
+      // score-driven round's step, so reset instead.
+      if (structural_reclaim || probe_transfer) {
         current_step_bytes_ = 0;
         last_step_recipient_ = SIZE_MAX;
       } else {
         current_step_bytes_ = step;
         last_step_recipient_ = recipient;
       }
-      // Arm the direction locks (round_id_ was already advanced above).
+      // Record the pair transfer for reversal detection (round_id_ was
+      // already advanced above; use the pre-advance id the detection ran
+      // against so window arithmetic stays consistent).
+      pair_last_round_[pair_idx] = round_id_ - 1;
+      pair_last_dir_[pair_idx] = transfer_dir;
+      pair_reversal_streak_[pair_idx] = reversal_streak;
+      // Arm the direction locks, escalated by the pair's reversal streak:
+      // base 3 rounds, doubled per streak (3, 6, 12, ...), capped.
       if (options_.step_direction_lock_rounds > 0) {
-        received_lock_round_[recipient] =
-            round_id_ + options_.step_direction_lock_rounds;
-        donated_lock_round_[donor] =
-            round_id_ + options_.step_direction_lock_rounds;
+        uint64_t lock_rounds = options_.step_direction_lock_rounds
+                               << std::min<uint32_t>(reversal_streak, 10);
+        if (options_.reversal_lock_max_rounds > 0) {
+          lock_rounds = std::min(lock_rounds, options_.reversal_lock_max_rounds);
+        }
+        received_lock_round_[recipient] = round_id_ + lock_rounds;
+        donated_lock_round_[donor] = round_id_ + lock_rounds;
       }
     } else {
       current_step_bytes_ = 0;
