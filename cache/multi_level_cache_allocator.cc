@@ -1007,25 +1007,27 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
   // cost grows with the resident set (~175ms/round at 8 GB full cache),
   // stalling the hot path and collapsing low-concurrency throughput.
   //
-  // Solution: bounded single-pair transfer per round, guided by the exact
-  // per-byte marginal score from the KKT stationarity condition:
-  //   score_i = λ_i · (α_i / D_i) · exp(-α_i · c_i / D_i)
-  //           = λ_i · (α_i / D_i) · miss_rate_i(c_i)
-  // At the water-filling optimum every active level equalises score_i = μ, so
-  // this is the correct signal for a greedy step: transfer a fixed step from
-  // the lowest-score (over-provisioned) donor to the highest-score (under-
-  // provisioned) recipient, walking the allocation toward the optimum.
-  //
+  // Solution: bounded single-pair transfer per round, guided by a per-byte
+  // marginal score:
   //   Recipient = argmax(score) — highest marginal benefit per byte.
   //   Donor     = argmin(score) — lowest marginal benefit; can give bytes away.
   //
-  // Prerequisite: lambda must be raw fg_lookups (use_reuse_lambda=false); the
-  // reuse-lambda path drives lambda_L6 → ε, collapsing score_L6 and wrongly
-  // making the largest level a permanent donor (see below).
+  // Primary scorer (use_ghost_marginal): per-level repeat-miss (ghost)
+  // counts, a direct model-free measurement of capacity-convertible miss
+  // traffic, normalized per byte (see ghost_normalize_by_data /
+  // ghost_normalize_by_uncached in the header for the denominator debate).
+  //
+  // Fallback scorer (ghost vector unavailable): the exponential-MRC KKT
+  // stationarity derivative
+  //   score_i = λ_i · (α_i / D_i) · exp(-α_i · c_i / D_i)
+  // which requires lambda = raw fg_lookups (use_reuse_lambda=false); the
+  // reuse-lambda path drives lambda_L6 → ε and wrongly makes the largest
+  // level a permanent donor.
   //
   // Properties:
-  //   - Per-round purge is O(adjust_step_bytes), not O(GB swing) → ≤ ms.
-  //   - No stability gate needed: step size is the stability mechanism.
+  //   - Per-round purge is O(step), not O(GB swing) → ≤ ms.
+  //   - Steady-state churn is bounded by the gates + hysteresis below;
+  //     acceleration is a cold-start-only device (accel_cold_start_applies).
   //   - Floors / caps enforced by donor_avail / recv_room constraints.
   //   - Cold start: equal split so every level gets signal immediately.
   // -------------------------------------------------------------------------
@@ -1047,33 +1049,54 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       return s;
     }
 
+    // --- Data-size smoothing ---
+    // Every data-keyed mechanism below (floors, upper_bytes, structural
+    // reclaim, score normalization, fully-cached score-0) reads the smoothed
+    // series, so a flush burst pulsing L0's data through the thresholds
+    // cannot cycle them (see data_ema_beta in the header).
+    if (data.size() == level_count) {
+      const double dbeta =
+          (options_.data_ema_beta > 0.0 && options_.data_ema_beta < 1.0)
+              ? options_.data_ema_beta
+              : 1.0;
+      if (data_ema_.size() != level_count) {
+        data_ema_ = data;
+      }
+      for (size_t i = 0; i < level_count; ++i) {
+        data_ema_[i] = (1.0 - dbeta) * data_ema_[i] + dbeta * data[i];
+        data[i] = data_ema_[i];
+      }
+    }
+
     // --- Floors (data-share weighted + absolute minimum) ---
     //
-    // In theory the score is self-capping on the upper side: as a level's
-    // capacity approaches its data size, miss_rate → 0 and score → 0, so it
-    // stops being a recipient on its own.  In practice a level whose capacity
-    // already exceeds its data size drives the *observed* alpha to 0 (all hits,
-    // no signal), which trips the kInfiniteScore sentinel and would make it a
-    // permanent recipient.  The explicit data-size upper bound (upper_bytes,
-    // computed below) is the robust guard against that degenerate case.  The
-    // floor below is the complementary lower bound: it guarantees each active
-    // level retains a minimum allocation so compaction can make forward
-    // progress.
+    // Lower bound companion to upper_bytes below: every active level keeps a
+    // minimum allocation (5% pool split by data share) so compaction and
+    // point lookups make forward progress even when its marginal score never
+    // wins a transfer. Empirically these floors ARE the steady-state
+    // capacity of the deep levels (L5/L6 sit exactly at their floor in most
+    // wlA runs), so their sizing directly shows up in the hit ratio.
+    // Floor eligibility requires >= 1 MiB of (smoothed) data. The EMA decays
+    // geometrically after a level empties, so without a threshold a level
+    // that held transient compaction output (L1/L2) keeps a residual EMA of
+    // a few bytes forever and parks its absolute floor (observed: empty
+    // L1/L2 pinning 14 MiB each). 1 MiB is small enough that L0's EMA never
+    // falls through it between flushes (which would re-introduce the pulse
+    // cycle the smoothing exists to prevent).
+    constexpr double kFloorActiveDataMin = static_cast<double>(1 << 20);
     std::vector<size_t> floor_bytes(level_count, 0);
     if (options_.min_active_level_capacity_ratio > 0.0 &&
-        snapshot.data_sizes.size() == level_count && total_capacity > 0) {
-      uint64_t sum_active = 0;
+        data.size() == level_count && total_capacity > 0) {
+      double sum_active = 0.0;
       for (size_t i = 0; i < level_count; ++i) {
-        if (snapshot.data_sizes[i] > 0) sum_active += snapshot.data_sizes[i];
+        if (data[i] >= kFloorActiveDataMin) sum_active += data[i];
       }
-      if (sum_active > 0) {
+      if (sum_active > 0.0) {
         const double pool = static_cast<double>(total_capacity) *
                             options_.min_active_level_capacity_ratio;
         for (size_t i = 0; i < level_count; ++i) {
-          if (snapshot.data_sizes[i] == 0) continue;
-          const double share =
-              static_cast<double>(snapshot.data_sizes[i]) /
-              static_cast<double>(sum_active);
+          if (data[i] < kFloorActiveDataMin) continue;
+          const double share = data[i] / sum_active;
           floor_bytes[i] = std::max(
               options_.min_active_level_floor_bytes,
               static_cast<size_t>(std::floor(pool * share)));
@@ -1081,9 +1104,9 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       }
     }
     if (options_.min_active_level_capacity_bytes > 0 &&
-        snapshot.data_sizes.size() == level_count) {
+        data.size() == level_count) {
       for (size_t i = 0; i < level_count; ++i) {
-        if (snapshot.data_sizes[i] > 0) {
+        if (data[i] >= kFloorActiveDataMin) {
           floor_bytes[i] =
               std::max(floor_bytes[i],
                        options_.min_active_level_capacity_bytes);
@@ -1185,17 +1208,22 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           // once); no amount of extra capacity converts those, so the
           // marginal score is exactly 0. For deep levels (cap << data) this
           // is numerically identical to the old 1/D normalization.
-          // The denominator is floored at floor_frac * D: as cap -> data the
-          // raw uncached size -> 0+ and the score would explode, turning
-          // data-pulsing levels (L0) into oscillating capacity magnets.
+          // Denominator: D by default (allocation-invariant, no feedback);
+          // optionally the floored uncached footprint (see header comment on
+          // ghost_normalize_by_uncached for the rich-get-richer caveat).
+          // Fully-cached levels score 0 either way: their residual misses
+          // are churn-compulsory and no capacity converts them.
           if (options_.ghost_normalize_by_data && data[i] > 0.0) {
             const double uncached =
                 data[i] - static_cast<double>(last_capacities_[i]);
             if (uncached <= 0.0) {
               score[i] = 0.0;
             } else {
-              const double denom = std::max(
-                  uncached, options_.ghost_uncached_floor_frac * data[i]);
+              const double denom =
+                  options_.ghost_normalize_by_uncached
+                      ? std::max(uncached,
+                                 options_.ghost_uncached_floor_frac * data[i])
+                      : data[i];
               score[i] = ghost_score_ema_[i] / denom;
             }
           }
@@ -1409,8 +1437,11 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         if (uncached <= 0.0) {
           return 0.0;
         }
-        return 1.0 / std::max(uncached,
-                              options_.ghost_uncached_floor_frac * data[lvl]);
+        if (options_.ghost_normalize_by_uncached) {
+          return 1.0 / std::max(uncached,
+                                options_.ghost_uncached_floor_frac * data[lvl]);
+        }
+        return 1.0 / data[lvl];
       };
       const double recv_scale = score_scale(recipient);
       const double donor_scale = score_scale(donor);
@@ -1474,9 +1505,18 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         1 << 20, std::min(options_.adjust_step_bytes, total_capacity / 32));
     const size_t max_step = std::max(
         base_step, std::min(options_.step_max_bytes, total_capacity / 8));
+    // Acceleration is a cold-start device only: past the apply budget, or
+    // after the first observed reversal (definitive overshoot evidence),
+    // every transfer moves at the base step. See accel_cold_start_applies.
+    if (is_reversal) {
+      accel_disabled_ = true;
+    }
+    const bool accel_allowed =
+        !accel_disabled_ &&
+        applied_transfer_count_ < options_.accel_cold_start_applies;
     size_t step = base_step;
-    if (options_.step_growth > 1.0 && recipient == last_step_recipient_ &&
-        current_step_bytes_ > 0 && !is_reversal) {
+    if (options_.step_growth > 1.0 && accel_allowed &&
+        recipient == last_step_recipient_ && current_step_bytes_ > 0) {
       const double grown =
           static_cast<double>(current_step_bytes_) * options_.step_growth;
       step = static_cast<size_t>(
@@ -1563,6 +1603,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     if (s.ok()) {
       last_capacities_ = std::move(new_caps);
       last_round_applied_ = true;
+      ++applied_transfer_count_;
       // Any applied transfer restarts the probe countdown.
       consecutive_gate_skips_ = 0;
       // Feed the adaptive-step streak tracker. A structural reclaim moves at

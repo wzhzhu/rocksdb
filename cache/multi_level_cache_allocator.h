@@ -215,16 +215,20 @@ struct MultiLevelAllocationOptions {
   // advantage let it hoard 1.1 GiB of a 2 GiB budget and drain L6, while
   // its residual misses were churn-compulsory and unconvertible).
   bool ghost_normalize_by_data = true;
-  // Floor on the uncached denominator, as a fraction of D_i:
-  //   denom_i = max(D_i - c_i, ghost_uncached_floor_frac * D_i).
-  // Without it the score explodes as c_i -> D_i (denominator -> 0+), which
-  // recreated the small-level magnet in a worse form: a level whose data
-  // pulses just above its capacity (L0 during flush bursts) posts a huge
-  // score, sucks in capacity, then its data recedes, structural reclaim
-  // drains it, and the cycle repeats (observed as the round-250/500/600
-  // L0 reclaim loop with 211 MiB counter-transfers in between). The floor
-  // caps the near-full advantage at 1/floor_frac x the average per-byte
-  // score. Fully-cached levels (c_i >= D_i) still score exactly 0.
+  // Denominator choice for the normalization above.
+  //   false (default): denom_i = D_i (total data size). Allocation-invariant,
+  //     so scores have no feedback through the allocation itself.
+  //   true: denom_i = max(D_i - c_i, ghost_uncached_floor_frac * D_i), i.e.
+  //     the uncached footprint. Theoretically the marginal denominator under
+  //     UNIFORM within-level access, but under zipfian it has a
+  //     rich-get-richer positive feedback: as a level approaches full
+  //     caching its denominator shrinks toward the floor, its score rises,
+  //     it wins more capacity, and the loop repeats -- measured on wlA 100M
+  //     at 2 GiB t64 it drove the allocation all-in on L4 (1948 MiB of a
+  //     2 GiB budget; L3 starved at 0.8 MiB with 9.3M lookups) and cost
+  //     ~2pt of fg hit ratio vs the D_i denominator. Kept as an option for
+  //     A/B studies. Either way, fully-cached levels (c_i >= D_i) score 0.
+  bool ghost_normalize_by_uncached = false;
   double ghost_uncached_floor_frac = 0.1;
 
   // --- Steady-state suppression (incremental mode) ---
@@ -248,22 +252,29 @@ struct MultiLevelAllocationOptions {
   //    AND
   //      recv_score - donor_score > ghost_significance_k *
   //                                 sqrt(recv_score + donor_score)
-  //    (Poisson-noise significance for count data). During convergence the
-  //    gaps are 10-100x and pass trivially; in steady-state noise they fail
-  //    and the round is skipped. Set ratio to 0 to disable both checks.
-  double ghost_min_recv_donor_ratio = 2.0;
+  //    (Poisson-noise significance for count data). Set ratio to 0 to
+  //    disable both checks.
+  //    DEFAULT OFF: k=3 was tuned against 2^16 ghost tables; at the current
+  //    2^18 tables counts are ~4x larger, relative Poisson noise ~2x
+  //    smaller, and the gate passed ~79% of steady-state rounds (measured,
+  //    wlA 100M 2 GiB) -- de facto a no-op, while its historical failure
+  //    mode (freezing convergence overshoot in place) motivated the probe
+  //    mechanism below. With cold-start-only acceleration + the near-optimal
+  //    ratio gate + direction locks + reversal hysteresis, steady-state
+  //    churn is bounded at base-step size and mechanically cheap, so the
+  //    lean stack omits this gate. Kept for ablation studies.
+  double ghost_min_recv_donor_ratio = 0.0;
   double ghost_significance_k = 3.0;
-  // 4. Probe transfers (anti-freeze annealing). The significance gate trades
-  //    hit ratio for quiet: it freezes the allocation wherever convergence
-  //    left it, including overshoot (observed: adaptive-step streaks parked
-  //    1152 MiB on L4 for the same hit ratio it had at 721 MiB, while
-  //    L3/L5 starved ~1.9pt of fg hit ratio below the known optimum).
-  //    After probe_after_skipped_rounds consecutive gate-skipped rounds,
-  //    allow ONE small transfer (base step / probe_step_divisor) from the
-  //    score argmin to argmax, bypassing the near-optimal and significance
-  //    gates but still respecting direction locks, floors, and upper bounds.
-  //    Purge cost is O(base_step/divisor) (~8 MiB) so p99 is unaffected;
-  //    the equilibrium anneals toward the optimum instead of freezing.
+  // 4. Probe transfers (anti-freeze annealing). If the gates freeze the
+  //    allocation at a suboptimal point (historically: the significance gate
+  //    freezing convergence overshoot), then after
+  //    probe_after_skipped_rounds consecutive gate-skipped rounds allow ONE
+  //    small transfer (base step / probe_step_divisor) from the score argmin
+  //    to argmax, bypassing the near-optimal and significance gates but
+  //    still respecting direction locks, floors, and upper bounds. With the
+  //    significance gate now off by default the only remaining freezer is
+  //    the near-optimal ratio gate, so the probe serves as cheap insurance
+  //    (~base_step/4 purge per probe) rather than a primary mechanism.
   //    0 disables probing.
   uint64_t probe_after_skipped_rounds = 8;
   size_t probe_step_divisor = 4;
@@ -283,6 +294,27 @@ struct MultiLevelAllocationOptions {
   //    traffic is never slowed. 0 window disables.
   uint64_t reversal_window_rounds = 200;
   uint64_t reversal_lock_max_rounds = 96;
+  // 6. Cold-start-only step acceleration. The Rprop-style step doubling was
+  //    added to cut the cold-start convergence tax, but left enabled in
+  //    steady state it is the primary overshoot generator: the EMA-smoothed
+  //    ghost signal lags ~1/beta windows, so a 3-4 round streak moves
+  //    64+128+256 MiB before the signal reflects any of it (measured: L4
+  //    parked at 1948 MiB of a 2 GiB budget across repeats, deep levels
+  //    pinned to their floors, ~2pt fg hit below the balanced allocation).
+  //    Acceleration is therefore permitted only for the first
+  //    accel_cold_start_applies applied transfers, and is disabled
+  //    permanently the first time a reversal is detected (the definitive
+  //    overshoot signal). Steady state always steps at the base step.
+  //    0 disables acceleration entirely.
+  uint64_t accel_cold_start_applies = 32;
+  // 7. EMA smoothing of per-level data sizes (0 < beta <= 1; 1 = raw).
+  //    L0's data pulses 0 <-> ~1.3 GiB with every flush/compaction cycle;
+  //    the three mechanisms keyed off data size (score-0 for fully-cached
+  //    levels, the upper_bytes growth cap, and structural excess reclaim)
+  //    all used the instantaneous value and took turns firing, producing a
+  //    reclaim->refill loop on L0. Smoothing the data series they see
+  //    removes the pulse without changing any of their semantics.
+  double data_ema_beta = 0.3;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -406,6 +438,12 @@ class MultiLevelCacheAllocator {
   std::vector<uint64_t> pair_last_round_;
   std::vector<int> pair_last_dir_;
   std::vector<uint32_t> pair_reversal_streak_;
+  // Cold-start acceleration budget: applied-transfer count and the
+  // first-reversal kill switch (see accel_cold_start_applies).
+  uint64_t applied_transfer_count_ = 0;
+  bool accel_disabled_ = false;
+  // EMA-smoothed per-level data sizes (see data_ema_beta).
+  std::vector<double> data_ema_;
   // Total cache lookups (summed across levels) at the last op-gated round.
   // Used by BackgroundLoop to decide when adjust_interval_ops have elapsed.
   uint64_t last_round_lookups_ = 0;

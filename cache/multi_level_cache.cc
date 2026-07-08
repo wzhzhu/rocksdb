@@ -1239,10 +1239,22 @@ void MultiLevelCache::MaybeRebuildSparseSubCaches() {
     // mostly-empty slot array on every insert. Only AutoHCC is grow-only, so
     // only it needs a rebuild to actually shrink its table.
     static constexpr size_t kMinSlotsForRebuild = 4096;
-    static constexpr double kSparseOccupancyRatio = 0.10;
-    // No hysteresis: with the op-count cadence the model-stability gate already
-    // holds a stable allocation (large swings are SKIPped), so a level only
-    // reads sparse after a genuine, sustained defund -- rebuild it immediately.
+    // Rebuild only when the Evict sweep cost is genuinely pathological:
+    // the expected slots scanned per eviction is ~slots/occ, so gate on that
+    // ratio directly. The previous 10%-occupancy trigger also caught tables
+    // that were sparse but WARM -- e.g. occ=35K in 628K slots (18 probes per
+    // eviction, harmless) -- and discarded tens of thousands of just-purged
+    // hot entries per rebuild, each costing a full storage reload on next
+    // access. Measured on wlA 100M at 2 GiB, those warm drops (up to 78
+    // rebuilds per run) were the dominant hit-ratio leak, and the resulting
+    // repeat-miss spike fed the allocator's ghost scores, driving the
+    // 50-100 round capacity oscillation. At 64x the table pays at most ~64
+    // probes per eviction (hundreds of ns) while its warm set survives;
+    // genuinely dead tables (occ=64 in 251K slots = 3900x) still rebuild.
+    static constexpr size_t kMaxSlotsPerOccupied = 64;
+    // No extra hysteresis here: the allocator's incremental steps and
+    // steady-state gates bound capacity swings, so a table only reads this
+    // sparse after a genuine, sustained defund -- rebuild it immediately.
     bool swapped = false;
     for (size_t level = 0; level < sub_caches_.size(); ++level) {
       Cache* cur = current_ptr_[level].load(std::memory_order_acquire);
@@ -1252,10 +1264,8 @@ void MultiLevelCache::MaybeRebuildSparseSubCaches() {
       }
       const size_t slots = cur->GetTableAddressCount();
       const size_t occ = cur->GetOccupancyCount();
-      const bool sparse =
-          slots > kMinSlotsForRebuild && occ != SIZE_MAX &&
-          static_cast<double>(occ) < kSparseOccupancyRatio *
-                                         static_cast<double>(slots);
+      const bool sparse = slots > kMinSlotsForRebuild && occ != SIZE_MAX &&
+                          slots > kMaxSlotsPerOccupied * std::max<size_t>(occ, 1);
       if (!sparse) {
         continue;
       }
@@ -1543,10 +1553,18 @@ void MultiLevelCache::SetGhostTrackingEnabled(bool enabled,
     // Bound: 2^10 (8KB/level) .. 2^22 (32MB/level).
     if (slots_log2 < 10) slots_log2 = 10;
     if (slots_log2 > 22) slots_log2 = 22;
-    ghost_slots_log2_.store(slots_log2, std::memory_order_relaxed);
     const size_t levels = sub_caches_.size();
     if (ghost_tables_.size() != levels) {
       ghost_tables_.resize(levels);
+    }
+    // Tables are allocated once at the log2 in effect at first enable; a
+    // later call with a LARGER log2 must not update the published log2
+    // (RecordGhostMiss indexes with it) or the hot path would index past
+    // the smaller allocation.
+    if (ghost_tables_.empty() || ghost_tables_[0] == nullptr) {
+      ghost_slots_log2_.store(slots_log2, std::memory_order_relaxed);
+    } else {
+      slots_log2 = ghost_slots_log2_.load(std::memory_order_relaxed);
     }
     const size_t slots = size_t{1} << slots_log2;
     for (size_t level = 0; level < levels; ++level) {
@@ -1619,6 +1637,28 @@ std::vector<uint64_t> MultiLevelCache::DrainGhostHits() {
           0, std::memory_order_relaxed);
     }
     result[level] = sum;
+  }
+  // Clear the fingerprint tables so every drain starts a fresh window.
+  // Persisting fingerprints made the effective repeat-miss window
+  // collision-driven and thus traffic-dependent: low-traffic levels kept
+  // fingerprints for many windows (counting reuse at distances no
+  // realistic capacity could serve) while high-traffic levels overwrote
+  // theirs within one, systematically inflating small levels' scores.
+  // With the clear, "repeat miss" uniformly means "re-missed within one
+  // adjustment window" for every level. Runs on the allocator background
+  // thread (~2 MiB/level of relaxed stores); racing hot-path records are
+  // benign (a fingerprint written mid-clear either survives or costs one
+  // undercounted repeat).
+  const size_t slots =
+      size_t{1} << ghost_slots_log2_.load(std::memory_order_relaxed);
+  for (size_t level = 0; level < levels; ++level) {
+    std::atomic<uint64_t>* table = ghost_tables_[level].get();
+    if (table == nullptr) {
+      continue;
+    }
+    for (size_t i = 0; i < slots; ++i) {
+      table[i].store(0, std::memory_order_relaxed);
+    }
   }
   return result;
 }
