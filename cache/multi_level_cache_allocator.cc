@@ -1160,7 +1160,93 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     const double kInfiniteScore = std::numeric_limits<double>::infinity();
     std::vector<double> score(level_count, 0.0);
     bool ghost_scored = false;
-    if (options_.use_ghost_marginal) {
+    bool capture_scored = false;
+    if (options_.use_ghost_marginal && options_.use_ghost_capture_rate) {
+      // --- Capture-rate score: measured per-byte marginal utility ---
+      // A repeat miss at reuse distance d (distinct missed blocks between
+      // the two misses) becomes a hit once the level holds ~d more blocks,
+      // so its value per byte of added capacity is 1/(d * block_bytes).
+      // Summing over the drained distance histogram gives
+      //   score_i = sum_b hist_i[b] / (mid_b * block_bytes)
+      // -- the same quantity the static denominators (raw count / D /
+      // uncached) each tried to guess with a fixed prior about within-level
+      // reuse concentration, now measured directly. A level whose repeats
+      // cluster at short distances (zipfian hot tail, e.g. L5's) scores by
+      // that concentration instead of being flat-taxed by its 15 GiB
+      // footprint; a level whose repeats sit at unreachable distances
+      // scores ~0 instead of masquerading as capacity-hungry. The score is
+      // also allocation-path independent (no feedback through c_i), which
+      // is what makes different runs converge to the same attractor.
+      const std::vector<uint64_t> hist =
+          cache_->DrainGhostDistanceHistogram();
+      constexpr size_t kB = MultiLevelCache::kGhostDistBuckets;
+      if (hist.size() == level_count * kB) {
+        const double block_bytes =
+            std::max<double>(1.0, static_cast<double>(
+                                      options_.ghost_dist_block_bytes));
+        const double beta =
+            (options_.ghost_score_ema_beta > 0.0 &&
+             options_.ghost_score_ema_beta < 1.0)
+                ? options_.ghost_score_ema_beta
+                : 1.0;
+        if (ghost_score_ema_.size() != level_count) {
+          ghost_score_ema_.assign(level_count, 0.0);
+        }
+        for (size_t i = 0; i < level_count; ++i) {
+          double val = 0.0;
+          for (size_t b = 0; b < kB; ++b) {
+            const uint64_t cnt = hist[i * kB + b];
+            if (cnt == 0) {
+              continue;
+            }
+            // Geometric mid-distance of the bucket in blocks. Bucket 0
+            // aggregates everything below one sampled-clock tick
+            // (2^kGhostClockSampleShift blocks); buckets b >= shift span
+            // [2^b, 2^(b+1)).
+            const double mid =
+                (b == 0)
+                    ? static_cast<double>(
+                          uint64_t{1}
+                          << (MultiLevelCache::kGhostClockSampleShift - 1))
+                    : std::sqrt(2.0) *
+                          static_cast<double>(uint64_t{1} << b);
+            val += static_cast<double>(cnt) / (mid * block_bytes);
+          }
+          // Same EMA smoothing as the plain ghost path (per-window
+          // histograms carry the same Poisson/compaction-burst noise).
+          ghost_score_ema_[i] =
+              (1.0 - beta) * ghost_score_ema_[i] + beta * val;
+          score[i] = ghost_score_ema_[i];
+        }
+        ghost_scored = true;
+        capture_scored = true;
+        if (kAllocDebug) {
+          std::string h;
+          char tmp[64];
+          for (size_t i = 0; i < level_count; ++i) {
+            snprintf(tmp, sizeof(tmp), " L%zu:", i);
+            h += tmp;
+            bool any = false;
+            for (size_t b = 0; b < kB; ++b) {
+              const uint64_t cnt = hist[i * kB + b];
+              if (cnt == 0) {
+                continue;
+              }
+              snprintf(tmp, sizeof(tmp), "%s%zu=%llu", any ? "," : "", b,
+                       (unsigned long long)cnt);
+              h += tmp;
+              any = true;
+            }
+            if (!any) {
+              h += "-";
+            }
+          }
+          fprintf(stderr, "[mlc-alloc] round=%llu GHOSTHIST%s\n",
+                  (unsigned long long)round_id_, h.c_str());
+        }
+      }
+    }
+    if (options_.use_ghost_marginal && !ghost_scored) {
       // --- Ghost (repeat-miss) marginal score: direct measurement ---
       // score[i] = repeat misses on recently-missed keys this window = the
       // exact traffic a capacity increase would convert into hits. No MRC
@@ -1427,8 +1513,13 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           options_.ghost_min_recv_donor_ratio * std::max(0.0, best_donor_score);
       // Scale factor applied to each level's count in score[]: 1/uncached
       // (or 1 when unnormalized), mirroring the normalization above.
+      // Capture-rate scores are not simple scaled counts (each repeat
+      // contributes 1/(d·block)), so the Poisson variance model below does
+      // not apply; treat them as unscaled (the gate is off by default and
+      // this path exists for ablation of the plain ghost scorer).
       auto score_scale = [&](size_t lvl) {
-        if (!options_.ghost_normalize_by_data || data[lvl] <= 0.0) {
+        if (capture_scored || !options_.ghost_normalize_by_data ||
+            data[lvl] <= 0.0) {
           return 1.0;
         }
         const double uncached =

@@ -231,6 +231,29 @@ struct MultiLevelAllocationOptions {
   bool ghost_normalize_by_uncached = false;
   double ghost_uncached_floor_frac = 0.1;
 
+  // Capture-rate scoring (segmented ghost). Replaces the static-denominator
+  // normalizations above with a measured per-byte marginal utility: the
+  // cache records each repeat miss's reuse distance (distinct missed blocks
+  // between the two misses; see MultiLevelCache::DrainGhostDistanceHistogram)
+  // and the score integrates the histogram as
+  //   score_i = sum_b hist_i[b] / (mid_b * ghost_dist_block_bytes)
+  // i.e. each repeat is weighted by the reciprocal of the capacity needed to
+  // capture it. Raw counts assume every repeat is capturable by one step
+  // (f=1); /D and /uncached assume uniform within-level reuse spread; the
+  // histogram measures the actual concentration, so a level with a tight
+  // zipfian hot tail (L5's 555 MiB / 6.2% level-hit opportunity that /D's
+  // 20x footprint penalty killed) scores by its true short-distance mass,
+  // and the score has no allocation feedback (distances are counted among
+  // missed blocks, independent of current c_i). Requires the cache to have
+  // segmented ghost tracking enabled; falls back to the plain ghost count
+  // path (with the normalizations above) when the histogram is unavailable.
+  bool use_ghost_capture_rate = false;
+  // Bytes per block for converting histogram distances (in blocks) to a
+  // per-byte score. Should match the workload's dominant block size
+  // (uncompressed block-cache charge); only the RELATIVE score across
+  // levels matters, so a uniform constant is sufficient.
+  size_t ghost_dist_block_bytes = 4096;
+
   // --- Steady-state suppression (incremental mode) ---
   // Observed pathology on write-heavy steady state (wlA, 100M ops): ghost
   // hits never reach zero (compaction keeps shuffling data), per-window

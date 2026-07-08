@@ -166,10 +166,39 @@ class MultiLevelCache : public Cache {
   // MRC shape assumption (unlike the exponential-alpha inversion).
   // slots_log2 sizes the fingerprint table (1<<slots_log2 slots x 8B/level);
   // it bounds how far beyond current capacity the signal can "see".
-  void SetGhostTrackingEnabled(bool enabled, uint32_t slots_log2 = 16);
+  // segmented switches the slot layout from a plain 64-bit fingerprint to
+  // (32-bit tag | 32-bit distinct-miss clock) and enables the reuse-distance
+  // histogram below.
+  void SetGhostTrackingEnabled(bool enabled, uint32_t slots_log2 = 16,
+                               bool segmented = false);
   // Per-level ghost hits since the previous drain (read-and-reset windowed
   // counter). Empty when tracking is disabled.
   std::vector<uint64_t> DrainGhostHits();
+
+  // Segmented ghost: reuse-distance histogram of repeat misses.
+  //
+  // Each ghost slot stores a 32-bit key tag plus the level's distinct-miss
+  // clock at record time; on a repeat miss the clock delta is the number of
+  // DISTINCT blocks that missed at this level in between -- a direct proxy
+  // for how far beyond current capacity the block's stack distance lies. A
+  // repeat miss at distance d would have been a hit with ~d more cached
+  // blocks, so the histogram measures the CAPTURE RATE of a capacity step
+  // directly, replacing the static per-byte denominators (raw / D /
+  // uncached) that each encode a fixed prior about within-level reuse
+  // concentration.
+  //
+  // Buckets are log2 of the distance in distinct missed blocks: bucket b
+  // holds [2^b, 2^(b+1)). The miss clock is sampled 1-in-2^kGhostClockSampleShift
+  // (see RecordGhostMiss), so bucket 0 aggregates all distances below one
+  // clock tick (2^shift blocks) and buckets 1..shift-1 are never populated.
+  // Returned flat as level * kGhostDistBuckets + bucket; read-and-reset.
+  // Unlike DrainGhostHits this does NOT clear the fingerprint tables: the
+  // timestamps make the reuse window uniform by construction (stale entries
+  // just report long distances that fall in high buckets), so cross-window
+  // visibility is a feature here. Empty when tracking is disabled.
+  static constexpr size_t kGhostDistBuckets = 32;
+  static constexpr uint32_t kGhostClockSampleShift = 6;
+  std::vector<uint64_t> DrainGhostDistanceHistogram();
 
   // Installs the factory used by the sparse-table rebuild (swap a defunded
   // level's grow-only AutoHCC table for a fresh empty one). The HCC-options
@@ -406,10 +435,22 @@ class MultiLevelCache : public Cache {
   // (0 = empty slot). Probed and updated with relaxed atomics on the
   // foreground miss path only; collisions simply overwrite (bounded window).
   // ghost_hits_ uses the same striping as the other hot-path counters.
+  // In segmented mode a slot is (32-bit key tag << 32 | 32-bit distinct-miss
+  // clock) instead of the full 64-bit fingerprint.
   std::atomic<bool> ghost_tracking_enabled_{false};
+  std::atomic<bool> ghost_segmented_{false};
   std::atomic<uint32_t> ghost_slots_log2_{16};
   std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> ghost_tables_;
   std::unique_ptr<StripedCounter[]> ghost_hits_;
+  // Per-level distinct-miss clock (segmented mode): incremented once per
+  // non-repeat foreground miss; the delta between two misses of the same key
+  // is its reuse distance in distinct missed blocks. One cache line per
+  // level (StripedCounter is alignas(64)), indexed by level directly.
+  std::unique_ptr<StripedCounter[]> ghost_miss_clock_;
+  // Reuse-distance histogram, [level * kGhostDistBuckets + log2bucket].
+  // Repeat misses are ~two orders of magnitude rarer than lookups, so plain
+  // (unstriped) relaxed counters are sufficient.
+  std::unique_ptr<std::atomic<uint64_t>[]> ghost_dist_hist_;
   mutable std::atomic<uint64_t> insert_route_queries_{0};
   mutable std::atomic<uint64_t> insert_route_parse_failures_{0};
   mutable std::atomic<uint64_t> insert_route_prefix_hits_{0};

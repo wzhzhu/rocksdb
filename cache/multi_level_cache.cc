@@ -1548,7 +1548,8 @@ std::vector<double> MultiLevelCache::DrainForegroundWorkingSetDistinct() {
 }
 
 void MultiLevelCache::SetGhostTrackingEnabled(bool enabled,
-                                              uint32_t slots_log2) {
+                                              uint32_t slots_log2,
+                                              bool segmented) {
   if (enabled) {
     // Bound: 2^10 (8KB/level) .. 2^22 (32MB/level).
     if (slots_log2 < 10) slots_log2 = 10;
@@ -1580,6 +1581,19 @@ void MultiLevelCache::SetGhostTrackingEnabled(bool enabled,
       ghost_hits_ =
           std::make_unique<StripedCounter[]>(kCounterStripes * levels);
     }
+    if (segmented) {
+      if (ghost_miss_clock_ == nullptr) {
+        ghost_miss_clock_ = std::make_unique<StripedCounter[]>(levels);
+      }
+      if (ghost_dist_hist_ == nullptr) {
+        ghost_dist_hist_ = std::make_unique<std::atomic<uint64_t>[]>(
+            levels * kGhostDistBuckets);
+        for (size_t i = 0; i < levels * kGhostDistBuckets; ++i) {
+          ghost_dist_hist_[i].store(0, std::memory_order_relaxed);
+        }
+      }
+      ghost_segmented_.store(true, std::memory_order_relaxed);
+    }
   }
   // Publish enable last so the hot path never sees enabled=true with
   // unallocated tables.
@@ -1601,19 +1615,83 @@ void MultiLevelCache::RecordGhostMiss(size_t level_index,
   }
   const uint32_t slots_log2 =
       ghost_slots_log2_.load(std::memory_order_relaxed);
-  // High bits index the direct-mapped table; the full hash is the fingerprint.
+  // High bits index the direct-mapped table.
   const size_t idx = static_cast<size_t>(fp >> (64 - slots_log2));
   std::atomic<uint64_t>& slot = table[idx];
-  const uint64_t prev = slot.load(std::memory_order_relaxed);
-  if (prev == fp) {
-    // Repeat miss on a recently-missed key: capacity-convertible traffic.
-    IncGhostHitCounter(level_index);
+  if (!ghost_segmented_.load(std::memory_order_relaxed)) {
+    // Plain mode: full 64-bit fingerprint, repeat = any re-miss within the
+    // window.
+    const uint64_t prev = slot.load(std::memory_order_relaxed);
+    if (prev == fp) {
+      // Repeat miss on a recently-missed key: capacity-convertible traffic.
+      IncGhostHitCounter(level_index);
+      return;
+    }
+    // First-seen miss (or a colliding key evicting the previous
+    // fingerprint): record it so a future repeat can be detected. Plain
+    // store: a lost race just costs one signal sample.
+    slot.store(fp, std::memory_order_relaxed);
     return;
   }
-  // First-seen miss (or a colliding key evicting the previous fingerprint):
-  // record it so a future repeat can be detected. Plain store: a lost race
-  // just costs one signal sample.
-  slot.store(fp, std::memory_order_relaxed);
+  // Segmented mode: slot = (32-bit tag << 32 | 32-bit distinct-miss clock).
+  // The tag is the LOW half of the hash so it shares no bits with the index
+  // (which uses the high slots_log2 bits); collision odds per probe are
+  // ~2^-32.
+  //
+  // The clock is SAMPLED: it advances once per ~2^kGhostClockSampleShift
+  // first-seen misses (selected by hash bits, so distinct keys sample it
+  // uniformly) rather than on every miss. Misses run at ~80% of the lookup
+  // rate on these workloads, so a full-rate per-level fetch_add would be a
+  // globally contended cache line (the same reason the fg counters are
+  // striped); sampling cuts writes 2^shift-fold. One clock tick therefore
+  // represents ~2^shift distinct missed blocks, and the histogram bucket is
+  // offset by the shift so buckets stay in distinct-block units. The lost
+  // resolution (distances below ~64 blocks = one bucket) is irrelevant:
+  // allocation steps are tens of thousands of blocks.
+  uint32_t tag = static_cast<uint32_t>(fp);
+  if (tag == 0) {
+    tag = 1;  // keep the slot distinguishable from the empty sentinel
+  }
+  const uint64_t prev = slot.load(std::memory_order_relaxed);
+  if (static_cast<uint32_t>(prev >> 32) == tag) {
+    // Repeat miss. The clock delta approximates the number of distinct
+    // blocks that missed at this level since the previous miss of this key
+    // -- its reuse distance among missed blocks, i.e. how many more cached
+    // blocks would have made this a hit. uint32 subtraction handles clock
+    // wraparound.
+    const uint32_t now = static_cast<uint32_t>(
+        ghost_miss_clock_[level_index].v.load(std::memory_order_relaxed));
+    const uint32_t delta = now - static_cast<uint32_t>(prev);
+    // Bucket = log2(distance in distinct blocks); delta==0 means the
+    // distance is below one clock tick (trivially capturable), bucket 0.
+    uint32_t bucket = 0;
+    if (delta > 0) {
+      bucket = 31 - static_cast<uint32_t>(__builtin_clz(delta)) +
+               kGhostClockSampleShift;
+      if (bucket >= kGhostDistBuckets) {
+        bucket = kGhostDistBuckets - 1;
+      }
+    }
+    ghost_dist_hist_[level_index * kGhostDistBuckets + bucket].fetch_add(
+        1, std::memory_order_relaxed);
+    IncGhostHitCounter(level_index);
+    // Refresh the timestamp so the next repeat measures from this miss.
+    slot.store((uint64_t{tag} << 32) | now, std::memory_order_relaxed);
+    return;
+  }
+  // First-seen miss (or collision overwrite): timestamp the record,
+  // advancing the sampled clock on ~1/2^shift of keys. The middle hash bits
+  // drive the sampling decision (index uses the high bits, tag the low).
+  uint32_t now;
+  if (((fp >> 32) & ((uint32_t{1} << kGhostClockSampleShift) - 1)) == 0) {
+    now = static_cast<uint32_t>(ghost_miss_clock_[level_index].v.fetch_add(
+                                    1, std::memory_order_relaxed) +
+                                1);
+  } else {
+    now = static_cast<uint32_t>(
+        ghost_miss_clock_[level_index].v.load(std::memory_order_relaxed));
+  }
+  slot.store((uint64_t{tag} << 32) | now, std::memory_order_relaxed);
 }
 
 void MultiLevelCache::IncGhostHitCounter(size_t level_index) {
@@ -1649,6 +1727,15 @@ std::vector<uint64_t> MultiLevelCache::DrainGhostHits() {
   // thread (~2 MiB/level of relaxed stores); racing hot-path records are
   // benign (a fingerprint written mid-clear either survives or costs one
   // undercounted repeat).
+  //
+  // Segmented mode keeps the tables: the per-record miss-clock timestamp
+  // already makes the window uniform (a stale record just reports a long
+  // distance in a high bucket, which the capture-rate scorer correctly
+  // treats as beyond reach), and clearing would destroy exactly the
+  // long-distance signal the histogram exists to measure.
+  if (ghost_segmented_.load(std::memory_order_relaxed)) {
+    return result;
+  }
   const size_t slots =
       size_t{1} << ghost_slots_log2_.load(std::memory_order_relaxed);
   for (size_t level = 0; level < levels; ++level) {
@@ -1659,6 +1746,21 @@ std::vector<uint64_t> MultiLevelCache::DrainGhostHits() {
     for (size_t i = 0; i < slots; ++i) {
       table[i].store(0, std::memory_order_relaxed);
     }
+  }
+  return result;
+}
+
+std::vector<uint64_t> MultiLevelCache::DrainGhostDistanceHistogram() {
+  std::vector<uint64_t> result;
+  if (!ghost_tracking_enabled_.load(std::memory_order_relaxed) ||
+      !ghost_segmented_.load(std::memory_order_relaxed) ||
+      ghost_dist_hist_ == nullptr) {
+    return result;
+  }
+  const size_t levels = sub_caches_.size();
+  result.assign(levels * kGhostDistBuckets, 0);
+  for (size_t i = 0; i < levels * kGhostDistBuckets; ++i) {
+    result[i] = ghost_dist_hist_[i].exchange(0, std::memory_order_relaxed);
   }
   return result;
 }
