@@ -1417,6 +1417,58 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         }
       }
     }
+    // Usage-based excess (see usage_reclaim_margin in the header): capacity a
+    // level has persistently failed to FILL is dead regardless of its on-disk
+    // data size -- with cap > usage there is no eviction, so the slack earns
+    // zero hits. The persistence window distinguishes "still filling a step
+    // it just received" from "touched footprint reached, slack is dead".
+    if (options_.usage_reclaim_rounds > 0 &&
+        snapshot.usages.size() == level_count) {
+      if (usage_excess_rounds_.size() != level_count) {
+        usage_excess_rounds_.assign(level_count, 0);
+      }
+      for (size_t i = 0; i < level_count; ++i) {
+        const double usable_d =
+            static_cast<double>(snapshot.usages[i]) *
+            std::max(1.0, options_.usage_reclaim_margin);
+        size_t usable = usable_d < static_cast<double>(total_capacity)
+                            ? static_cast<size_t>(usable_d)
+                            : total_capacity;
+        usable = std::max({usable, floor_bytes[i],
+                           options_.usage_bootstrap_bytes});
+        // A level still FILLING its capacity is not holding dead slack: its
+        // usage grows every round until the touched footprint is reached.
+        // Reset the persistence counter while growth continues, so the
+        // effective window scales with the level's own fill rate (a 1%-
+        // traffic level fills a 64 MiB step over ~27 rounds; a fixed
+        // 12-round window would reclaim the step mid-fill and re-create the
+        // grow/reclaim oscillation this mechanism is meant to end).
+        const uint64_t prev_u =
+            prev_usages_.size() == level_count ? prev_usages_[i] : 0;
+        const bool still_filling =
+            snapshot.usages[i] >
+            prev_u + std::max<uint64_t>(
+                         1 << 20, (last_capacities_[i] > snapshot.usages[i]
+                                       ? last_capacities_[i] -
+                                             snapshot.usages[i]
+                                       : 0) /
+                                      50);
+        if (last_capacities_[i] > usable + (size_t{1} << 20) &&
+            !still_filling) {
+          ++usage_excess_rounds_[i];
+          if (usage_excess_rounds_[i] >= options_.usage_reclaim_rounds) {
+            const size_t ex = last_capacities_[i] - usable;
+            if (ex > excess_bytes) {
+              excess_bytes = ex;
+              excess_donor = i;
+            }
+          }
+        } else {
+          usage_excess_rounds_[i] = 0;
+        }
+      }
+      prev_usages_ = snapshot.usages;
+    }
     // Ignore sub-MiB slack (accounting noise).
     const bool structural_reclaim =
         excess_donor != level_count && excess_bytes >= (size_t{1} << 20);
@@ -1431,12 +1483,63 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         !structural_reclaim && options_.probe_after_skipped_rounds > 0 &&
         consecutive_gate_skips_ >= options_.probe_after_skipped_rounds;
 
+    if (kAllocDebug) {
+      // Full per-level decision state: score, capacity, growth ceiling,
+      // floor, and any active direction locks. This is the line to read when
+      // a level with a dominant score is mysteriously never selected.
+      std::string st;
+      char tmp[160];
+      for (size_t i = 0; i < level_count; ++i) {
+        snprintf(tmp, sizeof(tmp),
+                 " L%zu[s=%.3g c=%zu u=%zu ru=%zu fl=%zu d=%.0f dl=%lld "
+                 "rl=%lld ux=%u]",
+                 i, score[i], last_capacities_[i] >> 20,
+                 (snapshot.usages.size() == level_count ? snapshot.usages[i]
+                                                        : 0) >>
+                     20,
+                 recv_upper_bytes[i] >> 20, floor_bytes[i] >> 20,
+                 data[i] / (1 << 20),
+                 donated_lock_round_[i] > round_id_
+                     ? (long long)(donated_lock_round_[i] - round_id_)
+                     : 0LL,
+                 received_lock_round_[i] > round_id_
+                     ? (long long)(received_lock_round_[i] - round_id_)
+                     : 0LL,
+                 usage_excess_rounds_.size() == level_count
+                     ? usage_excess_rounds_[i]
+                     : 0);
+        st += tmp;
+      }
+      fprintf(stderr, "[mlc-alloc] round=%llu STATE%s\n",
+              (unsigned long long)round_id_, st.c_str());
+    }
+
+    // Usage growth gate (see usage_grow_headroom in the header): a level
+    // that has not filled the capacity it already holds cannot use more, so
+    // it is not a recipient until its usage catches up. Growth thereby
+    // tracks demonstrated demand, and lazily-growing levels lose nothing
+    // (their misses are admitted either way while cap > usage). The
+    // bootstrap exemption lets a fully-defunded level re-enter.
+    auto usage_gated = [&](size_t i) {
+      if (options_.usage_grow_headroom <= 0.0 ||
+          snapshot.usages.size() != level_count) {
+        return false;
+      }
+      if (last_capacities_[i] <= options_.usage_bootstrap_bytes) {
+        return false;
+      }
+      return static_cast<double>(last_capacities_[i]) >
+             static_cast<double>(snapshot.usages[i]) *
+                 options_.usage_grow_headroom;
+    };
+
     // --- Find recipient (highest score, has data, has room to grow) ---
     size_t recipient = level_count;
     double best_recv = -1.0;
     for (size_t i = 0; i < level_count; ++i) {
       if (structural_reclaim && i == excess_donor) continue;
       if (donated_lock_round_[i] > round_id_) continue;  // recent donor
+      if (usage_gated(i)) continue;  // has not filled what it holds
       if (data[i] > 0.0 && last_capacities_[i] < recv_upper_bytes[i] &&
           score[i] > best_recv) {
         best_recv = score[i];
@@ -1449,6 +1552,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       double best_data = 0.0;
       for (size_t i = 0; i < level_count; ++i) {
         if (i == excess_donor) continue;
+        if (usage_gated(i)) continue;
         if (data[i] > best_data && last_capacities_[i] < recv_upper_bytes[i]) {
           best_data = data[i];
           recipient = i;
@@ -1458,22 +1562,55 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     }
 
     // --- Find donor (lowest score, capacity above floor, not recipient) ---
+    //
+    // Two passes. Pass 1 considers only levels holding UNUSED capacity
+    // (cap > usage): donating slack evicts nothing, so it is always the
+    // cheapest source of bytes, and taking it first keeps a slowly-filling
+    // level's capacity tracking its usage instead of digging into its
+    // resident set (observed on wlC: score-driven donations drained a
+    // filling L3 through its warm set to 0, its starved score then exploded
+    // and the resulting refill/reversal cycle escalated the pair locks to
+    // ~90 rounds, freezing the allocator with L3 dead at 0 capacity). Pass 2
+    // (no slack anywhere) is the normal regime once the budget is fully
+    // utilized: the argmin-score FULL level donates and evicts its coldest
+    // blocks -- the intended marginal trade.
     size_t donor = level_count;
     double best_donor_score = kInfiniteScore;
     bool donor_found = false;
+    bool donor_slack_only = false;
     if (structural_reclaim) {
       donor = excess_donor;
       best_donor_score = score[donor];
       donor_found = true;
     } else {
-      for (size_t i = 0; i < level_count; ++i) {
-        if (i == recipient) continue;
-        if (received_lock_round_[i] > round_id_) continue;  // recent recipient
-        if (last_capacities_[i] <= floor_bytes[i]) continue;
-        if (!donor_found || score[i] < best_donor_score) {
-          best_donor_score = score[i];
-          donor = i;
-          donor_found = true;
+      const bool have_usage = snapshot.usages.size() == level_count;
+      if (have_usage) {
+        for (size_t i = 0; i < level_count; ++i) {
+          if (i == recipient) continue;
+          if (received_lock_round_[i] > round_id_) continue;
+          const size_t protected_bytes =
+              std::max(floor_bytes[i], static_cast<size_t>(snapshot.usages[i]));
+          if (last_capacities_[i] <= protected_bytes + (size_t{1} << 20)) {
+            continue;  // no meaningful slack
+          }
+          if (!donor_found || score[i] < best_donor_score) {
+            best_donor_score = score[i];
+            donor = i;
+            donor_found = true;
+            donor_slack_only = true;
+          }
+        }
+      }
+      if (!donor_found) {
+        for (size_t i = 0; i < level_count; ++i) {
+          if (i == recipient) continue;
+          if (received_lock_round_[i] > round_id_) continue;  // recent recipient
+          if (last_capacities_[i] <= floor_bytes[i]) continue;
+          if (!donor_found || score[i] < best_donor_score) {
+            best_donor_score = score[i];
+            donor = i;
+            donor_found = true;
+          }
         }
       }
     }
@@ -1667,6 +1804,16 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     if (structural_reclaim) {
       step = max_step;
       donor_avail = std::min(donor_avail, excess_bytes);
+    } else if (donor_slack_only &&
+               snapshot.usages.size() == level_count) {
+      // A slack donor only gives away its unused capacity; its resident set
+      // is untouched.
+      const size_t protected_bytes = std::max(
+          floor_bytes[donor], static_cast<size_t>(snapshot.usages[donor]));
+      donor_avail = std::min(
+          donor_avail, last_capacities_[donor] > protected_bytes
+                           ? last_capacities_[donor] - protected_bytes
+                           : 0);
     }
     const size_t recv_room =
         recv_upper_bytes[recipient] > last_capacities_[recipient]

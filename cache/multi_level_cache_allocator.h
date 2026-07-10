@@ -343,6 +343,43 @@ struct MultiLevelAllocationOptions {
   //    would have to claw back rounds later (see recv_upper_bytes in the
   //    allocator).
   double data_ema_beta = 0.3;
+  // 8. Usage-aware growth gate and reclaim. The data-size bounds above cap a
+  //    level at its ON-DISK footprint, but the binding constraint within a
+  //    run is the level's TOUCHED footprint: a cold level (~1% of traffic)
+  //    only ever inserts the distinct blocks it actually reads, so capacity
+  //    beyond its resident usage never fills and contributes exactly zero
+  //    hits (with cap > usage there is no eviction: every missed block is
+  //    admitted and stays, so hit ratio is identical whether the slack is 1
+  //    byte or 800 MiB). Measured on read-only wlC 100M at 2 GiB: L3 parked
+  //    at 541 MiB capacity / 165 MiB usage and L4 at 800/210 -- ~1 GiB
+  //    (half the budget) dead while fully-utilized L5/L6 starved, costing
+  //    ~5pt fg hit ratio vs HCC. The capture-rate score cannot see this:
+  //    it measures gain-from-growth on the uncached tail, which for a small
+  //    level is a step function (huge below the touched footprint, ~0
+  //    above), so score-driven transfers bang-bang around the boundary
+  //    instead of resting at it.
+  //
+  //    (a) Growth gate: a level whose capacity already exceeds
+  //        usage * usage_grow_headroom is not accepting more capacity until
+  //        it fills what it has (exempt below usage_bootstrap_bytes, so a
+  //        defunded level can bootstrap back). Capacity growth thereby
+  //        tracks demonstrated demand at the level's own fill rate, and a
+  //        lazily-growing level loses nothing (its misses are admitted
+  //        either way).
+  //    (b) Usage reclaim: capacity above
+  //        max(floor, usage * usage_reclaim_margin, usage_bootstrap_bytes)
+  //        sustained for usage_reclaim_rounds consecutive rounds is
+  //        structural excess (mandatory donor, same machinery as the
+  //        data-size reclaim). The persistence window lets a level that
+  //        just received a step fill it before the slack is judged dead;
+  //        the margin band between grow_headroom and reclaim_margin is the
+  //        hysteresis that gives a converged level a stable resting zone.
+  //    usage_grow_headroom <= 0 disables the gate;
+  //    usage_reclaim_rounds == 0 disables the reclaim.
+  double usage_grow_headroom = 1.25;
+  double usage_reclaim_margin = 1.3;
+  uint64_t usage_reclaim_rounds = 12;
+  size_t usage_bootstrap_bytes = 32 << 20;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -472,6 +509,12 @@ class MultiLevelCacheAllocator {
   bool accel_disabled_ = false;
   // EMA-smoothed per-level data sizes (see data_ema_beta).
   std::vector<double> data_ema_;
+  // Consecutive rounds each level's capacity has exceeded its usage-based
+  // usable bound (see usage_reclaim_rounds); reset whenever it does not.
+  std::vector<uint32_t> usage_excess_rounds_;
+  // Previous round's per-level usage, for the still-filling detection that
+  // holds the usage reclaim off while a level is actively absorbing a step.
+  std::vector<size_t> prev_usages_;
   // Total cache lookups (summed across levels) at the last op-gated round.
   // Used by BackgroundLoop to decide when adjust_interval_ops have elapsed.
   uint64_t last_round_lookups_ = 0;
