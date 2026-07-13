@@ -1329,14 +1329,20 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
               (1.0 - beta) * ghost_score_ema_[i] + beta * val;
           score[i] = ghost_score_ema_[i];
         }
-        // Realization credit cap (see score_credit_frac in the header): a
-        // full, meaningfully-funded level's marginal score cannot honestly
-        // exceed what its resident bytes measurably earn -- capture repeats
-        // whose blocks die to compaction churn before the re-access arrives
-        // are promises that never pay out. Cap applies to score[] only (the
-        // raw EMA keeps the undiscounted signal so the cap re-evaluates
-        // every round as density evolves).
-        if (options_.score_credit_frac > 0.0 && window_stats_available &&
+        // Realization credit band (see score_credit_frac /
+        // score_credit_floor_frac in the header): churn kills cache-key
+        // identity in both directions of the capture measurement. Cap: a
+        // full level's promised conversions whose blocks die before the
+        // re-access never pay out, so its score cannot honestly exceed what
+        // its resident bytes measurably earn. Floor: a high-churn level's
+        // genuine repeats never REGISTER (the key dies before the second
+        // miss), so a full level demonstrably earning hd per byte is
+        // credited at least floor_frac * hd regardless of what the ghost
+        // failed to see. Applies to score[] only (the raw EMA keeps the
+        // unadjusted signal so the band re-evaluates every round).
+        if ((options_.score_credit_frac > 0.0 ||
+             options_.score_credit_floor_frac > 0.0) &&
+            window_stats_available &&
             snapshot.usages.size() == level_count &&
             hit_density_ema_.size() == level_count) {
           for (size_t i = 0; i < level_count; ++i) {
@@ -1347,10 +1353,19 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                 0.9 * static_cast<double>(last_capacities_[i])) {
               continue;  // still filling; density lags potential
             }
-            const double cap =
-                options_.score_credit_frac * hit_density_ema_[i];
-            if (score[i] > cap) {
-              score[i] = cap;
+            if (options_.score_credit_frac > 0.0) {
+              const double cap =
+                  options_.score_credit_frac * hit_density_ema_[i];
+              if (score[i] > cap) {
+                score[i] = cap;
+              }
+            }
+            if (options_.score_credit_floor_frac > 0.0) {
+              const double floor =
+                  options_.score_credit_floor_frac * hit_density_ema_[i];
+              if (score[i] < floor) {
+                score[i] = floor;
+              }
             }
           }
         }

@@ -468,6 +468,29 @@ struct MultiLevelAllocationOptions {
   // level has nothing to prove yet). <= 0 disables.
   double score_credit_frac = 1.0;
   size_t score_credit_min_cap_bytes = 64 << 20;
+  // Density floor: the symmetric half of the credit cap, for the UNDER-
+  // reporting side of the same churn bias. A high-churn level's repeats
+  // never register in the ghost table at all -- the key dies (file
+  // rewritten by flush/compaction) before the second miss arrives, so the
+  // repeat appears as a first miss on a fresh key. On wlA, L0's capture
+  // score sat at ~7e-7 while its resident bytes measurably earned 1.7e-5
+  // hits/byte/window (24x more): the ghost simply cannot see through L0's
+  // key rotation, and the allocator drained the cache's best earner to 127
+  // MiB late in every long run. For an ELIGIBLE level (same guards as the
+  // cap: full, i.e. usage >= 90% of capacity, and holding at least
+  // score_credit_min_cap_bytes -- a level actively earning with every byte
+  // it has), the score is floored at
+  //   score_credit_floor_frac * hit_density_ema.
+  // The fraction discounts average to marginal (same rationale as
+  // donor_retention_frac); growth beyond genuine demand is bounded
+  // upstream by the sustained-data recv cap and the usage growth gate, and
+  // the floor is self-limiting: growing capacity dilutes density (hd =
+  // window hits / capacity), so an over-fed level's floor sinks on its
+  // own. Together with the cap, a proven level's effective score lives in
+  // [floor_frac, frac] * hd -- realized earnings dominate for funded
+  // levels while raw capture stays authoritative for starved ones (whose
+  // capacity is too small to measure density on). <= 0 disables.
+  double score_credit_floor_frac = 0.25;
 };
 
 // Periodically solves and applies multi-level cache capacities from
