@@ -1329,6 +1329,31 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
               (1.0 - beta) * ghost_score_ema_[i] + beta * val;
           score[i] = ghost_score_ema_[i];
         }
+        // Realization credit cap (see score_credit_frac in the header): a
+        // full, meaningfully-funded level's marginal score cannot honestly
+        // exceed what its resident bytes measurably earn -- capture repeats
+        // whose blocks die to compaction churn before the re-access arrives
+        // are promises that never pay out. Cap applies to score[] only (the
+        // raw EMA keeps the undiscounted signal so the cap re-evaluates
+        // every round as density evolves).
+        if (options_.score_credit_frac > 0.0 && window_stats_available &&
+            snapshot.usages.size() == level_count &&
+            hit_density_ema_.size() == level_count) {
+          for (size_t i = 0; i < level_count; ++i) {
+            if (last_capacities_[i] < options_.score_credit_min_cap_bytes) {
+              continue;
+            }
+            if (static_cast<double>(snapshot.usages[i]) <
+                0.9 * static_cast<double>(last_capacities_[i])) {
+              continue;  // still filling; density lags potential
+            }
+            const double cap =
+                options_.score_credit_frac * hit_density_ema_[i];
+            if (score[i] > cap) {
+              score[i] = cap;
+            }
+          }
+        }
         ghost_scored = true;
         capture_scored = true;
         if (kAllocDebug) {
@@ -1625,7 +1650,19 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     double best_recv = -1.0;
     for (size_t i = 0; i < level_count; ++i) {
       if (structural_reclaim && i == excess_donor) continue;
-      if (donated_lock_round_[i] > round_id_) continue;  // recent donor
+      // Recent-donor lock, EXCEPT for levels sitting at their floor. The
+      // lock exists to kill ping-pong (donate then immediately re-receive),
+      // but a floor-level has nothing left to ping with -- keeping it locked
+      // only freezes a starved level out of the receive side while its
+      // donated_lock keeps getting re-escalated by reversal hysteresis
+      // (observed on wlA: L5 held the TOP capture score for ~70 rounds while
+      // pinned at its 8 MiB floor with dl=39..48, so the budget settled in a
+      // run-dependent local optimum -- 812 MiB in L5 on one run, 8 MiB on
+      // the next -- costing ~3pt fg hit on the bad draws).
+      if (donated_lock_round_[i] > round_id_ &&
+          last_capacities_[i] > floor_bytes[i]) {
+        continue;  // recent donor
+      }
       if (usage_gated(i)) continue;  // has not filled what it holds
       if (data[i] > 0.0 && last_capacities_[i] < recv_upper_bytes[i] &&
           score[i] > best_recv) {

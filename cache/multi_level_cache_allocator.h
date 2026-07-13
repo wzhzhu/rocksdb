@@ -443,6 +443,31 @@ struct MultiLevelAllocationOptions {
   double usage_reclaim_margin = 1.3;
   uint64_t usage_reclaim_rounds = 12;
   size_t usage_bootstrap_bytes = 32 << 20;
+  // Realization credit cap for the capture-rate score. The capture score
+  // promises "each byte granted converts this many repeat misses per
+  // window", but the promise silently assumes the cached block SURVIVES
+  // until the predicted re-access. Under write-heavy compaction churn it
+  // often does not: the block's file is rewritten (new file number = new
+  // cache key) before the repeat arrives, so the hit never lands. The
+  // measured per-byte hit density of the level's resident bytes
+  // (hit_density_ema_, same hits/byte/window units) IS the realized
+  // earnings, and for a concave hit curve the marginal value of a new byte
+  // cannot exceed the average value of the bytes already held -- so a FULL
+  // level whose capture score exceeds its measured density is
+  // over-promising, and its score is capped at
+  //   score_credit_frac * hit_density_ema.
+  // Observed on wlA (50% writes) 2G t64: L5's capture score stayed ~2x
+  // above L0's (1.2e-6 vs 4.9e-7) while its resident bytes earned SIXTY
+  // times less (0.6K vs 41K hits/MB) -- compaction rewrote L5's files
+  // before the promised repeats arrived -- so 100M-op runs drifted to an
+  // L5-heavy allocation (759 MiB at run end) costing ~3pt fg hit vs the
+  // L0-heavy state short runs converge to. The cap only applies to levels
+  // that have had a fair chance to prove their earnings: capacity of at
+  // least score_credit_min_cap_bytes AND usage >= 90% of capacity (a
+  // still-filling level's density lags its potential; an under-bootstrap
+  // level has nothing to prove yet). <= 0 disables.
+  double score_credit_frac = 1.0;
+  size_t score_credit_min_cap_bytes = 64 << 20;
 };
 
 // Periodically solves and applies multi-level cache capacities from
