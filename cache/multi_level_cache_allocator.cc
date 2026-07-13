@@ -1231,6 +1231,14 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         }
         for (size_t i = 0; i < level_count; ++i) {
           double val = 0.0;
+          // Short-distance repeats on a level holding real capacity are
+          // concurrent duplicate misses (threads re-missing a block before
+          // the first miss's fill lands), which no amount of capacity
+          // converts; only a near-defunded level's short-distance repeats
+          // are genuine starvation signal. See ghost_inflight_dist_bytes.
+          const bool skip_inflight =
+              options_.ghost_inflight_dist_bytes > 0 &&
+              last_capacities_[i] >= options_.ghost_inflight_min_cap_bytes;
           for (size_t b = 0; b < kB; ++b) {
             const uint64_t cnt = hist[i * kB + b];
             if (cnt == 0) {
@@ -1247,6 +1255,11 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                           << (MultiLevelCache::kGhostClockSampleShift - 1))
                     : std::sqrt(2.0) *
                           static_cast<double>(uint64_t{1} << b);
+            if (skip_inflight &&
+                mid * block_bytes <=
+                    static_cast<double>(options_.ghost_inflight_dist_bytes)) {
+              continue;
+            }
             val += static_cast<double>(cnt) / (mid * block_bytes);
           }
           // Same EMA smoothing as the plain ghost path (per-window
@@ -1383,6 +1396,39 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       }
     }
 
+    // Donor retention cost (capture-rate mode): per-byte hit density of
+    // each level's resident bytes this window, in the same units as the
+    // capture score (hits/byte/window). This is the measurable shrink-side
+    // marginal the growth-only capture score lacks: a fully-fed level
+    // scores ~0 as a recipient (correct) but its resident bytes may be the
+    // densest hit earners in the cache, so it must NOT be the argmin-score
+    // donor. See donor_retention_frac.
+    const bool retention_available =
+        capture_scored && options_.donor_retention_frac > 0.0 &&
+        snapshot.fg_hits.size() == level_count;
+    if (retention_available) {
+      if (prev_fg_hits_.size() != level_count) {
+        prev_fg_hits_ = snapshot.fg_hits;
+      }
+      if (hit_density_ema_.size() != level_count) {
+        hit_density_ema_.assign(level_count, 0.0);
+      }
+      const double beta = (options_.ghost_score_ema_beta > 0.0 &&
+                           options_.ghost_score_ema_beta < 1.0)
+                              ? options_.ghost_score_ema_beta
+                              : 1.0;
+      for (size_t i = 0; i < level_count; ++i) {
+        const uint64_t delta = snapshot.fg_hits[i] >= prev_fg_hits_[i]
+                                   ? snapshot.fg_hits[i] - prev_fg_hits_[i]
+                                   : 0;
+        const double cap_bytes = static_cast<double>(
+            std::max<size_t>(last_capacities_[i], size_t{1} << 20));
+        hit_density_ema_[i] = (1.0 - beta) * hit_density_ema_[i] +
+                              beta * static_cast<double>(delta) / cap_bytes;
+      }
+      prev_fg_hits_ = snapshot.fg_hits;
+    }
+
     // Direction locks (steady-state suppression #2): a recent recipient may
     // not donate and a recent donor may not receive, killing ping-pong
     // transfers (observed: L3->L0 then L0->L5 within 50 rounds) regardless
@@ -1491,9 +1537,12 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       char tmp[160];
       for (size_t i = 0; i < level_count; ++i) {
         snprintf(tmp, sizeof(tmp),
-                 " L%zu[s=%.3g c=%zu u=%zu ru=%zu fl=%zu d=%.0f dl=%lld "
-                 "rl=%lld ux=%u]",
-                 i, score[i], last_capacities_[i] >> 20,
+                 " L%zu[s=%.3g hd=%.3g c=%zu u=%zu ru=%zu fl=%zu d=%.0f "
+                 "dl=%lld rl=%lld ux=%u]",
+                 i, score[i],
+                 hit_density_ema_.size() == level_count ? hit_density_ema_[i]
+                                                        : 0.0,
+                 last_capacities_[i] >> 20,
                  (snapshot.usages.size() == level_count ? snapshot.usages[i]
                                                         : 0) >>
                      20,
@@ -1602,11 +1651,21 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         }
       }
       if (!donor_found) {
+        // Full-level donors evict resident data, so rank them by what
+        // those bytes EARN (retention density), not by their capture
+        // score: the capture score measures growth value only, and a
+        // fully-fed level's ~0 score would otherwise mark the densest
+        // hit earner in the cache as the cheapest donor (observed on wlD:
+        // fully-cached L3 at 0.95 hit drained to zero this way).
+        double best_donor_cost = 0.0;
         for (size_t i = 0; i < level_count; ++i) {
           if (i == recipient) continue;
           if (received_lock_round_[i] > round_id_) continue;  // recent recipient
           if (last_capacities_[i] <= floor_bytes[i]) continue;
-          if (!donor_found || score[i] < best_donor_score) {
+          const double cost =
+              retention_available ? hit_density_ema_[i] : score[i];
+          if (!donor_found || cost < best_donor_cost) {
+            best_donor_cost = cost;
             best_donor_score = score[i];
             donor = i;
             donor_found = true;
@@ -1720,6 +1779,21 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         do_skip_step("insignificant", /*gate_skip=*/true);
         return Status::OK();
       }
+    }
+
+    // Donor retention gate: a full-level donor's coldest bytes are evicted
+    // by the transfer, so the recipient's measured per-byte gain must beat
+    // a discounted fraction of the donor's measured per-byte earnings
+    // (mean density discounted to marginal; see donor_retention_frac).
+    // Applies to probe transfers too -- a probe exists to unfreeze stuck
+    // gates, not to bleed a protected donor -- but not to structural
+    // reclaims (dead capacity earns nothing) or slack donors (nothing is
+    // evicted).
+    if (!structural_reclaim && !donor_slack_only && retention_available &&
+        best_recv <=
+            options_.donor_retention_frac * hit_density_ema_[donor]) {
+      do_skip_step("donor_protected", /*gate_skip=*/false);
+      return Status::OK();
     }
 
     // --- Reversal hysteresis (steady-state suppression #5) ---

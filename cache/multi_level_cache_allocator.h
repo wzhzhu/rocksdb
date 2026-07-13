@@ -253,6 +253,47 @@ struct MultiLevelAllocationOptions {
   // (uncompressed block-cache charge); only the RELATIVE score across
   // levels matters, so a uniform constant is sufficient.
   size_t ghost_dist_block_bytes = 4096;
+  // In-flight duplicate-miss filter for the capture-rate score. Repeats at
+  // short reuse distance cannot be capacity starvation for a level holding
+  // real capacity: the first miss's fill would serve the re-access. They
+  // are concurrent threads missing the same block before the first fill
+  // lands -- an artifact that scales with thread count and I/O queueing
+  // depth, not with capacity pressure. Measured on wlD t128 the artifact
+  // was ~100% of the coldest levels' capture score (bucket 0 alone
+  // contributed 5e-4 hits/byte to L6 vs 5e-8 from its genuine
+  // far-distance buckets, and under deep queueing the overlap window
+  // stretched into the 256 KiB - 2 MiB buckets), which made the coldest
+  // levels read as the hungriest, drained the true hot level (L3: 60% of
+  // traffic, capable of 0.95 hit) to zero, and collapsed fg hit ratio
+  // 0.67 -> 0.45 at t128 while t32 (fewer overlapping misses) converged
+  // fine. Buckets whose mid distance is at or below
+  // ghost_inflight_dist_bytes are therefore discarded -- but only for
+  // levels holding at least ghost_inflight_min_cap_bytes of capacity: a
+  // genuinely defunded level's short-distance repeats ARE starvation
+  // signal and must keep counting. Set dist to 0 to disable the filter.
+  size_t ghost_inflight_dist_bytes = 2 << 20;
+  size_t ghost_inflight_min_cap_bytes = 8 << 20;
+  // Donor retention cost for capture-rate mode. The capture score measures
+  // only the marginal value of GROWING a level; a fully-fed level's score
+  // is correctly ~0 (its misses are all converted), but argmin-score donor
+  // selection then reads exactly that level as the cheapest source of
+  // bytes -- draining the highest-hit-density level in the cache to feed
+  // marginal recipients (observed on wlD: fully-cached L3 at 0.95 hit and
+  // ~324 hits/MB/window drained to zero to feed L4/L6, then frozen at zero
+  // by the escalated reversal locks). The shrink cost of a FULL level is
+  // what its resident bytes currently earn, which is directly measurable:
+  //   density_i = window_fg_hits_i / capacity_i  (hits/byte/window)
+  // -- the same units as the capture score, so recipient gain and donor
+  // loss compare directly. Full-level donors are selected by argmin
+  // density, and a transfer requires
+  //   recipient_capture_score > donor_retention_frac * donor_density.
+  // The fraction discounts mean density to marginal: clock eviction takes
+  // the donor's coldest bytes, which earn far less than its average byte
+  // (zipfian concentration), so requiring the recipient to beat the full
+  // mean would over-protect donors and freeze legitimate rebalancing.
+  // Slack donors (cap > usage) evict nothing and bypass the gate. 0
+  // disables both the density selection and the gate.
+  double donor_retention_frac = 0.2;
 
   // --- Steady-state suppression (incremental mode) ---
   // Observed pathology on write-heavy steady state (wlA, 100M ops): ghost
@@ -493,6 +534,11 @@ class MultiLevelCacheAllocator {
   std::vector<double> ghost_score_ema_;
   std::vector<uint64_t> received_lock_round_;
   std::vector<uint64_t> donated_lock_round_;
+  // Donor retention cost state (capture-rate mode): previous cumulative
+  // per-level fg hits (for per-round deltas) and the EMA-smoothed per-byte
+  // hit density. See donor_retention_frac.
+  std::vector<uint64_t> prev_fg_hits_;
+  std::vector<double> hit_density_ema_;
   // Consecutive rounds skipped by the steady-state gates; when it reaches
   // probe_after_skipped_rounds, the next round runs as a probe transfer.
   uint64_t consecutive_gate_skips_ = 0;
