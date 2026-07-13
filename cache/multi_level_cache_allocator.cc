@@ -1198,6 +1198,52 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     std::vector<double> score(level_count, 0.0);
     bool ghost_scored = false;
     bool capture_scored = false;
+
+    // Window fg stats: per-round deltas of the cumulative fg counters,
+    // EMA-smoothed into (a) per-byte hit density -- the donor retention
+    // cost, same hits/byte/window units as the capture score -- and
+    // (b) window hit rate, which drives reuse-distance decompression in
+    // the capture scorer. Computed before scoring so the current round's
+    // scores see the current window.
+    const bool window_stats_available =
+        snapshot.fg_hits.size() == level_count &&
+        snapshot.fg_lookups.size() == level_count;
+    if (window_stats_available) {
+      if (prev_fg_hits_.size() != level_count) {
+        prev_fg_hits_ = snapshot.fg_hits;
+        prev_fg_lookups_ = snapshot.fg_lookups;
+      }
+      if (hit_density_ema_.size() != level_count) {
+        hit_density_ema_.assign(level_count, 0.0);
+        hit_rate_ema_.assign(level_count, 0.0);
+      }
+      const double beta = (options_.ghost_score_ema_beta > 0.0 &&
+                           options_.ghost_score_ema_beta < 1.0)
+                              ? options_.ghost_score_ema_beta
+                              : 1.0;
+      for (size_t i = 0; i < level_count; ++i) {
+        const uint64_t dh = snapshot.fg_hits[i] >= prev_fg_hits_[i]
+                                ? snapshot.fg_hits[i] - prev_fg_hits_[i]
+                                : 0;
+        const uint64_t dl = snapshot.fg_lookups[i] >= prev_fg_lookups_[i]
+                                ? snapshot.fg_lookups[i] - prev_fg_lookups_[i]
+                                : 0;
+        const double cap_bytes = static_cast<double>(
+            std::max<size_t>(last_capacities_[i], size_t{1} << 20));
+        hit_density_ema_[i] = (1.0 - beta) * hit_density_ema_[i] +
+                              beta * static_cast<double>(dh) / cap_bytes;
+        // Levels with no window traffic keep their previous rate estimate
+        // (a 0/0 window says nothing about the hit curve).
+        if (dl > 0) {
+          hit_rate_ema_[i] =
+              (1.0 - beta) * hit_rate_ema_[i] +
+              beta * static_cast<double>(dh) / static_cast<double>(dl);
+        }
+      }
+      prev_fg_hits_ = snapshot.fg_hits;
+      prev_fg_lookups_ = snapshot.fg_lookups;
+    }
+
     if (options_.use_ghost_marginal && options_.use_ghost_capture_rate) {
       // --- Capture-rate score: measured per-byte marginal utility ---
       // A repeat miss at reuse distance d (distinct missed blocks between
@@ -1239,6 +1285,18 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           const bool skip_inflight =
               options_.ghost_inflight_dist_bytes > 0 &&
               last_capacities_[i] >= options_.ghost_inflight_min_cap_bytes;
+          // Distances are measured in distinct MISSED blocks; the capacity
+          // needed to capture a repeat scales with distinct ACCESSED
+          // blocks, larger by ~1/(1-h). Without this, high-hit levels'
+          // scores are inflated by the same factor (up to 4x at h=0.75).
+          // See ghost_dist_decompress_max.
+          double decompress = 1.0;
+          if (options_.ghost_dist_decompress_max > 1.0 &&
+              window_stats_available) {
+            decompress = std::min(
+                options_.ghost_dist_decompress_max,
+                1.0 / std::max(0.05, 1.0 - hit_rate_ema_[i]));
+          }
           for (size_t b = 0; b < kB; ++b) {
             const uint64_t cnt = hist[i * kB + b];
             if (cnt == 0) {
@@ -1255,12 +1313,15 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                           << (MultiLevelCache::kGhostClockSampleShift - 1))
                     : std::sqrt(2.0) *
                           static_cast<double>(uint64_t{1} << b);
+            // In-flight filtering uses the RAW measured distance: the
+            // overlap window is itself measured in missed blocks, so it
+            // must not be decompressed. Only the capacity-value weight is.
             if (skip_inflight &&
                 mid * block_bytes <=
                     static_cast<double>(options_.ghost_inflight_dist_bytes)) {
               continue;
             }
-            val += static_cast<double>(cnt) / (mid * block_bytes);
+            val += static_cast<double>(cnt) / (mid * decompress * block_bytes);
           }
           // Same EMA smoothing as the plain ghost path (per-window
           // histograms carry the same Poisson/compaction-burst noise).
@@ -1396,38 +1457,15 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       }
     }
 
-    // Donor retention cost (capture-rate mode): per-byte hit density of
-    // each level's resident bytes this window, in the same units as the
-    // capture score (hits/byte/window). This is the measurable shrink-side
-    // marginal the growth-only capture score lacks: a fully-fed level
-    // scores ~0 as a recipient (correct) but its resident bytes may be the
-    // densest hit earners in the cache, so it must NOT be the argmin-score
-    // donor. See donor_retention_frac.
-    const bool retention_available =
-        capture_scored && options_.donor_retention_frac > 0.0 &&
-        snapshot.fg_hits.size() == level_count;
-    if (retention_available) {
-      if (prev_fg_hits_.size() != level_count) {
-        prev_fg_hits_ = snapshot.fg_hits;
-      }
-      if (hit_density_ema_.size() != level_count) {
-        hit_density_ema_.assign(level_count, 0.0);
-      }
-      const double beta = (options_.ghost_score_ema_beta > 0.0 &&
-                           options_.ghost_score_ema_beta < 1.0)
-                              ? options_.ghost_score_ema_beta
-                              : 1.0;
-      for (size_t i = 0; i < level_count; ++i) {
-        const uint64_t delta = snapshot.fg_hits[i] >= prev_fg_hits_[i]
-                                   ? snapshot.fg_hits[i] - prev_fg_hits_[i]
-                                   : 0;
-        const double cap_bytes = static_cast<double>(
-            std::max<size_t>(last_capacities_[i], size_t{1} << 20));
-        hit_density_ema_[i] = (1.0 - beta) * hit_density_ema_[i] +
-                              beta * static_cast<double>(delta) / cap_bytes;
-      }
-      prev_fg_hits_ = snapshot.fg_hits;
-    }
+    // Donor retention cost (capture-rate mode): the per-byte hit density
+    // computed above is the measurable shrink-side marginal the
+    // growth-only capture score lacks -- a fully-fed level scores ~0 as a
+    // recipient (correct) but its resident bytes may be the densest hit
+    // earners in the cache, so it must NOT be the argmin-score donor. See
+    // donor_retention_frac.
+    const bool retention_available = capture_scored &&
+                                     options_.donor_retention_frac > 0.0 &&
+                                     window_stats_available;
 
     // Direction locks (steady-state suppression #2): a recent recipient may
     // not donate and a recent donor may not receive, killing ping-pong

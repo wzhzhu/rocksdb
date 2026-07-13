@@ -253,6 +253,28 @@ struct MultiLevelAllocationOptions {
   // (uncompressed block-cache charge); only the RELATIVE score across
   // levels matters, so a uniform constant is sufficient.
   size_t ghost_dist_block_bytes = 4096;
+  // Reuse-distance decompression. Histogram distances are counted in
+  // distinct MISSED blocks, but the capacity needed to capture a repeat is
+  // set by the distinct ACCESSED blocks in between -- of which a fraction h
+  // (the level's hit rate) never reached the miss stream. The measured
+  // distance therefore understates the true one by a factor ~(1-h), which
+  // systematically INFLATES the capture scores of high-hit levels: at
+  // h=0.75 a repeat's per-byte value reads 4x its true worth. On wlB
+  // (zipfian spread over the whole keyspace, hot mass physically in L6)
+  // this bias over-funded the mid levels: L4 held 833 MiB earning
+  // 1.36 hits/MiB while L6 -- 60% of foreground traffic, earning
+  // 6.3 hits/MiB -- was starved at 564 MiB, a large part of the -11pt fg
+  // hit gap vs HCC at 2G t64. Each bucket's mid distance is multiplied by
+  // min(this cap, 1/(1-h_window)) with h_window the level's EMA-smoothed
+  // window fg hit rate. The cap bounds the correction where h -> 1
+  // (a fully-fed level's residual misses give a noisy h estimate, and its
+  // score is heading to 0 anyway). <= 1 disables decompression.
+  // Default OFF: measured neutral on wlB 2G t64 (0.275 vs 0.277) and
+  // wlD 2G t128 (0.699 vs 0.702) once the donor retention gate is active
+  // -- the gate already blocks the trades this bias would mis-rank, so
+  // the correction adds an unvalidated variable without measured benefit.
+  // Kept as an option for ablation.
+  double ghost_dist_decompress_max = 1.0;
   // In-flight duplicate-miss filter for the capture-rate score. Repeats at
   // short reuse distance cannot be capacity starvation for a level holding
   // real capacity: the first miss's fill would serve the re-access. They
@@ -534,11 +556,15 @@ class MultiLevelCacheAllocator {
   std::vector<double> ghost_score_ema_;
   std::vector<uint64_t> received_lock_round_;
   std::vector<uint64_t> donated_lock_round_;
-  // Donor retention cost state (capture-rate mode): previous cumulative
-  // per-level fg hits (for per-round deltas) and the EMA-smoothed per-byte
-  // hit density. See donor_retention_frac.
+  // Window fg stats (capture-rate mode): previous cumulative per-level fg
+  // hits/lookups (for per-round deltas), the EMA-smoothed per-byte hit
+  // density (donor retention cost, see donor_retention_frac), and the
+  // EMA-smoothed window hit rate (distance decompression, see
+  // ghost_dist_decompress_max).
   std::vector<uint64_t> prev_fg_hits_;
+  std::vector<uint64_t> prev_fg_lookups_;
   std::vector<double> hit_density_ema_;
+  std::vector<double> hit_rate_ema_;
   // Consecutive rounds skipped by the steady-state gates; when it reaches
   // probe_after_skipped_rounds, the next round runs as a probe transfer.
   uint64_t consecutive_gate_skips_ = 0;

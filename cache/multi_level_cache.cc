@@ -325,8 +325,11 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
       working_set_tracking_enabled_.load(std::memory_order_relaxed)) {
     RecordForegroundWorkingSet(level_index, base_key);
   }
-  IncLookupCounter(level_index);
-  if (!is_compaction) {
+  // One striped RMW per lookup: the counter arrays are split by origin and
+  // totals are derived at read time.
+  if (is_compaction) {
+    IncCompLookupCounter(level_index);
+  } else {
     IncFgLookupCounter(level_index);
   }
   Cache* level_cache = SubCacheByLevel(level_index);
@@ -363,8 +366,9 @@ Cache::Handle* MultiLevelCache::Lookup(const Slice& key,
     shared_pool_hits_.fetch_add(1, std::memory_order_relaxed);
     owner_cache = SharedCache();
   }
-  IncHitCounter(level_index);
-  if (!is_compaction) {
+  if (is_compaction) {
+    IncCompHitCounter(level_index);
+  } else {
     IncFgHitCounter(level_index);
   }
   return WrapOrPassHandle(owner_cache, inner);
@@ -410,21 +414,24 @@ void MultiLevelCache::Erase(const Slice& key) {
   }
 }
 
-void MultiLevelCache::IncLookupCounter(size_t level_index) {
-  lookups_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() +
-           level_index]
+void MultiLevelCache::IncCompLookupCounter(size_t level_index) {
+  comp_lookups_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() +
+                level_index]
       .v.fetch_add(1, std::memory_order_relaxed);
 }
 
-void MultiLevelCache::IncHitCounter(size_t level_index) {
-  hits_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() + level_index]
+void MultiLevelCache::IncCompHitCounter(size_t level_index) {
+  comp_hits_[CounterStripeIndex(kCounterStripes) * sub_caches_.size() +
+             level_index]
       .v.fetch_add(1, std::memory_order_relaxed);
 }
 
 uint64_t MultiLevelCache::SumLookupCounter(size_t level_index) const {
   uint64_t sum = 0;
   for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
-    sum += lookups_[stripe * sub_caches_.size() + level_index].v.load(
+    sum += comp_lookups_[stripe * sub_caches_.size() + level_index].v.load(
+        std::memory_order_relaxed);
+    sum += fg_lookups_[stripe * sub_caches_.size() + level_index].v.load(
         std::memory_order_relaxed);
   }
   return sum;
@@ -433,7 +440,9 @@ uint64_t MultiLevelCache::SumLookupCounter(size_t level_index) const {
 uint64_t MultiLevelCache::SumHitCounter(size_t level_index) const {
   uint64_t sum = 0;
   for (size_t stripe = 0; stripe < kCounterStripes; ++stripe) {
-    sum += hits_[stripe * sub_caches_.size() + level_index].v.load(
+    sum += comp_hits_[stripe * sub_caches_.size() + level_index].v.load(
+        std::memory_order_relaxed);
+    sum += fg_hits_[stripe * sub_caches_.size() + level_index].v.load(
         std::memory_order_relaxed);
   }
   return sum;
@@ -736,8 +745,10 @@ std::string MultiLevelCache::PrintStats() const {
 void MultiLevelCache::ResetStats() {
   const size_t counter_count = kCounterStripes * sub_caches_.size();
   for (size_t i = 0; i < counter_count; ++i) {
-    lookups_[i].v.store(0, std::memory_order_relaxed);
-    hits_[i].v.store(0, std::memory_order_relaxed);
+    comp_lookups_[i].v.store(0, std::memory_order_relaxed);
+    comp_hits_[i].v.store(0, std::memory_order_relaxed);
+    fg_lookups_[i].v.store(0, std::memory_order_relaxed);
+    fg_hits_[i].v.store(0, std::memory_order_relaxed);
   }
   insert_route_queries_.store(0, std::memory_order_relaxed);
   insert_route_parse_failures_.store(0, std::memory_order_relaxed);
@@ -1079,6 +1090,24 @@ Cache* MultiLevelCache::FindHandleOwner(const void* handle_addr) const {
     return nullptr;
   }
   const uintptr_t addr = reinterpret_cast<uintptr_t>(handle_addr);
+  // Last-hit memo: this runs twice per cache hit (handle wrap + release
+  // resolve) over ~levels*shards ranges, and consecutive lookups cluster
+  // heavily on one level's shard (L6 typically carries most traffic), so
+  // the previous range answers most probes. Keyed on the snapshot pointer:
+  // if it matches the currently published one the snapshot is alive and
+  // the memoized index is valid; any rebuild publishes a new pointer and
+  // misses the memo.
+  struct RangeMemo {
+    const void* snapshot = nullptr;
+    size_t idx = 0;
+  };
+  static thread_local RangeMemo memo;
+  if (memo.snapshot == ranges && memo.idx < ranges->size()) {
+    const HandleOwnerRange& r = (*ranges)[memo.idx];
+    if (r.begin <= addr && addr < r.end) {
+      return r.owner;
+    }
+  }
   // Binary search over at most (levels + 1 + retired) * shards ranges.
   size_t lo = 0;
   size_t hi = ranges->size();
@@ -1094,7 +1123,12 @@ Cache* MultiLevelCache::FindHandleOwner(const void* handle_addr) const {
     return nullptr;
   }
   const HandleOwnerRange& range = (*ranges)[lo - 1];
-  return addr < range.end ? range.owner : nullptr;
+  if (addr < range.end) {
+    memo.snapshot = ranges;
+    memo.idx = lo - 1;
+    return range.owner;
+  }
+  return nullptr;
 }
 
 Cache::Handle* MultiLevelCache::WrapOrPassHandle(Cache* owner_cache,
@@ -2021,8 +2055,9 @@ void MultiLevelCache::InitializePerLevelState(size_t level_count) {
                               std::memory_order_release);
   }
   // Value-initialized: all stripes start at zero.
-  lookups_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
-  hits_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
+  comp_lookups_ =
+      std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
+  comp_hits_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
   fg_lookups_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
   fg_hits_ = std::make_unique<StripedCounter[]>(kCounterStripes * level_count);
   level_data_sizes_.resize(level_count);

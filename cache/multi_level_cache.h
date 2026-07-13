@@ -350,13 +350,18 @@ class MultiLevelCache : public Cache {
   // one level typically receives ~90% of traffic (L6 after full compaction),
   // and a single atomic pair would be contended by all client threads.
   // Indexed [stripe * level_count + level]; readers sum across stripes.
-  static constexpr size_t kCounterStripes = 16;
+  // 64 stripes so that at 128 client threads only ~2 threads share a
+  // stripe's cache line (at 16, 8-way sharing made the 2-4 relaxed
+  // fetch_adds per lookup a measurable contention source). Memory cost is
+  // ~100 KiB across all counter arrays at 7 levels.
+  static constexpr size_t kCounterStripes = 64;
   struct alignas(64) StripedCounter {
     std::atomic<uint64_t> v{0};
   };
 
-  void IncLookupCounter(size_t level_index);
-  void IncHitCounter(size_t level_index);
+  void IncCompLookupCounter(size_t level_index);
+  void IncCompHitCounter(size_t level_index);
+  // Totals (fg + compaction), derived at read time.
   uint64_t SumLookupCounter(size_t level_index) const;
   uint64_t SumHitCounter(size_t level_index) const;
   void IncFgLookupCounter(size_t level_index);
@@ -411,8 +416,13 @@ class MultiLevelCache : public Cache {
   // loaded the old pointer finish within microseconds).
   std::vector<std::pair<uint64_t, std::unique_ptr<const std::vector<HandleOwnerRange>>>>
       retired_ranges_;
-  std::unique_ptr<StripedCounter[]> lookups_;
-  std::unique_ptr<StripedCounter[]> hits_;
+  // Hot-path counters are split by origin (foreground vs compaction) so
+  // each Lookup pays exactly ONE striped fetch_add instead of two (totals
+  // + fg); "total" views are derived as fg + comp at read time. Profiled
+  // on wlC 1G t64: the redundant totals increment alone was ~0.7% of
+  // cycles.
+  std::unique_ptr<StripedCounter[]> comp_lookups_;
+  std::unique_ptr<StripedCounter[]> comp_hits_;
   std::unique_ptr<StripedCounter[]> fg_lookups_;
   std::unique_ptr<StripedCounter[]> fg_hits_;
   std::deque<std::atomic<uint64_t>> level_data_sizes_;
