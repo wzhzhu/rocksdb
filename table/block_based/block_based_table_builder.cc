@@ -9,6 +9,8 @@
 
 #include "table/block_based/block_based_table_builder.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdio>
@@ -25,6 +27,7 @@
 #include "cache/cache_helpers.h"
 #include "cache/cache_key.h"
 #include "cache/cache_reservation_manager.h"
+#include "cache/multi_level_cache.h"
 #include "db/dbformat.h"
 #include "index_builder.h"
 #include "logging/logging.h"
@@ -940,6 +943,11 @@ struct BlockBasedTableBuilder::Rep {
   std::unique_ptr<FilterBlockBuilder> filter_builder;
   OffsetableCacheKey base_cache_key;
   const TableFileCreationReason reason;
+  // LSM level this file is being created at (0 for flush, N for a compaction
+  // output to level N; meaningless for kMisc). Needed by the warm-cache path:
+  // MultiLevelCache routes inserts by a level tag appended to the cache key,
+  // and without it every prepopulated block would land in the L0 sub-cache.
+  const int level_at_creation;
   const bool target_file_size_is_upper_bound;
 
   BlockHandle pending_handle;  // Handle to add to index block
@@ -1087,6 +1095,7 @@ struct BlockBasedTableBuilder::Rep {
         use_delta_encoding_for_index_values(table_opt.format_version >= 4 &&
                                             !table_opt.block_align),
         reason(tbo.reason),
+        level_at_creation(tbo.level_at_creation),
         target_file_size_is_upper_bound(
             tbo.moptions.target_file_size_is_upper_bound),
         flush_block_policy(
@@ -2334,13 +2343,29 @@ Status BlockBasedTableBuilder::InsertBlockInCacheHelper(
       GetCacheItemHelper(block_type, rep_->ioptions.lowest_used_cache_tier);
   if (block_cache && helper && helper->create_cb) {
     CacheKey key = BlockBasedTable::GetCacheKey(rep_->base_cache_key, *handle);
+    // Under MultiLevelCache the READER always looks blocks up with a
+    // level-tagged extended key, and MLC routes by that tag (stripping it
+    // before touching the sub-cache). Warm inserts must therefore carry the
+    // same tag: an untagged key falls back to L0 routing, which is only
+    // accidentally correct for flush output and lands every compaction-warmed
+    // block in the wrong sub-cache (never found by reader lookups, and pure
+    // garbage charged against L0's budget).
+    Slice insert_key = key.AsSlice();
+    std::array<char, kExtendedCacheKeySize> extended_key_buf{};
+    if (block_cache->CheckedCast<MultiLevelCache>() != nullptr &&
+        IsCacheKeyLevelEncodable(rep_->level_at_creation)) {
+      std::copy_n(insert_key.data(), kCacheKeySize, extended_key_buf.data());
+      extended_key_buf[kCacheKeySize] =
+          static_cast<char>(EncodeCacheKeyLevelTag(rep_->level_at_creation));
+      insert_key = Slice(extended_key_buf.data(), kExtendedCacheKeySize);
+    }
     size_t charge;
     // NOTE: data blocks (and everything else) will be warmed in decompressed
     // state, so does not need a dictionary-aware decompressor. The only thing
     // needing a decompressor here (in create_context) is warming the
     // (de)compression dictionary, which will clone and save a dict-based
     // decompressor from the corresponding non-dict decompressor.
-    s = WarmInCache(block_cache, key.AsSlice(), block_contents,
+    s = WarmInCache(block_cache, insert_key, block_contents,
                     &rep_->create_context, helper,
                     rep_->warm_cache_config.priority, &charge);
     if (LIKELY(s.ok())) {

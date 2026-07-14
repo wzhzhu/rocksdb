@@ -834,12 +834,14 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
   std::vector<double> data;
   std::vector<double> alpha;
   uint64_t l0_file_count = 0;
+  uint64_t stall_micros_cum = 0;
   std::vector<size_t> target_capacities;
   if (options_.mode == MultiLevelAllocatorMode::kBaselineEmulation) {
     target_capacities.assign(level_count, 0);
     target_capacities[0] = total_capacity;
   } else {
-    if (!provider_(&lambda, &data, &alpha, &l0_file_count)) {
+    if (!provider_(&lambda, &data, &alpha, &l0_file_count,
+                   &stall_micros_cum)) {
       prev_data_sizes_ = snapshot.data_sizes;
       prev_lookups_ = snapshot.lookups;
       prev_hits_ = snapshot.hits;
@@ -1244,6 +1246,96 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       prev_fg_lookups_ = snapshot.fg_lookups;
     }
 
+    // Compaction-value inputs (see comp_value_weight in the header).
+    // (a) Stall-intensity weight: differentiate the cumulative DB stall
+    //     micros against wall time, EMA-smooth, normalize by
+    //     stall_weight_ref, clamp to [0,1]. First round only primes.
+    // (b) Per-level compaction miss/hit densities: comp = total - fg
+    //     deltas, per byte of the level's DATA (compaction reads every
+    //     live block once per merge, so per-byte value is linear in the
+    //     level's merge frequency, not concentrated like fg reuse).
+    double stall_w = 0.0;
+    const bool comp_stats_available =
+        options_.comp_value_weight > 0.0 && window_stats_available &&
+        snapshot.lookups.size() == level_count &&
+        snapshot.hits.size() == level_count;
+    if (comp_stats_available) {
+      const uint64_t now_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+      const double beta = (options_.ghost_score_ema_beta > 0.0 &&
+                           options_.ghost_score_ema_beta < 1.0)
+                              ? options_.ghost_score_ema_beta
+                              : 1.0;
+      if (!stall_window_primed_) {
+        stall_window_primed_ = true;
+      } else if (now_us > prev_stall_wall_micros_ &&
+                 stall_micros_cum >= prev_stall_micros_) {
+        const double intensity =
+            static_cast<double>(stall_micros_cum - prev_stall_micros_) /
+            static_cast<double>(now_us - prev_stall_wall_micros_);
+        stall_weight_ema_ =
+            (1.0 - beta) * stall_weight_ema_ + beta * intensity;
+      }
+      prev_stall_micros_ = stall_micros_cum;
+      prev_stall_wall_micros_ = now_us;
+      if (options_.stall_weight_ref > 0.0) {
+        stall_w = std::min(1.0, stall_weight_ema_ / options_.stall_weight_ref);
+      }
+      // Cumulative compaction counters = (total - fg), both from the SAME
+      // snapshot; prev_total_* store the previous round's comp cumulatives.
+      std::vector<uint64_t> comp_lookups_cum(level_count);
+      std::vector<uint64_t> comp_hits_cum(level_count);
+      for (size_t i = 0; i < level_count; ++i) {
+        comp_lookups_cum[i] = snapshot.lookups[i] >= snapshot.fg_lookups[i]
+                                  ? snapshot.lookups[i] - snapshot.fg_lookups[i]
+                                  : 0;
+        comp_hits_cum[i] = snapshot.hits[i] >= snapshot.fg_hits[i]
+                               ? snapshot.hits[i] - snapshot.fg_hits[i]
+                               : 0;
+      }
+      if (prev_total_lookups_.size() != level_count) {
+        prev_total_lookups_ = comp_lookups_cum;
+        prev_total_hits_ = comp_hits_cum;
+      }
+      if (comp_miss_density_ema_.size() != level_count) {
+        comp_miss_density_ema_.assign(level_count, 0.0);
+        comp_hit_density_ema_.assign(level_count, 0.0);
+      }
+      for (size_t i = 0; i < level_count; ++i) {
+        const uint64_t d_comp_lookups =
+            comp_lookups_cum[i] >= prev_total_lookups_[i]
+                ? comp_lookups_cum[i] - prev_total_lookups_[i]
+                : 0;
+        const uint64_t d_comp_hits = comp_hits_cum[i] >= prev_total_hits_[i]
+                                         ? comp_hits_cum[i] - prev_total_hits_[i]
+                                         : 0;
+        const uint64_t d_comp_misses =
+            d_comp_lookups >= d_comp_hits ? d_comp_lookups - d_comp_hits : 0;
+        // Miss density per byte of DATA (linear conversion: caching X% of
+        // the level converts ~X% of its merge reads). Floor at 1 MiB to
+        // avoid density explosions on transient/empty levels.
+        const double data_bytes = std::max(
+            static_cast<double>(uint64_t{1} << 20),
+            data_ema_.size() == level_count
+                ? data_ema_[i]
+                : static_cast<double>(snapshot.data_sizes[i]));
+        comp_miss_density_ema_[i] =
+            (1.0 - beta) * comp_miss_density_ema_[i] +
+            beta * static_cast<double>(d_comp_misses) / data_bytes;
+        // Hit density per byte of CAPACITY (realized earnings of the bytes
+        // actually held -- feeds donor retention, same units as fg density).
+        const double cap_bytes = static_cast<double>(
+            std::max<size_t>(last_capacities_[i], size_t{1} << 20));
+        comp_hit_density_ema_[i] =
+            (1.0 - beta) * comp_hit_density_ema_[i] +
+            beta * static_cast<double>(d_comp_hits) / cap_bytes;
+      }
+      prev_total_lookups_ = comp_lookups_cum;
+      prev_total_hits_ = comp_hits_cum;
+    }
+
     if (options_.use_ghost_marginal && options_.use_ghost_capture_rate) {
       // --- Capture-rate score: measured per-byte marginal utility ---
       // A repeat miss at reuse distance d (distinct missed blocks between
@@ -1367,6 +1459,19 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                 score[i] = floor;
               }
             }
+          }
+        }
+        // Compaction-value term, added AFTER the credit band: the band's
+        // concavity argument (marginal <= average) holds for fg reuse only;
+        // compaction conversion is linear in bytes, so it stacks on top.
+        // Weighted by measured stall intensity: converting a compaction
+        // read only buys throughput when compaction speed is the
+        // bottleneck (see comp_value_weight in the header).
+        if (comp_stats_available && stall_w > 0.0 &&
+            comp_miss_density_ema_.size() == level_count) {
+          for (size_t i = 0; i < level_count; ++i) {
+            score[i] += stall_w * options_.comp_value_weight *
+                        comp_miss_density_ema_[i];
           }
         }
         ghost_scored = true;
@@ -1506,6 +1611,20 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     const bool retention_available = capture_scored &&
                                      options_.donor_retention_frac > 0.0 &&
                                      window_stats_available;
+    // Retention density = fg earnings + stall-weighted compaction earnings.
+    // Without the comp component, a level funded for compaction conversion
+    // (whose fg density is legitimately poor) would read as the cheapest
+    // donor and be drained right back. Same stall weight as the score-side
+    // term: when stall is 0, compaction hits protect nothing.
+    auto retention_density = [&](size_t i) {
+      double d = hit_density_ema_.size() == level_count ? hit_density_ema_[i]
+                                                        : 0.0;
+      if (comp_stats_available && stall_w > 0.0 &&
+          comp_hit_density_ema_.size() == level_count) {
+        d += stall_w * options_.comp_value_weight * comp_hit_density_ema_[i];
+      }
+      return d;
+    };
 
     // Direction locks (steady-state suppression #2): a recent recipient may
     // not donate and a recent donor may not receive, killing ping-pong
@@ -1636,9 +1755,15 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
                      ? usage_excess_rounds_[i]
                      : 0);
         st += tmp;
+        if (comp_stats_available &&
+            comp_miss_density_ema_.size() == level_count) {
+          snprintf(tmp, sizeof(tmp), "{cm=%.3g ch=%.3g}",
+                   comp_miss_density_ema_[i], comp_hit_density_ema_[i]);
+          st += tmp;
+        }
       }
-      fprintf(stderr, "[mlc-alloc] round=%llu STATE%s\n",
-              (unsigned long long)round_id_, st.c_str());
+      fprintf(stderr, "[mlc-alloc] round=%llu STATE w=%.3f%s\n",
+              (unsigned long long)round_id_, stall_w, st.c_str());
     }
 
     // Usage growth gate (see usage_grow_headroom in the header): a level
@@ -1753,7 +1878,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           if (received_lock_round_[i] > round_id_) continue;  // recent recipient
           if (last_capacities_[i] <= floor_bytes[i]) continue;
           const double cost =
-              retention_available ? hit_density_ema_[i] : score[i];
+              retention_available ? retention_density(i) : score[i];
           if (!donor_found || cost < best_donor_cost) {
             best_donor_cost = cost;
             best_donor_score = score[i];
@@ -1881,7 +2006,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     // evicted).
     if (!structural_reclaim && !donor_slack_only && retention_available &&
         best_recv <=
-            options_.donor_retention_frac * hit_density_ema_[donor]) {
+            options_.donor_retention_frac * retention_density(donor)) {
       do_skip_step("donor_protected", /*gate_skip=*/false);
       return Status::OK();
     }

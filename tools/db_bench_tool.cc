@@ -3226,7 +3226,9 @@ class Benchmark {
          estimated_entry_bytes,
          alpha_debug_round](std::vector<double>* lambda,
                             std::vector<double>* data,
-                            std::vector<double>* alpha) mutable {
+                            std::vector<double>* alpha,
+                            uint64_t* /*l0_file_count*/,
+                            uint64_t* /*stall_micros*/) mutable {
           if (lambda == nullptr || data == nullptr || alpha == nullptr) {
             return false;
           }

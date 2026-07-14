@@ -491,6 +491,48 @@ struct MultiLevelAllocationOptions {
   // levels while raw capture stays authoritative for starved ones (whose
   // capacity is too small to measure density on). <= 0 disables.
   double score_credit_floor_frac = 0.25;
+  // --- Compaction-value term (cache-for-compaction) ---
+  // Everything above scores levels by FOREGROUND reuse only; compaction's
+  // streaming reads are deliberately excluded from the capture signal. But
+  // on write-heavy workloads the throughput bottleneck is compaction speed
+  // itself (pending-compaction-bytes back-pressure -> write stalls; the
+  // no-stall ablation showed the entire MLC throughput advantage flows
+  // through this channel), and every compaction read converted to a cache
+  // hit accelerates it. Compaction reads have no popularity structure --
+  // each live block is read exactly once when its file is merged -- so a
+  // level's per-byte compaction value is LINEAR (marginal == average):
+  //   comp_density_i = window compaction misses_i / data_bytes_i
+  // (caching X% of the level converts ~X% of its compaction reads). The
+  // term is added AFTER the realization credit band (the band's concavity
+  // argument applies to foreground value only):
+  //   score_i = band(fg_capture_i) + w * comp_value_weight * comp_density_i
+  // and the same weighted compaction HIT density is folded into the donor
+  // retention density so a level funded for compaction is not immediately
+  // read as the cheapest donor by fg-only earnings.
+  //
+  // w is the measured stall intensity: the per-round delta of the DB's
+  // cumulative write-stall micros divided by the round's wall time, EMA
+  // smoothed, normalized by stall_weight_ref and clamped to [0, 1]. On
+  // read-heavy workloads stall is ~0 -> w ~ 0 and behavior is unchanged
+  // (fg hits are the only currency that buys anything there); under deep
+  // back-pressure w -> 1 and capacity shifts toward converting compaction
+  // reads -- exactly the regime where the ablation proved fg hits buy no
+  // throughput. Requires the provider to supply cumulative stall micros;
+  // if it does not (stall_micros == nullptr semantics: always 0), w stays
+  // 0 and the term is inert. comp_value_weight <= 0 disables entirely.
+  //
+  // DEFAULT OFF after the wlA 2G t64 100M ablation: the term does not
+  // convert. Compaction misses concentrate on base-level inputs whose
+  // blocks are REWRITTEN by the very compactions that would re-read them
+  // (the same churn-blindness physics as the fg credit band), so the
+  // density promises capacity that never pays out -- fg hit slipped
+  // 0.2097 -> 0.2038 and stall rose with no comp-hit gain. Kept as an
+  // ablation lever for workloads with stable compaction inputs.
+  double comp_value_weight = 0.0;
+  // Stall intensity that maps to full weight w=1. 0.25 means: writers
+  // spending an aggregate 25% of wall time in explicit delay/stop is
+  // treated as fully stall-bound. wlA 2G t64 measures ~0.4 steady-state.
+  double stall_weight_ref = 0.25;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -503,10 +545,15 @@ class MultiLevelCacheAllocator {
   // backlog signal used to gate the data-share floor relief so it only fires
   // under real compaction pressure (write-heavy doom loop) and never perturbs a
   // healthy read-only workload (where L0 stays at ~1 file).
+  // `stall_micros` (when non-null) is filled with the DB's CUMULATIVE write-
+  // stall microseconds (rocksdb STALL_MICROS ticker); the allocator
+  // differentiates it into a stall-intensity weight for the compaction-value
+  // term. Providers that cannot supply it should leave it at 0 (term inert).
   using MetricsProvider = std::function<bool(std::vector<double>* lambda,
                                              std::vector<double>* data,
                                              std::vector<double>* alpha,
-                                             uint64_t* l0_file_count)>;
+                                             uint64_t* l0_file_count,
+                                             uint64_t* stall_micros)>;
 
   MultiLevelCacheAllocator(std::shared_ptr<MultiLevelCache> cache,
                            MetricsProvider provider,
@@ -613,6 +660,18 @@ class MultiLevelCacheAllocator {
   std::vector<uint64_t> prev_fg_lookups_;
   std::vector<double> hit_density_ema_;
   std::vector<double> hit_rate_ema_;
+  // Compaction-value term state (see comp_value_weight): previous cumulative
+  // per-level TOTAL lookups/hits (comp = total - fg), previous cumulative DB
+  // stall micros + wall clock for the stall-intensity weight, its EMA, and
+  // the EMA-smoothed per-byte compaction miss/hit densities.
+  std::vector<uint64_t> prev_total_hits_;
+  std::vector<uint64_t> prev_total_lookups_;
+  std::vector<double> comp_miss_density_ema_;
+  std::vector<double> comp_hit_density_ema_;
+  uint64_t prev_stall_micros_ = 0;
+  uint64_t prev_stall_wall_micros_ = 0;
+  bool stall_window_primed_ = false;
+  double stall_weight_ema_ = 0.0;
   // Consecutive rounds skipped by the steady-state gates; when it reaches
   // probe_after_skipped_rounds, the next round runs as a probe transfer.
   uint64_t consecutive_gate_skips_ = 0;

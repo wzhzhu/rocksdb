@@ -135,7 +135,9 @@ int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::MultiLevelCacheAllocator::MetricsProvider provider =
       [ml_cache, prev_lookups](std::vector<double>* lambda,
                                std::vector<double>* data,
-                               std::vector<double>* alpha) mutable {
+                               std::vector<double>* alpha,
+                               uint64_t* /*l0_file_count*/,
+                               uint64_t* /*stall_micros*/) mutable {
         if (lambda == nullptr || data == nullptr || alpha == nullptr) {
           return false;
         }
