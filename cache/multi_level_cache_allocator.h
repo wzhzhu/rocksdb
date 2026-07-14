@@ -533,6 +533,55 @@ struct MultiLevelAllocationOptions {
   // spending an aggregate 25% of wall time in explicit delay/stop is
   // treated as fully stall-bound. wlA 2G t64 measures ~0.4 steady-state.
   double stall_weight_ref = 0.25;
+  // --- Stall-adaptive lazy mode ---
+  // MLC's fixed overheads (ghost recording on every fg miss, drain +
+  // scoring + snapshot work every round) buy nothing once two conditions
+  // hold simultaneously: no write back-pressure (a hit-ratio edge cannot
+  // buy throughput without a stall channel to relieve -- the no-stall
+  // ablation) and a converged allocation (rounds keep skipping, scores
+  // only confirm the status quo). Low-thread cells sit in exactly that
+  // regime and pay 1-6% throughput for it. When stall intensity stays
+  // below lazy_stall_intensity_max AND the allocation has been drift-
+  // stationary for lazy_after_stable_rounds calls (see
+  // lazy_drift_tolerance_ratio), the allocator enters lazy mode: ghost
+  // recording is hash-gate downsampled to 1/2^lazy_ghost_sample_shift of
+  // fg misses and only every lazy_round_multiplier-th round runs the full
+  // drain/score/transfer path (skipped rounds still read the provider and
+  // stall ticker, so pressure is detected at the normal cadence). Stall
+  // re-appearance or net capacity drift beyond the tolerance (workload
+  // shift) exits immediately back to full speed. The signal stays LIVE in
+  // lazy mode -- downsampling is
+  // unbiased for the capture score (1/8 the repeats measured against a
+  // clock running 1/8 as fast; the scorer rescales counts by 2^shift and
+  // the recorder offsets distance buckets to keep true distinct-block
+  // units), just noisier -- so a genuine workload shift still produces a
+  // transfer, which itself un-lazies the allocator.
+  bool lazy_mode_enabled = true;
+  // Stall intensity (aggregate stall micros per wall micro, EMA) below
+  // which the workload counts as unstalled. wlA 2G t64 measures ~0.4;
+  // read-heavy workloads measure ~0.
+  double lazy_stall_intensity_max = 0.01;
+  // Convergence test: the allocation counts as stationary when the summed
+  // per-level capacity DRIFT from a reference snapshot stays within
+  // lazy_drift_tolerance_ratio * total for lazy_after_stable_rounds
+  // consecutive calls. Net drift, not "no transfers": a converged
+  // equilibrium still runs lock-throttled ping-pong and probe annealing
+  // (observed on wlC t8: L3<->L5 single-step reversals every ~27 rounds,
+  // so a no-apply test is only ever satisfied inside lock windows and
+  // lazy mode thrashes), but those transfers cancel out while a genuine
+  // workload shift moves capacity in one direction past the tolerance --
+  // which resets the reference and (if engaged) exits lazy mode.
+  uint64_t lazy_after_stable_rounds = 20;
+  // Summed |capacity - reference| tolerance as a fraction of the total
+  // budget. Default 1/16 (128 MiB at 2 GiB): a couple of base steps of
+  // ping-pong amplitude fit inside; structural shifts do not.
+  double lazy_drift_tolerance_ratio = 0.0625;
+  // log2 of the ghost-recording downsample in lazy mode (3 = 1/8 of fg
+  // misses feed the ghost tables).
+  uint32_t lazy_ghost_sample_shift = 3;
+  // Only every N-th round runs the full scoring/transfer path in lazy
+  // mode; the rest return after the stall check.
+  uint32_t lazy_round_multiplier = 4;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -672,6 +721,20 @@ class MultiLevelCacheAllocator {
   uint64_t prev_stall_wall_micros_ = 0;
   bool stall_window_primed_ = false;
   double stall_weight_ema_ = 0.0;
+  // Stall-adaptive lazy mode state (see lazy_mode_enabled): whether lazy is
+  // engaged, the drift-reference capacity snapshot with the count of
+  // consecutive calls the allocation stayed within tolerance of it (the
+  // convergence test), calls since lazy engaged (for the 1-in-N full-round
+  // gate), and the ghost downsample shift in effect for the window
+  // accumulating since the last drain (the scorer's rescale factor; updated
+  // at drain time so a mid-window mode flip rescales with the shift the
+  // window was recorded under).
+  bool lazy_active_ = false;
+  std::vector<size_t> lazy_ref_capacities_;
+  uint64_t lazy_stable_calls_ = 0;
+  uint64_t lazy_call_counter_ = 0;
+  uint32_t ghost_window_sample_shift_ = 0;
+  uint32_t ghost_pending_sample_shift_ = 0;
   // Consecutive rounds skipped by the steady-state gates; when it reaches
   // probe_after_skipped_rounds, the next round runs as a probe transfer.
   uint64_t consecutive_gate_skips_ = 0;

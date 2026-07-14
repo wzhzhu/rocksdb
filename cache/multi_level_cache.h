@@ -171,6 +171,16 @@ class MultiLevelCache : public Cache {
   // histogram below.
   void SetGhostTrackingEnabled(bool enabled, uint32_t slots_log2 = 16,
                                bool segmented = false);
+  // Hash-gated downsampling of ghost recording (stall-adaptive lazy mode):
+  // only keys whose designated hash bits are zero (1/2^shift of fg misses)
+  // are recorded. 0 = record everything. Downsampling is unbiased for the
+  // capture score: 1/2^shift as many repeats are observed against a distinct-
+  // miss clock advancing 1/2^shift as fast, and the recorder offsets distance
+  // buckets by the shift so they stay in true distinct-block units -- the
+  // allocator rescales drained counts by 2^shift.
+  void SetGhostSampleShift(uint32_t shift) {
+    ghost_sample_shift_.store(shift, std::memory_order_relaxed);
+  }
   // Per-level ghost hits since the previous drain (read-and-reset windowed
   // counter). Empty when tracking is disabled.
   std::vector<uint64_t> DrainGhostHits();
@@ -450,6 +460,10 @@ class MultiLevelCache : public Cache {
   std::atomic<bool> ghost_tracking_enabled_{false};
   std::atomic<bool> ghost_segmented_{false};
   std::atomic<uint32_t> ghost_slots_log2_{16};
+  // See SetGhostSampleShift. The gate reads hash bits above the clock-sample
+  // bits (32 + kGhostClockSampleShift ..) so it is independent of the table
+  // index (top slots_log2 bits), the tag (low 32), and the clock sampling.
+  std::atomic<uint32_t> ghost_sample_shift_{0};
   std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> ghost_tables_;
   std::unique_ptr<StripedCounter[]> ghost_hits_;
   // Per-level distinct-miss clock (segmented mode): incremented once per

@@ -1647,6 +1647,19 @@ void MultiLevelCache::RecordGhostMiss(size_t level_index,
   if (fp == 0) {
     fp = 1;  // 0 is the empty-slot sentinel
   }
+  // Lazy-mode downsampling (see SetGhostSampleShift): drop all but
+  // 1/2^shift of keys, selected by hash bits disjoint from the index, tag,
+  // and clock-sample bits. Both the repeat detection and the clock advance
+  // then run on the sampled key stream, which keeps the capture score
+  // unbiased (fewer repeats measured at proportionally shorter clock
+  // distances; the bucket offset below restores true units).
+  const uint32_t sample_shift =
+      ghost_sample_shift_.load(std::memory_order_relaxed);
+  if (sample_shift != 0 &&
+      ((fp >> (32 + kGhostClockSampleShift)) &
+       ((uint64_t{1} << sample_shift) - 1)) != 0) {
+    return;
+  }
   const uint32_t slots_log2 =
       ghost_slots_log2_.load(std::memory_order_relaxed);
   // High bits index the direct-mapped table.
@@ -1698,10 +1711,14 @@ void MultiLevelCache::RecordGhostMiss(size_t level_index,
     const uint32_t delta = now - static_cast<uint32_t>(prev);
     // Bucket = log2(distance in distinct blocks); delta==0 means the
     // distance is below one clock tick (trivially capturable), bucket 0.
+    // With lazy-mode downsampling active, one clock tick additionally
+    // represents 2^sample_shift-fold more true distinct misses (the clock
+    // only sees the sampled stream), so the offset grows by the shift to
+    // keep buckets in true distinct-block units.
     uint32_t bucket = 0;
     if (delta > 0) {
       bucket = 31 - static_cast<uint32_t>(__builtin_clz(delta)) +
-               kGhostClockSampleShift;
+               kGhostClockSampleShift + sample_shift;
       if (bucket >= kGhostDistBuckets) {
         bucket = kGhostDistBuckets - 1;
       }

@@ -848,6 +848,113 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       return Status::OK();
     }
 
+    // --- Stall intensity (feeds the comp-value weight and the lazy mode) ---
+    // Differentiate the cumulative DB stall micros against wall time and
+    // EMA-smooth. Updated on every call, including lazy-skipped rounds, so
+    // back-pressure re-appearing during lazy mode is detected at the normal
+    // cadence.
+    {
+      const uint64_t now_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+      const double sbeta = (options_.ghost_score_ema_beta > 0.0 &&
+                            options_.ghost_score_ema_beta < 1.0)
+                               ? options_.ghost_score_ema_beta
+                               : 1.0;
+      if (!stall_window_primed_) {
+        stall_window_primed_ = true;
+      } else if (now_us > prev_stall_wall_micros_ &&
+                 stall_micros_cum >= prev_stall_micros_) {
+        const double intensity =
+            static_cast<double>(stall_micros_cum - prev_stall_micros_) /
+            static_cast<double>(now_us - prev_stall_wall_micros_);
+        stall_weight_ema_ =
+            (1.0 - sbeta) * stall_weight_ema_ + sbeta * intensity;
+      }
+      prev_stall_micros_ = stall_micros_cum;
+      prev_stall_wall_micros_ = now_us;
+    }
+
+    // --- Stall-adaptive lazy mode (see lazy_mode_enabled in the header) ---
+    // Unstalled AND drift-stationary -> throttle: ghost recording
+    // downsampled, only every lazy_round_multiplier-th call runs the full
+    // round below. Skipped calls return here, before the solver / floors /
+    // scoring. The convergence test is NET capacity drift from a reference
+    // snapshot, not "no transfers": a converged equilibrium still runs
+    // lock-throttled ping-pong and probe annealing whose transfers cancel
+    // out, while a real workload shift walks capacity in one direction.
+    if (options_.lazy_mode_enabled && options_.use_ghost_marginal &&
+        options_.adjust_step_bytes > 0 && !last_capacities_.empty()) {
+      uint64_t drift = 0;
+      if (lazy_ref_capacities_.size() != level_count) {
+        lazy_ref_capacities_ = last_capacities_;
+        lazy_stable_calls_ = 0;
+      } else {
+        for (size_t i = 0; i < level_count; ++i) {
+          const size_t a = last_capacities_[i];
+          const size_t b = lazy_ref_capacities_[i];
+          drift += static_cast<uint64_t>(a > b ? a - b : b - a);
+        }
+      }
+      const uint64_t drift_tol = static_cast<uint64_t>(
+          options_.lazy_drift_tolerance_ratio *
+          static_cast<double>(total_capacity));
+      if (drift > drift_tol) {
+        // Net movement beyond tolerance: re-reference and restart the
+        // stability count (and exit lazy below if engaged).
+        lazy_ref_capacities_ = last_capacities_;
+        lazy_stable_calls_ = 0;
+      } else {
+        ++lazy_stable_calls_;
+      }
+      if (lazy_active_) {
+        const bool pressure =
+            stall_weight_ema_ >= options_.lazy_stall_intensity_max;
+        if (pressure || lazy_stable_calls_ == 0) {
+          // Back-pressure re-appeared, or capacity drifted past the
+          // tolerance (workload shift): resume full speed immediately. The
+          // window shift used by the scorer is updated at drain time.
+          lazy_active_ = false;
+          ghost_pending_sample_shift_ = 0;
+          cache_->SetGhostSampleShift(0);
+          if (kAllocDebug) {
+            fprintf(stderr,
+                    "[mlc-alloc] round=%llu LAZY exit (%s) stall=%.4f "
+                    "drift=%lluMiB\n",
+                    (unsigned long long)round_id_,
+                    pressure ? "stall" : "drift", stall_weight_ema_,
+                    (unsigned long long)(drift >> 20));
+          }
+        } else {
+          ++lazy_call_counter_;
+          if (options_.lazy_round_multiplier > 1 &&
+              (lazy_call_counter_ % options_.lazy_round_multiplier) != 0) {
+            return Status::OK();  // lazy-skipped round
+          }
+        }
+      } else if (stall_weight_ema_ < options_.lazy_stall_intensity_max &&
+                 lazy_stable_calls_ >= options_.lazy_after_stable_rounds) {
+        lazy_active_ = true;
+        lazy_call_counter_ = 0;
+        // Re-reference at entry: stability may have been reached with the
+        // slow equilibrium wander already near the tolerance edge, and
+        // entering with no headroom bounces straight back out on the next
+        // ping-pong transfer (observed enter->exit churn every ~27 rounds).
+        lazy_ref_capacities_ = last_capacities_;
+        ghost_pending_sample_shift_ = options_.lazy_ghost_sample_shift;
+        cache_->SetGhostSampleShift(options_.lazy_ghost_sample_shift);
+        if (kAllocDebug) {
+          fprintf(stderr,
+                  "[mlc-alloc] round=%llu LAZY enter stall=%.4f stable=%llu "
+                  "drift=%lluMiB\n",
+                  (unsigned long long)round_id_, stall_weight_ema_,
+                  (unsigned long long)lazy_stable_calls_,
+                  (unsigned long long)(drift >> 20));
+        }
+      }
+    }
+
     std::vector<double> upper_bounds;
     if (options_.cap_at_data_size &&
         snapshot.data_sizes.size() == level_count) {
@@ -1247,9 +1354,8 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     }
 
     // Compaction-value inputs (see comp_value_weight in the header).
-    // (a) Stall-intensity weight: differentiate the cumulative DB stall
-    //     micros against wall time, EMA-smooth, normalize by
-    //     stall_weight_ref, clamp to [0,1]. First round only primes.
+    // (a) Stall-intensity weight: the EMA maintained above, normalized by
+    //     stall_weight_ref and clamped to [0,1].
     // (b) Per-level compaction miss/hit densities: comp = total - fg
     //     deltas, per byte of the level's DATA (compaction reads every
     //     live block once per merge, so per-byte value is linear in the
@@ -1260,26 +1366,10 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         snapshot.lookups.size() == level_count &&
         snapshot.hits.size() == level_count;
     if (comp_stats_available) {
-      const uint64_t now_us = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now().time_since_epoch())
-              .count());
       const double beta = (options_.ghost_score_ema_beta > 0.0 &&
                            options_.ghost_score_ema_beta < 1.0)
                               ? options_.ghost_score_ema_beta
                               : 1.0;
-      if (!stall_window_primed_) {
-        stall_window_primed_ = true;
-      } else if (now_us > prev_stall_wall_micros_ &&
-                 stall_micros_cum >= prev_stall_micros_) {
-        const double intensity =
-            static_cast<double>(stall_micros_cum - prev_stall_micros_) /
-            static_cast<double>(now_us - prev_stall_wall_micros_);
-        stall_weight_ema_ =
-            (1.0 - beta) * stall_weight_ema_ + beta * intensity;
-      }
-      prev_stall_micros_ = stall_micros_cum;
-      prev_stall_wall_micros_ = now_us;
       if (options_.stall_weight_ref > 0.0) {
         stall_w = std::min(1.0, stall_weight_ema_ / options_.stall_weight_ref);
       }
@@ -1354,6 +1444,13 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       // is what makes different runs converge to the same attractor.
       const std::vector<uint64_t> hist =
           cache_->DrainGhostDistanceHistogram();
+      // Lazy-mode rescale: the drained window was recorded at the shift in
+      // effect since the previous drain; counts represent 2^shift-fold more
+      // true repeats (distances already in true units via the recorder's
+      // bucket offset). Hand the pending shift over for the next window.
+      const double sample_scale = static_cast<double>(
+          uint64_t{1} << ghost_window_sample_shift_);
+      ghost_window_sample_shift_ = ghost_pending_sample_shift_;
       constexpr size_t kB = MultiLevelCache::kGhostDistBuckets;
       if (hist.size() == level_count * kB) {
         const double block_bytes =
@@ -1415,6 +1512,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
             }
             val += static_cast<double>(cnt) / (mid * decompress * block_bytes);
           }
+          val *= sample_scale;
           // Same EMA smoothing as the plain ghost path (per-window
           // histograms carry the same Poisson/compaction-burst noise).
           ghost_score_ema_[i] =
@@ -1514,6 +1612,11 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       // level produces ~0 misses hence ~0 ghost hits, so it self-retires
       // as recipient (belt: upper_bytes cap still applies).
       const std::vector<uint64_t> ghost = cache_->DrainGhostHits();
+      // Lazy-mode rescale (see the capture path above): counts of the
+      // drained window are 1/2^shift of true repeats.
+      const double plain_sample_scale = static_cast<double>(
+          uint64_t{1} << ghost_window_sample_shift_);
+      ghost_window_sample_shift_ = ghost_pending_sample_shift_;
       if (ghost.size() == level_count) {
         // EMA smoothing (steady-state suppression #1): per-window counts are
         // Poisson-noisy and compaction-bursty; smoothing keeps a transient
@@ -1527,8 +1630,9 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           ghost_score_ema_.assign(level_count, 0.0);
         }
         for (size_t i = 0; i < level_count; ++i) {
-          ghost_score_ema_[i] = (1.0 - beta) * ghost_score_ema_[i] +
-                                beta * static_cast<double>(ghost[i]);
+          ghost_score_ema_[i] =
+              (1.0 - beta) * ghost_score_ema_[i] +
+              beta * static_cast<double>(ghost[i]) * plain_sample_scale;
           score[i] = ghost_score_ema_[i];
           // Per-byte normalization: the raw count says how many misses more
           // capacity could convert, but the bytes needed per converted hit
@@ -1722,8 +1826,13 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     // no-signal check, direction locks, floors, or upper bounds). This
     // keeps the equilibrium annealing toward the optimum instead of
     // freezing wherever the convergence phase overshot.
+    // Probes are suppressed while lazy: a probe exists to keep annealing a
+    // full-speed equilibrium, and lazy mode is the explicit decision to stop
+    // paying for annealing while unstalled and converged (a genuine workload
+    // shift still surfaces through the live downsampled scores).
     const bool probe_transfer =
-        !structural_reclaim && options_.probe_after_skipped_rounds > 0 &&
+        !structural_reclaim && !lazy_active_ &&
+        options_.probe_after_skipped_rounds > 0 &&
         consecutive_gate_skips_ >= options_.probe_after_skipped_rounds;
 
     if (kAllocDebug) {
@@ -1762,8 +1871,9 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
           st += tmp;
         }
       }
-      fprintf(stderr, "[mlc-alloc] round=%llu STATE w=%.3f%s\n",
-              (unsigned long long)round_id_, stall_w, st.c_str());
+      fprintf(stderr, "[mlc-alloc] round=%llu STATE w=%.3f si=%.4f lz=%d%s\n",
+              (unsigned long long)round_id_, stall_w, stall_weight_ema_,
+              lazy_active_ ? 1 : 0, st.c_str());
     }
 
     // Usage growth gate (see usage_grow_headroom in the header): a level
