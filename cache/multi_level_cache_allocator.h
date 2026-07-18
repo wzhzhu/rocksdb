@@ -490,7 +490,17 @@ struct MultiLevelAllocationOptions {
   // [floor_frac, frac] * hd -- realized earnings dominate for funded
   // levels while raw capture stays authoritative for starved ones (whose
   // capacity is too small to measure density on). <= 0 disables.
-  double score_credit_floor_frac = 0.25;
+  //
+  // Default 0.5 (raised from 0.25): at 0.25 the floor was too weak to
+  // stabilize wlB (churn-heavy read-mostly zipfian), whose bottom level
+  // under-reports capture the same way L0 does on wlA -- compaction
+  // rotates keys faster than repeats arrive. wlB 4G t64 with 0.25
+  // converged by lottery (fg hit 0.268..0.353 across repeats, bad
+  // branches drain a proven mid level to single-digit MiB on noise); at
+  // 0.5 three repeats landed at 0.346/0.361/0.365 (+5pt mean, spread
+  // 8.1pt -> 1.9pt) at equal throughput. wlA 2G t64 and wlD 2G t128
+  // paired checks showed no regression (wlA fg +1.4pt, wlD equal).
+  double score_credit_floor_frac = 0.5;
   // --- Compaction-value term (cache-for-compaction) ---
   // Everything above scores levels by FOREGROUND reuse only; compaction's
   // streaming reads are deliberately excluded from the capture signal. But
