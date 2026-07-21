@@ -491,15 +491,15 @@ struct MultiLevelAllocationOptions {
   // levels while raw capture stays authoritative for starved ones (whose
   // capacity is too small to measure density on). <= 0 disables.
   //
-  // Default 0.5 (raised from 0.25): at 0.25 the floor was too weak to
-  // stabilize wlB (churn-heavy read-mostly zipfian), whose bottom level
-  // under-reports capture the same way L0 does on wlA -- compaction
-  // rotates keys faster than repeats arrive. wlB 4G t64 with 0.25
-  // converged by lottery (fg hit 0.268..0.353 across repeats, bad
-  // branches drain a proven mid level to single-digit MiB on noise); at
-  // 0.5 three repeats landed at 0.346/0.361/0.365 (+5pt mean, spread
-  // 8.1pt -> 1.9pt) at equal throughput. wlA 2G t64 and wlD 2G t128
-  // paired checks showed no regression (wlA fg +1.4pt, wlD equal).
+  // Default 0.5 (raised from 0.25), validated on TTL-clean paired runs
+  // (earlier evidence was polluted by RocksDB's 30-day ttl flattening
+  // benchmark clones mid-run; see the ttl=0 fix in the YCSB harness).
+  // wlA 2G t64: 0.5 gives +4.4% tps at -0.6pt fg (repeats tight and
+  // non-overlapping) -- the stronger realized-density floor keeps the
+  // high-churn upper levels funded, cutting compaction back-pressure
+  // (stall 241-246s vs 250-252s); the win flows through the stall
+  // channel, not raw hit ratio. wlB 4G t64: indistinguishable from 0.25
+  // (fg 0.330-0.344 vs 0.336-0.349, tps +1.6% inside noise).
   double score_credit_floor_frac = 0.5;
   // --- Compaction-value term (cache-for-compaction) ---
   // Everything above scores levels by FOREGROUND reuse only; compaction's
