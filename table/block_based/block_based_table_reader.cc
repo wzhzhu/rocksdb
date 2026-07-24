@@ -1885,6 +1885,16 @@ BlockBasedTable::MaybeReadBlockAndLoadToCache(
   // insert, and this extends the same principle to the MLC counters). The
   // scope covers the whole function; only MultiLevelCache::Lookup reads it.
   MLCLookupCompactionScope compaction_lookup_scope(for_compaction);
+  // Expose the point read's user key to the MLC ghost tracker for the same
+  // scope: with user-key fingerprinting enabled, repeat-miss signals are keyed
+  // by the logical record instead of the block cache key, so they survive
+  // compaction rewrites. Null (cleared) for non-point reads.
+  const Slice* ghost_user_key =
+      (!for_compaction && get_context != nullptr) ? &get_context->user_key()
+                                                  : nullptr;
+  MLCLookupUserKeyScope user_key_scope(
+      ghost_user_key != nullptr ? ghost_user_key->data() : nullptr,
+      ghost_user_key != nullptr ? ghost_user_key->size() : 0);
   const bool no_io = (ro.read_tier == kBlockCacheTier);
   BlockCacheInterface<TBlocklike> block_cache{
       rep_->table_options.block_cache.get()};

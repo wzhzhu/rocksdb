@@ -191,6 +191,11 @@ class GetContext {
     }
   }
 
+  // The user key this point read is looking up. Used by the block-retrieval
+  // path to expose a churn-immune identity to the MultiLevelCache ghost
+  // tracker (see MLCLookupUserKeyScope).
+  const Slice& user_key() const { return user_key_; }
+
   uint64_t get_tracing_get_id() const { return tracing_get_id_; }
 
   void push_operand(const Slice& value, Cleanable* value_pinner);

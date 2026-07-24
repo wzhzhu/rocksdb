@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -181,6 +182,16 @@ class MultiLevelCache : public Cache {
   void SetGhostSampleShift(uint32_t shift) {
     ghost_sample_shift_.store(shift, std::memory_order_relaxed);
   }
+  // Ghost fingerprint identity = user key hash for point reads (see
+  // MLCLookupUserKey in multi_level_cache_compaction.h): repeat-miss signals
+  // survive compaction rewrites instead of dying with the block cache key.
+  // Distances stay comparable to block units under scattered point reads
+  // (hashed key order: a window of distinct missed keys touches ~as many
+  // distinct blocks), so ghost_dist_block_bytes needs no rescale. Off by
+  // default.
+  void SetGhostUserKeyFingerprint(bool enabled) {
+    ghost_user_key_fp_.store(enabled, std::memory_order_relaxed);
+  }
   // Per-level ghost hits since the previous drain (read-and-reset windowed
   // counter). Empty when tracking is disabled.
   std::vector<uint64_t> DrainGhostHits();
@@ -223,6 +234,20 @@ class MultiLevelCache : public Cache {
 
   // Replaces per-level data sizes used by allocator D_i metric.
   void UpdateLevelDataSizes(const std::vector<uint64_t>& level_data_sizes);
+  // Merge the deepest LSM levels into one sub-cache: any decoded cache-key
+  // level tag above max_slot routes to slot max_slot, and incoming per-level
+  // data sizes above max_slot are summed into it. Rationale: MLC's edge comes
+  // from recency stratification in the UPPER levels (L0-L4); the bottom two
+  // levels have similar coldness, and splitting them only adds the hardest
+  // allocation decision (the L5-vs-L6 split is where churn-degraded capture
+  // signals misallocate) plus partition overhead (floors, transfer lag) that
+  // a global cache does not pay. Merging makes the bottom slot one HCC that
+  // shares capacity by global heat, exactly like the baseline does for the
+  // whole cache. Callers construct the MultiLevelCache with the reduced slot
+  // count and then set the clamp; default (SIZE_MAX) leaves routing 1:1.
+  void SetRouteLevelClamp(size_t max_slot) {
+    route_level_clamp_.store(max_slot, std::memory_order_relaxed);
+  }
   // For A/B diagnostics: force all requests to route into L0.
   // When enabled, initial capacities are also switched to L0-only so the
   // setup is closer to single-cache baseline behavior.
@@ -464,6 +489,10 @@ class MultiLevelCache : public Cache {
   // bits (32 + kGhostClockSampleShift ..) so it is independent of the table
   // index (top slots_log2 bits), the tag (low 32), and the clock sampling.
   std::atomic<uint32_t> ghost_sample_shift_{0};
+  // See SetGhostUserKeyFingerprint.
+  std::atomic<bool> ghost_user_key_fp_{false};
+  // See SetRouteLevelClamp. SIZE_MAX = no clamp (identity level->slot map).
+  std::atomic<size_t> route_level_clamp_{std::numeric_limits<size_t>::max()};
   std::vector<std::unique_ptr<std::atomic<uint64_t>[]>> ghost_tables_;
   std::unique_ptr<StripedCounter[]> ghost_hits_;
   // Per-level distinct-miss clock (segmented mode): incremented once per

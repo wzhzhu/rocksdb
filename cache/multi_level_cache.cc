@@ -35,6 +35,36 @@ MLCLookupCompactionScope::~MLCLookupCompactionScope() {
   tls_mlc_lookup_is_compaction = prev_;
 }
 
+// Per-thread user key of the in-flight point read (see the header). Stored as
+// raw pointer+size: the slice only needs to stay valid for the enclosing
+// block-retrieval scope, and RecordGhostMiss hashes it lazily (only on a
+// final foreground miss that passes the sample gate), so the hot path pays
+// two TLS stores and nothing else.
+thread_local const char* tls_mlc_lookup_user_key_data = nullptr;
+thread_local size_t tls_mlc_lookup_user_key_size = 0;
+
+bool MLCLookupUserKey(const char** key_data, size_t* key_size) {
+  if (tls_mlc_lookup_user_key_data == nullptr) {
+    return false;
+  }
+  *key_data = tls_mlc_lookup_user_key_data;
+  *key_size = tls_mlc_lookup_user_key_size;
+  return true;
+}
+
+MLCLookupUserKeyScope::MLCLookupUserKeyScope(const char* key_data,
+                                             size_t key_size)
+    : prev_data_(tls_mlc_lookup_user_key_data),
+      prev_size_(tls_mlc_lookup_user_key_size) {
+  tls_mlc_lookup_user_key_data = key_data;
+  tls_mlc_lookup_user_key_size = key_size;
+}
+
+MLCLookupUserKeyScope::~MLCLookupUserKeyScope() {
+  tls_mlc_lookup_user_key_data = prev_data_;
+  tls_mlc_lookup_user_key_size = prev_size_;
+}
+
 namespace {
 
 size_t SafeLevelCount(size_t num_levels) {
@@ -848,13 +878,19 @@ void MultiLevelCache::SetLookupSampleRateLog2(uint32_t sample_rate_log2) {
 
 void MultiLevelCache::UpdateLevelDataSizes(
     const std::vector<uint64_t>& level_data_sizes) {
-  const size_t limit = std::min(level_data_sizes.size(), level_data_sizes_.size());
-  for (size_t level = 0; level < limit; ++level) {
-    level_data_sizes_[level].store(level_data_sizes[level],
-                                   std::memory_order_relaxed);
+  // Bottom-level merge (see SetRouteLevelClamp): LSM levels above the clamp
+  // route to the last slot, so their data sizes aggregate there too (the
+  // allocator's D_i must describe everything the slot serves).
+  const size_t clamp = route_level_clamp_.load(std::memory_order_relaxed);
+  std::vector<uint64_t> slot_sizes(level_data_sizes_.size(), 0);
+  for (size_t level = 0; level < level_data_sizes.size(); ++level) {
+    const size_t slot = std::min(level, clamp);
+    if (slot < slot_sizes.size()) {
+      slot_sizes[slot] += level_data_sizes[level];
+    }
   }
-  for (size_t level = limit; level < level_data_sizes_.size(); ++level) {
-    level_data_sizes_[level].store(0, std::memory_order_relaxed);
+  for (size_t slot = 0; slot < slot_sizes.size(); ++slot) {
+    level_data_sizes_[slot].store(slot_sizes[slot], std::memory_order_relaxed);
   }
 }
 
@@ -1006,13 +1042,24 @@ bool MultiLevelCache::DecodeExtendedCacheRouting(const Slice& key, size_t* level
   if (!DecodeLevelFromCacheKeyLevelTag(level_tag, &decoded_level)) {
     return false;
   }
-  if (decoded_level < 0 ||
-      static_cast<size_t>(decoded_level) >= sub_caches_.size()) {
+  if (decoded_level < 0) {
+    route_normalize_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  // Bottom-level merge (see SetRouteLevelClamp): deep LSM levels share the
+  // last slot. Readers keep tagging blocks with the true LSM level; only the
+  // slot mapping here changes.
+  size_t slot = static_cast<size_t>(decoded_level);
+  const size_t clamp = route_level_clamp_.load(std::memory_order_relaxed);
+  if (slot > clamp) {
+    slot = clamp;
+  }
+  if (slot >= sub_caches_.size()) {
     route_normalize_fallbacks_.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   if (level != nullptr) {
-    *level = static_cast<size_t>(decoded_level);
+    *level = slot;
   }
   if (base_key != nullptr) {
     *base_key = Slice(key.data(), kCacheKeySize);
@@ -1643,7 +1690,27 @@ void MultiLevelCache::RecordGhostMiss(size_t level_index,
   if (table == nullptr) {
     return;
   }
-  uint64_t fp = HashCacheKey(base_key);
+  // Fingerprint identity. Default: block cache key hash. With user-key
+  // fingerprinting enabled, point reads hash the USER KEY instead (via the
+  // TLS scope set in MaybeReadBlockAndLoadToCache), making repeat signals
+  // survive compaction rewrites -- a block-keyed entry dies with its file
+  // number, so on high-churn levels genuine repeats mostly never register
+  // and the level is systematically under-scored. Non-point-read paths
+  // (scans, iterators) have no user key in scope and keep the block-key
+  // identity; the two coexist in one table (a cross-identity tag match is a
+  // ~2^-32 collision, same as any other).
+  uint64_t fp = 0;
+  if (ghost_user_key_fp_.load(std::memory_order_relaxed)) {
+    const char* uk_data = nullptr;
+    size_t uk_size = 0;
+    if (MLCLookupUserKey(&uk_data, &uk_size)) {
+      fp = static_cast<uint64_t>(std::hash<std::string_view>{}(
+          std::string_view(uk_data, uk_size)));
+    }
+  }
+  if (fp == 0) {
+    fp = HashCacheKey(base_key);
+  }
   if (fp == 0) {
     fp = 1;  // 0 is the empty-slot sentinel
   }
