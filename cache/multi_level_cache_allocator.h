@@ -592,6 +592,31 @@ struct MultiLevelAllocationOptions {
   // Only every N-th round runs the full scoring/transfer path in lazy
   // mode; the rest return after the stall check.
   uint32_t lazy_round_multiplier = 4;
+
+  // Physical-apply convergence gate (decouples the allocator's evolving
+  // capacity MODEL from the PHYSICAL cache updates). Every round still
+  // advances the internal model (last_capacities_) by its chosen step, but
+  // the model is only flushed to the sub-caches (cache_->AdjustCapacities,
+  // which locks every shard and purges/rebuilds under 128 foreground
+  // threads) once the model has drifted, in summed per-level |delta|, at
+  // least this fraction of the total budget away from the last physically
+  // applied state.
+  //
+  // Why: at a converged equilibrium the incremental stepper keeps moving one
+  // base step (adjust_step_bytes, default 64 MiB = 0.78% of an 8 GiB budget)
+  // between a ping-ponging donor/recipient pair. Each single-round change
+  // (0.78%) exceeds the per-round deadband (total_deadband_ratio, 0.5%), so
+  // the old code physically re-applied EVERY round even though the moves net
+  // to ~0 and buy no hit ratio (verified: auto_adjust=off matches default hit
+  // ratio at 8 GiB). At 128 threads those zero-value applies avalanche into
+  // kernel futex contention (native_queued_spin_lock_slowpath dominates the
+  // profile) and cost ~33% throughput on wlC 8G t128. Gating on NET drift
+  // from the applied state fully suppresses the equilibrium ping-pong (drift
+  // oscillates below tolerance -> zero physical calls) while a genuine
+  // workload shift still walks the model in one direction past the tolerance
+  // within a couple of rounds and flushes. 0 disables the gate (apply every
+  // round, legacy behaviour). Default 0.02 (= ~2.5 base steps at 8 GiB).
+  double apply_convergence_drift_ratio = 0.02;
 };
 
 // Periodically solves and applies multi-level cache capacities from
@@ -674,6 +699,17 @@ class MultiLevelCacheAllocator {
   // last_capacities_, then rebalances the proposal back to `budget`.
   void ApplyAntiOscillation(std::vector<size_t>* proposed, size_t budget);
 
+  // Physical-apply convergence gate (see apply_convergence_drift_ratio).
+  // Flushes new_caps to the sub-caches only when it has drifted at least the
+  // configured fraction of total_capacity, in summed per-level |delta|, from
+  // physical_applied_capacities_ (the last state actually pushed to the
+  // cache) -- or when force is set (init / floor relief / disabled gate).
+  // On a physical apply it refreshes physical_applied_capacities_. Returns
+  // the AdjustCapacities status, or OK when the apply is gate-skipped. The
+  // caller advances last_capacities_ (the model) regardless.
+  Status MaybeApplyCapacities(const std::vector<size_t>& new_caps,
+                              size_t total_capacity, bool force);
+
   std::shared_ptr<MultiLevelCache> cache_;
   MetricsProvider provider_;
   MultiLevelAllocationOptions options_;
@@ -682,6 +718,11 @@ class MultiLevelCacheAllocator {
   std::thread worker_;
   mutable std::mutex mu_;
   std::vector<size_t> last_capacities_;
+  // Last capacities physically pushed to the sub-caches (see
+  // MaybeApplyCapacities / apply_convergence_drift_ratio). Lags last_capacities_
+  // (the model) by at most apply_convergence_drift_ratio * total while the
+  // allocation is converged; re-synced on every physical apply.
+  std::vector<size_t> physical_applied_capacities_;
   // Previous round's raw solved target capacities (pre-smoothing), used by the
   // model-stability gate to detect an untrustworthy (rapidly swinging) signal.
   std::vector<size_t> prev_target_capacities_;
