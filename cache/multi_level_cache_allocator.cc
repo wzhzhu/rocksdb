@@ -1090,7 +1090,6 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
         if (floor_compliant != last_capacities_) {
           Status floor_status = cache_->AdjustCapacities(floor_compliant);
           if (floor_status.ok()) {
-            physical_applied_capacities_ = floor_compliant;
             last_capacities_ = std::move(floor_compliant);
             last_round_applied_ = true;
           } else {
@@ -1149,7 +1148,6 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
       EqualSplit(total_capacity, level_count, &init);
       Status s = cache_->AdjustCapacities(init);
       if (s.ok()) {
-        physical_applied_capacities_ = init;
         last_capacities_ = std::move(init);
         last_round_applied_ = true;
       }
@@ -2238,10 +2236,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
               std::chrono::steady_clock::now().time_since_epoch())
               .count());
     }
-    // Structural reclaim moves genuine dead capacity and should always flush;
-    // ordinary score-driven steps and probes go through the convergence gate.
-    Status s = MaybeApplyCapacities(new_caps, total_capacity,
-                                    /*force=*/structural_reclaim);
+    Status s = cache_->AdjustCapacities(new_caps);
     if (kAllocDebug) {
       const uint64_t t1 = static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2398,8 +2393,7 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
   }
-  Status adjust = MaybeApplyCapacities(capacities_to_apply, total_capacity,
-                                       /*force=*/false);
+  Status adjust = cache_->AdjustCapacities(capacities_to_apply);
   if (kAllocDebug) {
     const uint64_t t1 = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2437,34 +2431,6 @@ Status MultiLevelCacheAllocator::RunOnceLocked() {
     last_round_applied_ = true;
   }
   return adjust;
-}
-
-Status MultiLevelCacheAllocator::MaybeApplyCapacities(
-    const std::vector<size_t>& new_caps, size_t total_capacity, bool force) {
-  if (!force && options_.apply_convergence_drift_ratio > 0.0 &&
-      physical_applied_capacities_.size() == new_caps.size()) {
-    uint64_t drift = 0;
-    for (size_t i = 0; i < new_caps.size(); ++i) {
-      const size_t a = new_caps[i];
-      const size_t b = physical_applied_capacities_[i];
-      drift += static_cast<uint64_t>(a > b ? a - b : b - a);
-    }
-    const uint64_t tol = static_cast<uint64_t>(
-        options_.apply_convergence_drift_ratio *
-        static_cast<double>(total_capacity));
-    if (drift < tol) {
-      // Converged equilibrium: the model moved but nets to ~0 against the
-      // physically applied state. Skip the sub-cache flush (and its
-      // all-shard lock/purge) -- this is where the 128-thread futex
-      // avalanche came from. The caller still advances last_capacities_.
-      return Status::OK();
-    }
-  }
-  Status s = cache_->AdjustCapacities(new_caps);
-  if (s.ok()) {
-    physical_applied_capacities_ = new_caps;
-  }
-  return s;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
