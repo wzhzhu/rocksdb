@@ -491,16 +491,15 @@ struct MultiLevelAllocationOptions {
   // levels while raw capture stays authoritative for starved ones (whose
   // capacity is too small to measure density on). <= 0 disables.
   //
-  // Default 0.5 (raised from 0.25), validated on TTL-clean paired runs
-  // (earlier evidence was polluted by RocksDB's 30-day ttl flattening
-  // benchmark clones mid-run; see the ttl=0 fix in the YCSB harness).
-  // wlA 2G t64: 0.5 gives +4.4% tps at -0.6pt fg (repeats tight and
-  // non-overlapping) -- the stronger realized-density floor keeps the
-  // high-churn upper levels funded, cutting compaction back-pressure
-  // (stall 241-246s vs 250-252s); the win flows through the stall
-  // channel, not raw hit ratio. wlB 4G t64: indistinguishable from 0.25
-  // (fg 0.330-0.344 vs 0.336-0.349, tps +1.6% inside noise).
-  double score_credit_floor_frac = 0.5;
+  // Default 0.25. The 0.5 bump was reverted: its supporting evidence (wlA
+  // 2G t64 +4.4% tps) did NOT reproduce on the clean harness (lock-free
+  // ScrambledZipfianGenerator + process guard + disk-idle poll). Under the
+  // fixed generator, paired 0.5-vs-0.25 runs measured +1.1% tps -- inside
+  // run-to-run noise. The +4.4% was an artifact of the generator lock-convoy
+  // (a benchmark-harness futex bottleneck at high thread count), not of the
+  // floor. The floor MECHANISM (any nonzero fraction, addressing the ghost's
+  // churn under-reporting) is kept; only the unjustified value bump is undone.
+  double score_credit_floor_frac = 0.25;
   // --- Compaction-value term (cache-for-compaction) ---
   // Everything above scores levels by FOREGROUND reuse only; compaction's
   // streaming reads are deliberately excluded from the capture signal. But
