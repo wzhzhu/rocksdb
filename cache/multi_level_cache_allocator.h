@@ -565,7 +565,17 @@ struct MultiLevelAllocationOptions {
   // the recorder offsets distance buckets to keep true distinct-block
   // units), just noisier -- so a genuine workload shift still produces a
   // transfer, which itself un-lazies the allocator.
-  bool lazy_mode_enabled = true;
+  //
+  // DEFAULT OFF (re-validated on the clean harness, lazy-{on,off}-0804):
+  // the "1-6% recovered overhead" claim does NOT reproduce once the YCSB
+  // generator lock-convoy is fixed. Paired low-thread read-heavy runs
+  // (wlC/D, t8/t16, 2/8G, 3 repeats) measured geomean ON/OFF = +0.77% --
+  // inside the per-arm repeat spread -- with fg hit ratio neutral (|dfg| <
+  // 0.5pt) and two wlD cells actually FASTER with lazy off (the 1/8 ghost
+  // downsample slows tracking of read-latest's moving hot set). So lazy mode
+  // buys nothing measurable and occasionally costs a little; it is defaulted
+  // off to drop the sampling/drift machinery. Kept as an option for ablation.
+  bool lazy_mode_enabled = false;
   // Stall intensity (aggregate stall micros per wall micro, EMA) below
   // which the workload counts as unstalled. wlA 2G t64 measures ~0.4;
   // read-heavy workloads measure ~0.
