@@ -1,5 +1,12 @@
 # MultiLevelCache (Step B) One-Page Summary
 
+> ⚠️ **Early architecture snapshot (2026-04-22); partially outdated.** The
+> mapping-free routing design still holds, but sub-caches now default to
+> HyperClockCache (not LRU) and capacity is set by a `robust_hit_rate` model
+> allocator (not equal-split). Deepest LSM levels may be merged into one bottom
+> slot. Current source of truth: `cache/multi_level_cache*.{h,cc}` and
+> `YCSB-C-master/scripts/KNOWN_ISSUES.md`.
+
 ## 1. Problem and Goal
 
 RocksDB block cache is traditionally a single shared cache. Under multi-level LSM workloads, a static single-pool policy may under-serve hot levels.  

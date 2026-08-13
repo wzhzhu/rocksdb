@@ -1,5 +1,12 @@
 # MultiLevelCache 修改说明（Step B 最终版）
 
+> ⚠️ **早期架构快照（2026-04-22），部分内容已过时。** 路由机制（cache key 携带 level、
+> 直解路由）仍准确，但后续演进未同步进本文：子缓存默认已由 **LRU 改为 HyperClockCache
+> (AutoHCC)**；容量不再"均分"，而是由 `MultiLevelCacheAllocator` 按 `robust_hit_rate`
+> 模型动态定容（含 floor 反饥饿、排空层回收等）。当前实现以源码
+> `cache/multi_level_cache*.{h,cc}`、`cache/multi_level_cache_allocator*.{h,cc}` 为准，
+> 实验结论见 `YCSB-C-master/scripts/KNOWN_ISSUES.md`。
+
 本文档描述当前主线实现：**cache key 显式携带 level，`MultiLevelCache` 纯直解路由，不再依赖路由映射表**。
 
 ## 1. 核心架构（当前状态）
